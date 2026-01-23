@@ -1,0 +1,156 @@
+// Agent Orchestration Example
+// Demonstrates combining multiple agents with conditionals
+
+// ============================================
+// Types
+// ============================================
+
+type TaskType = {
+    category: string,
+    complexity: string
+}
+
+type TaskResult = {
+    response: string,
+    agent_used: string,
+    success: bool
+}
+
+// ============================================
+// Prompts for classification
+// ============================================
+
+prompt classify_request {
+    input: { request: string }
+    output: TaskType
+    template: "Classify this request into a category (research, coding, writing) and complexity (simple, complex).\n\nRequest: {request}"
+}
+
+// ============================================
+// Specialized Agents
+// ============================================
+
+// Simple research agent - quick lookups
+agent quick_researcher {
+    input: { question: string }
+    output: { answer: string }
+
+    tools: []
+
+    system: "You are a quick research assistant. Provide brief, direct answers.
+When done, respond: DONE: {\"answer\": \"...\"}"
+
+    max_turns: 2
+}
+
+// Complex research agent - thorough analysis
+agent deep_researcher {
+    input: { question: string }
+    output: { answer: string, sources: list<string>, confidence: string }
+
+    tools: []
+
+    system: "You are a thorough research assistant. Provide detailed answers with sources.
+When done, respond: DONE: {\"answer\": \"...\", \"sources\": [...], \"confidence\": \"high|medium|low\"}"
+
+    max_turns: 10
+}
+
+// Coding agent
+agent coder {
+    input: { request: string }
+    output: { code: string, explanation: string }
+
+    tools: []
+
+    system: "You are a coding assistant. Write code and explain it.
+When done, respond: DONE: {\"code\": \"...\", \"explanation\": \"...\"}"
+
+    max_turns: 5
+}
+
+// Writing agent
+agent writer {
+    input: { request: string }
+    output: { content: string }
+
+    tools: []
+
+    system: "You are a writing assistant. Create well-written content.
+When done, respond: DONE: {\"content\": \"...\"}"
+
+    max_turns: 5
+}
+
+// ============================================
+// Orchestration Tools
+// ============================================
+
+// Tool that routes to the appropriate agent based on classification
+tool route_request {
+    input: { request: string, classification: TaskType }
+    output: TaskResult
+
+    impl: if classification.category == "research" {
+        if classification.complexity == "simple" {
+            // Use quick researcher for simple research
+            quick_researcher(request)
+        } else {
+            // Use deep researcher for complex research
+            deep_researcher(request)
+        }
+    } else {
+        if classification.category == "coding" {
+            coder(request)
+        } else {
+            writer(request)
+        }
+    }
+}
+
+// ============================================
+// Main Pipeline
+// ============================================
+
+// Pipeline that classifies and routes tasks
+pipeline smart_assistant {
+    input: { request: string }
+    output: TaskResult
+
+    steps {
+        // First, classify the request
+        let classification = classify_request(request)
+
+        // Then route to appropriate agent
+        let routing_result = route_request(request, classification)
+    }
+}
+
+// ============================================
+// Alternative: Using Tools for Conditional Logic
+// ============================================
+
+// Tool with conditional logic for pipeline use
+tool conditional_processor {
+    input: { mode: string, data: string }
+    output: string
+
+    impl: if mode == "analyze" {
+        // Return classification result
+        "analyzed"
+    } else {
+        // Return research result
+        "researched"
+    }
+}
+
+// Pipeline using the conditional tool
+pipeline conditional_pipeline {
+    input: { mode: string, data: string }
+    output: { processed_data: string }
+
+    steps {
+        // Use tool with conditional logic
+        let processed_data = conditional_processor(mode, data)
+    }
+}

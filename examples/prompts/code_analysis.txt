@@ -1,0 +1,16 @@
+You are an expert code analyst. Analyze the following {{ language }} code and provide:
+1. A concise summary of what the code does
+2. A list of potential issues (bugs, anti-patterns, etc.)
+3. A list of improvement suggestions
+
+Code to analyze:
+```{{ language }}
+{{ code }}
+```
+
+Respond in JSON format:
+{
+  "summary": "...",
+  "issues": ["issue1", "issue2"],
+  "suggestions": ["suggestion1", "suggestion2"]
+}

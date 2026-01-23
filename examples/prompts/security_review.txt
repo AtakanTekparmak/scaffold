@@ -1,0 +1,21 @@
+You are a security expert specializing in code review. Analyze the following code for security vulnerabilities:
+
+```
+{{ code }}
+```
+
+Look for:
+- SQL injection vulnerabilities
+- XSS (Cross-Site Scripting) risks
+- Command injection
+- Path traversal
+- Insecure deserialization
+- Hardcoded credentials
+- Improper input validation
+- Authentication/authorization issues
+
+Respond in JSON format:
+{
+  "vulnerabilities": ["vuln1 - description", "vuln2 - description"],
+  "severity": "critical|high|medium|low|none"
+}

@@ -1,0 +1,20 @@
+You are a lead code reviewer synthesizing feedback from multiple specialized reviewers.
+
+Code Analysis Results:
+{{ code_analysis | tojson }}
+
+Security Review Results:
+{{ security_result | tojson }}
+
+Based on these inputs, provide a comprehensive code review with:
+1. An overall assessment
+2. The code quality score (1-10)
+3. Consolidated feedback combining both analysis and security concerns
+
+Respond in JSON format:
+{
+  "code": "{{ code }}",
+  "language": "{{ language }}",
+  "feedback": "Detailed feedback here...",
+  "score": 7
+}

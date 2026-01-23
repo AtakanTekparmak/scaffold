@@ -1,0 +1,115 @@
+// New Scaffold Syntax Demo
+// Demonstrates the clean semantic separation:
+//   - type: Reusable data structures
+//   - tool: Deterministic code (shell, pure functions)
+//   - prompt: Single LLM call with typed I/O
+//   - agent: Multi-turn LLM with tools
+//   - pipeline: Fixed sequence of prompts/tools
+
+// ============================================
+// Type Definitions
+// ============================================
+
+type Sentiment = {
+    sentiment: string,
+    confidence: float,
+    reasoning: string
+}
+
+type Entity = {
+    name: string,
+    kind: string
+}
+
+type TextAnalysis = {
+    sentiment: Sentiment,
+    entities: list<Entity>,
+    summary: string
+}
+
+// ============================================
+// Tools (Deterministic Code)
+// ============================================
+
+// Tool that counts words using shell
+tool word_count {
+    input: { text: string }
+    output: { count: int }
+    impl: shell("echo '{text}' | wc -w | tr -d ' '")
+}
+
+// Tool that extracts hashtags (pure text processing)
+tool extract_hashtags {
+    input: { text: string }
+    output: { hashtags: list<string> }
+    impl: shell("echo '{text}' | grep -o '#[a-zA-Z0-9_]*' || echo ''")
+}
+
+// ============================================
+// Prompts (Single LLM Calls)
+// ============================================
+
+// Sentiment analysis prompt
+prompt analyze_sentiment {
+    input: { text: string }
+    output: Sentiment
+    template: "Analyze the sentiment of this text and provide your analysis.\n\nText: {text}"
+}
+
+// Entity extraction prompt
+prompt extract_entities {
+    input: { text: string }
+    output: { entities: list<Entity> }
+    template: "Extract all named entities (people, organizations, locations, products) from this text.\n\nText: {text}"
+}
+
+// Summarization prompt
+prompt summarize {
+    input: { text: string, max_words: int }
+    output: { summary: string }
+    template: "Summarize the following text in at most {max_words} words.\n\nText: {text}"
+}
+
+// ============================================
+// Pipelines (Fixed Sequences)
+// ============================================
+
+// Analysis pipeline: sentiment + entities + summary
+pipeline analyze_text {
+    input: { text: string }
+    output: TextAnalysis
+
+    steps {
+        let sentiment_result = analyze_sentiment(text)
+        let entities_result = extract_entities(text)
+        let summary_result = summarize(text, 50)
+    }
+}
+
+// ============================================
+// Agents (Multi-turn with Tools)
+// ============================================
+
+// Research agent that can search and summarize
+agent researcher {
+    input: { question: string }
+    output: { answer: string, confidence: string, sources: list<string> }
+
+    tools: [word_count, extract_hashtags]
+
+    system: "You are a research assistant. Your job is to help answer questions thoroughly.
+
+When given a question:
+1. Think about what information you need
+2. Use available tools if helpful
+3. Provide a comprehensive answer with confidence level
+
+Available tool usage:
+- word_count: Count words in text
+- extract_hashtags: Find hashtags in text
+
+To call a tool, respond: TOOL_CALL: tool_name({\"arg\": \"value\"})
+When you have your final answer, respond: DONE: {\"answer\": \"...\", \"confidence\": \"high|medium|low\", \"sources\": [...]}"
+
+    max_turns: 5
+}

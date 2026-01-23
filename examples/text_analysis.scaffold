@@ -1,0 +1,71 @@
+// Text Analysis Example
+// Demonstrates agents and pipelines with reward/done fields for RL optimization
+
+type TextInput = {
+    text: string
+}
+
+type AnalysisResult = {
+    word_count: int,
+    summary: string,
+    sentiment: string
+}
+
+type SentimentOutput = {
+    sentiment: string,
+    confidence: float
+}
+
+// Tool: count words in text
+tool word_counter {
+    input: { text: string }
+    output: { count: int }
+    impl: shell("echo '{text}' | wc -w | tr -d ' '")
+}
+
+// Tool: get text length
+tool text_length {
+    input: { text: string }
+    output: { length: int }
+    impl: shell("echo -n '{text}' | wc -c | tr -d ' '")
+}
+
+// Prompt: summarize text
+prompt summarize {
+    input: { text: string }
+    output: { summary: string }
+    template: "Please provide a one-sentence summary of the following text:\n\n{text}"
+}
+
+// Prompt: analyze sentiment
+prompt analyze_sentiment {
+    input: { text: string }
+    output: SentimentOutput
+    template: "Analyze the sentiment of this text. Respond with 'positive', 'negative', or 'neutral' and a confidence score between 0 and 1.\n\nText: {text}"
+}
+
+// Agent: text analyzer that can use tools
+// reward: expression evaluated after each turn to compute intrinsic reward
+// done: condition that signals when the agent should stop
+agent text_analyzer {
+    input: { text: string }
+    output: AnalysisResult
+    tools: [word_counter, text_length]
+    system: "You are a text analysis assistant. Use the available tools to analyze the given text. Report word count and provide insights."
+    max_turns: 5
+    reward: word_count > 0
+    done: word_count > 0 && length(summary) > 10
+}
+
+// Pipeline: chains prompts and tools together
+// reward: computed after pipeline completion for RL training signal
+pipeline full_analysis {
+    input: { text: string }
+    output: AnalysisResult
+    steps {
+        let count_result = word_counter(text)
+        let sentiment_result = analyze_sentiment(text)
+        let summary_result = summarize(text)
+    }
+    reward: count_result.count > 0
+}
