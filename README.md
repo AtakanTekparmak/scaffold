@@ -1,6 +1,8 @@
 Scaffold Lang
 =============
 
+--WIP--
+
 Purpose
 -------
 - A tools‑first DSL and runtime for LLM‑authored automation that remains verifiable, analyzable, and safe to execute.
