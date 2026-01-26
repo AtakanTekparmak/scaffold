@@ -73,14 +73,12 @@ pub fn type_to_json_schema(ty: &TypeIR) -> JsonValue {
 
 /// Generate a JSON Schema string from a TypeIR
 pub fn type_to_json_schema_string(ty: &TypeIR) -> String {
-    serde_json::to_string_pretty(&type_to_json_schema(ty))
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&type_to_json_schema(ty)).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Generate a compact JSON Schema string from a TypeIR
 pub fn type_to_json_schema_compact(ty: &TypeIR) -> String {
-    serde_json::to_string(&type_to_json_schema(ty))
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&type_to_json_schema(ty)).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Generate a complete JSON Schema document with definitions
@@ -97,7 +95,10 @@ pub fn types_to_json_schema_document(
     let mut schema = type_to_json_schema(root_type);
 
     if let JsonValue::Object(ref mut obj) = schema {
-        obj.insert("$schema".to_string(), json!("http://json-schema.org/draft-07/schema#"));
+        obj.insert(
+            "$schema".to_string(),
+            json!("http://json-schema.org/draft-07/schema#"),
+        );
         if !defs.is_empty() {
             obj.insert("definitions".to_string(), JsonValue::Object(defs));
         }
@@ -167,10 +168,17 @@ mod tests {
         inner_fields.insert("y".to_string(), TypeIR::Int);
 
         let mut outer_fields = HashMap::new();
-        outer_fields.insert("position".to_string(), TypeIR::Struct { fields: inner_fields });
+        outer_fields.insert(
+            "position".to_string(),
+            TypeIR::Struct {
+                fields: inner_fields,
+            },
+        );
         outer_fields.insert("label".to_string(), TypeIR::String);
 
-        let struct_type = TypeIR::Struct { fields: outer_fields };
+        let struct_type = TypeIR::Struct {
+            fields: outer_fields,
+        };
         let schema = type_to_json_schema(&struct_type);
 
         assert_eq!(schema["type"], "object");

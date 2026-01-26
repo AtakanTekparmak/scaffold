@@ -81,27 +81,45 @@ impl<'source> Parser<'source> {
         match &token.token {
             Token::Bool => {
                 self.advance();
-                Ok(Spanned::new(TypeExpr::Primitive(PrimitiveType::Bool), token.span))
+                Ok(Spanned::new(
+                    TypeExpr::Primitive(PrimitiveType::Bool),
+                    token.span,
+                ))
             }
             Token::Int => {
                 self.advance();
-                Ok(Spanned::new(TypeExpr::Primitive(PrimitiveType::Int), token.span))
+                Ok(Spanned::new(
+                    TypeExpr::Primitive(PrimitiveType::Int),
+                    token.span,
+                ))
             }
             Token::Float => {
                 self.advance();
-                Ok(Spanned::new(TypeExpr::Primitive(PrimitiveType::Float), token.span))
+                Ok(Spanned::new(
+                    TypeExpr::Primitive(PrimitiveType::Float),
+                    token.span,
+                ))
             }
             Token::String_ => {
                 self.advance();
-                Ok(Spanned::new(TypeExpr::Primitive(PrimitiveType::String), token.span))
+                Ok(Spanned::new(
+                    TypeExpr::Primitive(PrimitiveType::String),
+                    token.span,
+                ))
             }
             Token::Any => {
                 self.advance();
-                Ok(Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), token.span))
+                Ok(Spanned::new(
+                    TypeExpr::Primitive(PrimitiveType::Any),
+                    token.span,
+                ))
             }
             Token::Bytes => {
                 self.advance();
-                Ok(Spanned::new(TypeExpr::Primitive(PrimitiveType::Bytes), token.span))
+                Ok(Spanned::new(
+                    TypeExpr::Primitive(PrimitiveType::Bytes),
+                    token.span,
+                ))
             }
             Token::Result_ => {
                 let start = token.span;
@@ -122,7 +140,10 @@ impl<'source> Parser<'source> {
                 self.expect(Token::Lt)?;
                 let inner = self.parse_type_expr()?;
                 let end = self.expect(Token::Gt)?.span;
-                Ok(Spanned::new(TypeExpr::List(Box::new(inner)), start.merge(end)))
+                Ok(Spanned::new(
+                    TypeExpr::List(Box::new(inner)),
+                    start.merge(end),
+                ))
             }
             Token::Map => {
                 let start = token.span;
@@ -143,7 +164,10 @@ impl<'source> Parser<'source> {
                 self.expect(Token::Lt)?;
                 let inner = self.parse_type_expr()?;
                 let end = self.expect(Token::Gt)?.span;
-                Ok(Spanned::new(TypeExpr::Option(Box::new(inner)), start.merge(end)))
+                Ok(Spanned::new(
+                    TypeExpr::Option(Box::new(inner)),
+                    start.merge(end),
+                ))
             }
             Token::LBrace => {
                 let start = token.span;
@@ -242,7 +266,10 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     return Err(ParseError::new(
-                        format!("expected 'type' or 'fn' in foreign block, found '{}'", token.token),
+                        format!(
+                            "expected 'type' or 'fn' in foreign block, found '{}'",
+                            token.token
+                        ),
                         token.span,
                     ));
                 }
@@ -366,7 +393,10 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     return Err(ParseError::new(
-                        format!("expected tool item (input, output, impl, spec, variants), found '{}'", token.token),
+                        format!(
+                            "expected tool item (input, output, impl, spec, variants), found '{}'",
+                            token.token
+                        ),
                         token.span,
                     ));
                 }
@@ -376,8 +406,10 @@ impl<'source> Parser<'source> {
         let end = self.expect(Token::RBrace)?.span;
 
         // Default types if not specified
-        let input = input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
-        let output = output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let input =
+            input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let output =
+            output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
 
         Ok(ToolDecl {
             name,
@@ -474,10 +506,7 @@ impl<'source> Parser<'source> {
             self.advance();
             let right = self.parse_tool_primary_expr()?;
             let span = left.span.merge(right.span);
-            left = Spanned::new(
-                ToolExpr::Pipe(Box::new(left), Box::new(right)),
-                span,
-            );
+            left = Spanned::new(ToolExpr::Pipe(Box::new(left), Box::new(right)), span);
         }
 
         Ok(left)
@@ -534,7 +563,9 @@ impl<'source> Parser<'source> {
                     let pattern = self.parse_expr()?;
                     self.expect(Token::Arrow)?;
                     let body = self.parse_tool_impl()?;
-                    let arm_span = pattern.span.merge(self.peek_token().map(|t| t.span).unwrap_or(pattern.span));
+                    let arm_span = pattern
+                        .span
+                        .merge(self.peek_token().map(|t| t.span).unwrap_or(pattern.span));
                     arms.push(MatchArm {
                         pattern,
                         body,
@@ -661,73 +692,70 @@ impl<'source> Parser<'source> {
         start: Span,
     ) -> ParseResult<Spanned<ToolExpr>> {
         // Check for :: (foreign module call)
-                if self.check(&Token::Colon) {
+        if self.check(&Token::Colon) {
+            self.advance();
+            self.expect(Token::Colon)?;
+            let func_name = self.parse_ident()?;
+            self.expect(Token::LParen)?;
+
+            let mut args = Vec::new();
+            if !self.check(&Token::RParen) {
+                args.push(self.parse_tool_expr()?);
+                while self.check(&Token::Comma) {
                     self.advance();
-                    self.expect(Token::Colon)?;
-                    let func_name = self.parse_ident()?;
-                    self.expect(Token::LParen)?;
-
-                    let mut args = Vec::new();
-                    if !self.check(&Token::RParen) {
-                        args.push(self.parse_tool_expr()?);
-                        while self.check(&Token::Comma) {
-                            self.advance();
-                            if self.check(&Token::RParen) {
-                                break;
-                            }
-                            args.push(self.parse_tool_expr()?);
-                        }
+                    if self.check(&Token::RParen) {
+                        break;
                     }
-                    let end = self.expect(Token::RParen)?.span;
-
-                    Ok(Spanned::new(
-                        ToolExpr::ForeignCall {
-                            module: name,
-                            function: func_name.node,
-                            args,
-                        },
-                        start.merge(end),
-                    ))
+                    args.push(self.parse_tool_expr()?);
                 }
-                // Check for ( (tool call or function)
-                else if self.check(&Token::LParen) {
+            }
+            let end = self.expect(Token::RParen)?.span;
+
+            Ok(Spanned::new(
+                ToolExpr::ForeignCall {
+                    module: name,
+                    function: func_name.node,
+                    args,
+                },
+                start.merge(end),
+            ))
+        }
+        // Check for ( (tool call or function)
+        else if self.check(&Token::LParen) {
+            self.advance();
+            let mut args = Vec::new();
+            if !self.check(&Token::RParen) {
+                args.push(self.parse_tool_expr()?);
+                while self.check(&Token::Comma) {
                     self.advance();
-                    let mut args = Vec::new();
-                    if !self.check(&Token::RParen) {
-                        args.push(self.parse_tool_expr()?);
-                        while self.check(&Token::Comma) {
-                            self.advance();
-                            if self.check(&Token::RParen) {
-                                break;
-                            }
-                            args.push(self.parse_tool_expr()?);
-                        }
+                    if self.check(&Token::RParen) {
+                        break;
                     }
-                    let end = self.expect(Token::RParen)?.span;
+                    args.push(self.parse_tool_expr()?);
+                }
+            }
+            let end = self.expect(Token::RParen)?.span;
 
-                    Ok(Spanned::new(
-                        ToolExpr::ToolCall {
-                            tool: name,
-                            args,
-                        },
-                        start.merge(end),
-                    ))
-                }
-                // Check for . (field access)
-                else if self.check(&Token::Dot) {
-                    let mut expr = Spanned::new(ToolExpr::Ident(name), start);
-                    while self.check(&Token::Dot) {
-                        self.advance();
-                        let field = self.parse_ident()?;
-                        let span = expr.span.merge(field.span);
-                        expr = Spanned::new(ToolExpr::FieldAccess(Box::new(expr), field), span);
-                    }
-                    Ok(expr)
-                }
-                // Just an identifier
-                else {
-                    Ok(Spanned::new(ToolExpr::Ident(name), start))
-                }
+            Ok(Spanned::new(
+                ToolExpr::ToolCall { tool: name, args },
+                start.merge(end),
+            ))
+        }
+        // Check for . (field access)
+        else if self.check(&Token::Dot) {
+            let mut expr = Spanned::new(ToolExpr::Ident(name), start);
+            while self.check(&Token::Dot) {
+                self.advance();
+                let field = self.parse_ident()?;
+                let span = expr.span.merge(field.span);
+                expr = Spanned::new(ToolExpr::FieldAccess(Box::new(expr), field), span);
+            }
+            Ok(expr)
+        }
+        // Just an identifier
+        else {
+            Ok(Spanned::new(ToolExpr::Ident(name), start))
+        }
     }
 
     fn parse_tool_spec(&mut self) -> ParseResult<ToolSpec> {
@@ -763,7 +791,10 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     return Err(ParseError::new(
-                        format!("expected spec item (pre, post, pure), found '{}'", token.token),
+                        format!(
+                            "expected spec item (pre, post, pure), found '{}'",
+                            token.token
+                        ),
                         token.span,
                     ));
                 }
@@ -851,7 +882,10 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     return Err(ParseError::new(
-                        format!("expected prompt item (input, output, template, system), found '{}'", token.token),
+                        format!(
+                            "expected prompt item (input, output, template, system), found '{}'",
+                            token.token
+                        ),
                         token.span,
                     ));
                 }
@@ -861,13 +895,14 @@ impl<'source> Parser<'source> {
         let end = self.expect(Token::RBrace)?.span;
 
         // Template is required
-        let template = template.ok_or_else(|| {
-            ParseError::new("prompt requires a template", start)
-        })?;
+        let template =
+            template.ok_or_else(|| ParseError::new("prompt requires a template", start))?;
 
         // Default types if not specified
-        let input = input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
-        let output = output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let input =
+            input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let output =
+            output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
 
         Ok(PromptDecl {
             name,
@@ -968,13 +1003,14 @@ impl<'source> Parser<'source> {
         let end = self.expect(Token::RBrace)?.span;
 
         // System is required for agents
-        let system = system.ok_or_else(|| {
-            ParseError::new("agent requires a system prompt", start)
-        })?;
+        let system =
+            system.ok_or_else(|| ParseError::new("agent requires a system prompt", start))?;
 
         // Default types if not specified
-        let input = input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
-        let output = output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let input =
+            input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let output =
+            output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
 
         Ok(AgentDecl {
             name,
@@ -1007,7 +1043,10 @@ impl<'source> Parser<'source> {
                 Ok(ErrorStrategy::Retry(count))
             }
             _ => Err(ParseError::new(
-                format!("expected error strategy (abort, retry(N)), found '{}'", token.token),
+                format!(
+                    "expected error strategy (abort, retry(N)), found '{}'",
+                    token.token
+                ),
                 token.span,
             )),
         }
@@ -1054,7 +1093,10 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     return Err(ParseError::new(
-                        format!("expected pipeline item (input, output, steps, reward), found '{}'", token.token),
+                        format!(
+                            "expected pipeline item (input, output, steps, reward), found '{}'",
+                            token.token
+                        ),
                         token.span,
                     ));
                 }
@@ -1064,8 +1106,10 @@ impl<'source> Parser<'source> {
         let end = self.expect(Token::RBrace)?.span;
 
         // Default types if not specified
-        let input = input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
-        let output = output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let input =
+            input.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
+        let output =
+            output.unwrap_or_else(|| Spanned::new(TypeExpr::Primitive(PrimitiveType::Any), start));
 
         Ok(PipelineDecl {
             name,
@@ -1094,10 +1138,15 @@ impl<'source> Parser<'source> {
         let expr = self.parse_tool_expr()?;
         let end = expr.span;
         let call = match &expr.node {
-            ToolExpr::ToolCall { tool, args } => {
-                PipelineCall::Tool { name: tool.clone(), args: args.clone() }
-            }
-            ToolExpr::ForeignCall { module: _, function: _, args: _ } => {
+            ToolExpr::ToolCall { tool, args } => PipelineCall::Tool {
+                name: tool.clone(),
+                args: args.clone(),
+            },
+            ToolExpr::ForeignCall {
+                module: _,
+                function: _,
+                args: _,
+            } => {
                 // Treat foreign calls as tool calls under a synthetic name if needed; for now, wrap as expr
                 PipelineCall::Expr(expr)
             }
@@ -1151,10 +1200,7 @@ impl<'source> Parser<'source> {
             self.advance(); // consume operator
             let right = self.parse_binary_expr(prec + 1)?;
             let span = left.span.merge(right.span);
-            left = Spanned::new(
-                Expr::Binary(Box::new(left), op, Box::new(right)),
-                span,
-            );
+            left = Spanned::new(Expr::Binary(Box::new(left), op, Box::new(right)), span);
         }
 
         Ok(left)
@@ -1207,6 +1253,38 @@ impl<'source> Parser<'source> {
                 let field = self.parse_field_name()?;
                 let span = expr.span.merge(field.span);
                 expr = Spanned::new(Expr::FieldAccess(Box::new(expr), field), span);
+            } else if self.check(&Token::Colon) {
+                // Foreign call: module::func(args) - only valid for identifiers
+                if let Expr::Ident(module) = &expr.node {
+                    let module = module.clone();
+                    let start = expr.span;
+                    self.advance(); // first :
+                    self.expect(Token::Colon)?; // second :
+                    let func_name = self.parse_ident()?;
+                    self.expect(Token::LParen)?;
+                    let mut args = Vec::new();
+                    if !self.check(&Token::RParen) {
+                        args.push(self.parse_expr()?);
+                        while self.check(&Token::Comma) {
+                            self.advance();
+                            if self.check(&Token::RParen) {
+                                break;
+                            }
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    let end = self.expect(Token::RParen)?.span;
+                    expr = Spanned::new(
+                        Expr::ForeignCall {
+                            module,
+                            function: func_name.node,
+                            args,
+                        },
+                        start.merge(end),
+                    );
+                } else {
+                    break;
+                }
             } else if self.check(&Token::LParen) {
                 // Function call - only valid for identifiers
                 if let Expr::Ident(name) = &expr.node {
@@ -1239,11 +1317,15 @@ impl<'source> Parser<'source> {
         match &token.token {
             Token::IntLit(n) => Ok(Spanned::new(Expr::Literal(Literal::Int(*n)), token.span)),
             Token::FloatLit(n) => Ok(Spanned::new(Expr::Literal(Literal::Float(*n)), token.span)),
-            Token::StringLit(s) => {
-                Ok(Spanned::new(Expr::Literal(Literal::String(s.clone())), token.span))
-            }
+            Token::StringLit(s) => Ok(Spanned::new(
+                Expr::Literal(Literal::String(s.clone())),
+                token.span,
+            )),
             Token::True => Ok(Spanned::new(Expr::Literal(Literal::Bool(true)), token.span)),
-            Token::False => Ok(Spanned::new(Expr::Literal(Literal::Bool(false)), token.span)),
+            Token::False => Ok(Spanned::new(
+                Expr::Literal(Literal::Bool(false)),
+                token.span,
+            )),
             Token::Null => Ok(Spanned::new(Expr::Literal(Literal::Null), token.span)),
             Token::Ident(name) => Ok(Spanned::new(Expr::Ident(name.clone()), token.span)),
             Token::LParen => {
@@ -1253,7 +1335,10 @@ impl<'source> Parser<'source> {
                 Ok(Spanned::new(Expr::Paren(Box::new(inner)), span))
             }
             // Handle keywords that might be used as identifiers in expressions
-            Token::Decompose => Ok(Spanned::new(Expr::Ident("decompose".to_string()), token.span)),
+            Token::Decompose => Ok(Spanned::new(
+                Expr::Ident("decompose".to_string()),
+                token.span,
+            )),
             Token::Options => Ok(Spanned::new(Expr::Ident("options".to_string()), token.span)),
             Token::Input => Ok(Spanned::new(Expr::Ident("input".to_string()), token.span)),
             Token::Output => Ok(Spanned::new(Expr::Ident("output".to_string()), token.span)),
@@ -1379,15 +1464,12 @@ impl<'source> Parser<'source> {
     }
 
     fn peek_token(&mut self) -> ParseResult<SpannedToken> {
-        self.lexer
-            .peek()
-            .cloned()
-            .ok_or_else(|| {
-                ParseError::new(
-                    "unexpected end of input",
-                    Span::new(self.source.len(), self.source.len()),
-                )
-            })
+        self.lexer.peek().cloned().ok_or_else(|| {
+            ParseError::new(
+                "unexpected end of input",
+                Span::new(self.source.len(), self.source.len()),
+            )
+        })
     }
 }
 
@@ -1413,5 +1495,4 @@ mod tests {
             _ => panic!("expected type declaration"),
         }
     }
-
 }

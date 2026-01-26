@@ -22,7 +22,10 @@ pub fn parse_bool(s: &str) -> Result<bool> {
     match t.as_str() {
         "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
-        other => Err(Error::ParseError(format!("failed to parse bool from '{}': expected true/false/1/0", other))),
+        other => Err(Error::ParseError(format!(
+            "failed to parse bool from '{}': expected true/false/1/0",
+            other
+        ))),
     }
 }
 
@@ -31,4 +34,3 @@ pub fn parse_json<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     serde_json::from_str::<T>(s.trim())
         .map_err(|e| Error::ParseError(format!("failed to parse json: {}", e)))
 }
-

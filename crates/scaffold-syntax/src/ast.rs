@@ -182,6 +182,12 @@ pub enum Expr {
     Binary(Box<Spanned<Expr>>, BinOp, Box<Spanned<Expr>>),
     /// Function call: func(args...)
     Call(String, Vec<Spanned<Expr>>),
+    /// Foreign function call: module::func(args...)
+    ForeignCall {
+        module: String,
+        function: String,
+        args: Vec<Spanned<Expr>>,
+    },
     /// Parenthesized expression
     Paren(Box<Spanned<Expr>>),
 }
@@ -378,9 +384,7 @@ pub enum ToolExpr {
         body: Box<ToolImpl>,
     },
     /// Infinite loop: loop { ... }
-    Loop {
-        body: Box<ToolImpl>,
-    },
+    Loop { body: Box<ToolImpl> },
     /// Break out of loop
     Break,
     /// Continue to next iteration

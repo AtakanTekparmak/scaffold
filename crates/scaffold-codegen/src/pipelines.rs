@@ -4,10 +4,10 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use scaffold_ir::{PipelineIR, PipelineStepIR, PipelineCallIR, ToolExprIR, ToolIR};
+use scaffold_ir::{PipelineCallIR, PipelineIR, PipelineStepIR, ToolExprIR, ToolIR};
 
 use crate::types::gen_type;
-use crate::util::{to_pascal_case, to_snake_case, to_ident};
+use crate::util::{to_ident, to_pascal_case, to_snake_case};
 use scaffold_ir::TypeIR;
 
 /// Generate the pipelines mod.rs
@@ -65,9 +65,7 @@ fn gen_io_type(ty: &TypeIR, type_name: &str) -> (TokenStream, TokenStream, bool)
 
             (struct_def, quote! { #struct_ident }, false)
         }
-        TypeIR::Struct { fields } if fields.is_empty() => {
-            (quote! {}, quote! { () }, true)
-        }
+        TypeIR::Struct { fields } if fields.is_empty() => (quote! {}, quote! { () }, true),
         other => {
             let ty = gen_type(other);
             (quote! {}, ty, true)
@@ -76,13 +74,17 @@ fn gen_io_type(ty: &TypeIR, type_name: &str) -> (TokenStream, TokenStream, bool)
 }
 
 /// Generate a pipeline module
-pub fn gen_pipeline_module(pipeline: &PipelineIR, tools_index: &std::collections::HashMap<String, ToolIR>) -> TokenStream {
+pub fn gen_pipeline_module(
+    pipeline: &PipelineIR,
+    tools_index: &std::collections::HashMap<String, ToolIR>,
+) -> TokenStream {
     let pipeline_name = &pipeline.name;
     let struct_name = format_ident!("{}Pipeline", to_pascal_case(pipeline_name));
 
     // Generate input/output struct definitions
     let (input_struct_def, input_type, needs_input_alias) = gen_io_type(&pipeline.input, "Input");
-    let (output_struct_def, output_type, needs_output_alias) = gen_io_type(&pipeline.output, "Output");
+    let (output_struct_def, output_type, needs_output_alias) =
+        gen_io_type(&pipeline.output, "Output");
 
     // Generate type aliases only when needed
     let input_alias = if needs_input_alias {
@@ -103,7 +105,12 @@ pub fn gen_pipeline_module(pipeline: &PipelineIR, tools_index: &std::collections
     };
 
     // Generate step code
-    let step_code = gen_pipeline_steps(&pipeline.steps, &input_fields, &pipeline.output, tools_index);
+    let step_code = gen_pipeline_steps(
+        &pipeline.steps,
+        &input_fields,
+        &pipeline.output,
+        tools_index,
+    );
 
     let doc = format!("Pipeline: {}", pipeline_name);
 
@@ -166,27 +173,31 @@ fn gen_pipeline_steps(
     // Track local variables from step bindings
     let mut local_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let step_codes: Vec<_> = steps.iter().enumerate().map(|(idx, step)| {
-        let call_code = gen_pipeline_call(&step.call, input_fields, &local_vars, tools_index);
+    let step_codes: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .map(|(idx, step)| {
+            let call_code = gen_pipeline_call(&step.call, input_fields, &local_vars, tools_index);
 
-        match &step.binding {
-            Some(name) => {
-                let binding_ident = format_ident!("{}", name);
-                local_vars.insert(name.clone());
-                quote! {
-                    let #binding_ident = #call_code;
+            match &step.binding {
+                Some(name) => {
+                    let binding_ident = format_ident!("{}", name);
+                    local_vars.insert(name.clone());
+                    quote! {
+                        let #binding_ident = #call_code;
+                    }
+                }
+                None => {
+                    // If no binding, just execute and ignore result (unless last step)
+                    let temp_ident = format_ident!("__step_{}", idx);
+                    local_vars.insert(format!("__step_{}", idx));
+                    quote! {
+                        let #temp_ident = #call_code;
+                    }
                 }
             }
-            None => {
-                // If no binding, just execute and ignore result (unless last step)
-                let temp_ident = format_ident!("__step_{}", idx);
-                local_vars.insert(format!("__step_{}", idx));
-                quote! {
-                    let #temp_ident = #call_code;
-                }
-            }
-        }
-    }).collect();
+        })
+        .collect();
 
     // The last step's result should be returned
     if steps.is_empty() {
@@ -195,16 +206,18 @@ fn gen_pipeline_steps(
         // If pipeline output is a struct with fields, try to construct it from bindings
         // Only use fields that have matching bindings
         if let TypeIR::Struct { fields } = output_type {
-            let matching_fields: Vec<_> = fields.keys()
-                .filter(|k| local_vars.contains(*k))
-                .collect();
+            let matching_fields: Vec<_> =
+                fields.keys().filter(|k| local_vars.contains(*k)).collect();
 
             if matching_fields.len() == fields.len() {
                 // All output fields have matching bindings
-                let field_inits: Vec<_> = fields.keys().map(|k| {
-                    let ident = format_ident!("{}", to_ident(k));
-                    quote! { #ident: #ident }
-                }).collect();
+                let field_inits: Vec<_> = fields
+                    .keys()
+                    .map(|k| {
+                        let ident = format_ident!("{}", to_ident(k));
+                        quote! { #ident: #ident }
+                    })
+                    .collect();
                 return quote! {
                     #(#step_codes)*
                     let __output = Output { #(#field_inits),* };
@@ -232,7 +245,10 @@ fn gen_pipeline_call(
     match call {
         PipelineCallIR::Prompt { name, args } => {
             let prompt_struct = format_ident!("{}Prompt", to_pascal_case(name));
-            let arg_codes: Vec<_> = args.iter().map(|a| gen_tool_expr(a, input_fields, local_vars)).collect();
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_tool_expr(a, input_fields, local_vars))
+                .collect();
 
             if args.is_empty() {
                 quote! { crate::prompts::#prompt_struct::new().execute(&client, model, ()).await? }
@@ -246,18 +262,28 @@ fn gen_pipeline_call(
         PipelineCallIR::Tool { name, args } => {
             let tool_struct = format_ident!("{}Tool", to_pascal_case(name));
             let tool_mod = format_ident!("{}", to_snake_case(name));
-            let arg_codes: Vec<_> = args.iter().map(|a| gen_tool_expr(a, input_fields, local_vars)).collect();
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_tool_expr(a, input_fields, local_vars))
+                .collect();
 
             // Look up the tool to determine its input type
             if let Some(tool_ir) = tools_index.get(name) {
                 match &tool_ir.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
                         // Construct the tool's Input struct
-                        let field_inits: Vec<_> = fields.keys().enumerate().map(|(i, k)| {
-                            let fname = format_ident!("{}", to_ident(k));
-                            let val = arg_codes.get(i).cloned().unwrap_or(quote! { Default::default() });
-                            quote! { #fname: #val }
-                        }).collect();
+                        let field_inits: Vec<_> = fields
+                            .keys()
+                            .enumerate()
+                            .map(|(i, k)| {
+                                let fname = format_ident!("{}", to_ident(k));
+                                let val = arg_codes
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(quote! { Default::default() });
+                                quote! { #fname: #val }
+                            })
+                            .collect();
                         quote! {
                             {
                                 let __tool_input = crate::tools::#tool_mod::Input { #(#field_inits),* };
@@ -323,12 +349,8 @@ fn gen_tool_expr(
             let field_ident = format_ident!("{}", field);
             quote! { #base_code.#field_ident.clone() }
         }
-        ToolExprIR::Literal { value } => {
-            gen_literal(value)
-        }
-        ToolExprIR::Expr { expr } => {
-            gen_pipeline_expr(expr, input_fields, local_vars)
-        }
+        ToolExprIR::Literal { value } => gen_literal(value),
+        ToolExprIR::Expr { expr } => gen_pipeline_expr(expr, input_fields, local_vars),
         _ => {
             // For complex expressions, fall back to a placeholder
             quote! { Default::default() }
@@ -358,9 +380,7 @@ fn gen_pipeline_expr(
             let field_ident = format_ident!("{}", field);
             quote! { #base_code.#field_ident }
         }
-        scaffold_ir::ExprIR::Literal { value } => {
-            gen_literal(value)
-        }
+        scaffold_ir::ExprIR::Literal { value } => gen_literal(value),
         scaffold_ir::ExprIR::Binary { left, op, right } => {
             let left_code = gen_pipeline_expr(left, input_fields, local_vars);
             let right_code = gen_pipeline_expr(right, input_fields, local_vars);
@@ -369,13 +389,29 @@ fn gen_pipeline_expr(
                 "-" => quote! { (#left_code - #right_code) },
                 "*" => quote! { (#left_code * #right_code) },
                 "/" => quote! { (#left_code / #right_code) },
-                _ => quote! { #left_code }
+                _ => quote! { #left_code },
             }
         }
         scaffold_ir::ExprIR::Call { function, args } => {
             let func = format_ident!("{}", function);
-            let arg_codes: Vec<_> = args.iter().map(|a| gen_pipeline_expr(a, input_fields, local_vars)).collect();
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_pipeline_expr(a, input_fields, local_vars))
+                .collect();
             quote! { #func(#(#arg_codes),*) }
+        }
+        scaffold_ir::ExprIR::ForeignCall {
+            module,
+            function,
+            args,
+        } => {
+            let module_ident = format_ident!("{}", module);
+            let func_ident = format_ident!("{}", function);
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_pipeline_expr(a, input_fields, local_vars))
+                .collect();
+            quote! { #module_ident::#func_ident(#(#arg_codes),*) }
         }
     }
 }
@@ -431,21 +467,26 @@ mod tests {
                     binding: Some("extracted".to_string()),
                     call: PipelineCallIR::Tool {
                         name: "extract".to_string(),
-                        args: vec![ToolExprIR::Ident { name: "input".to_string() }],
+                        args: vec![ToolExprIR::Ident {
+                            name: "input".to_string(),
+                        }],
                     },
                 },
                 PipelineStepIR {
                     binding: Some("result".to_string()),
                     call: PipelineCallIR::Prompt {
                         name: "summarize".to_string(),
-                        args: vec![ToolExprIR::Ident { name: "extracted".to_string() }],
+                        args: vec![ToolExprIR::Ident {
+                            name: "extracted".to_string(),
+                        }],
                     },
                 },
             ],
             reward: None,
         };
 
-        let tools_index: std::collections::HashMap<String, ToolIR> = std::collections::HashMap::new();
+        let tools_index: std::collections::HashMap<String, ToolIR> =
+            std::collections::HashMap::new();
         let code = gen_pipeline_module(&pipeline, &tools_index).to_string();
         assert!(code.contains("AnalyzePipeline"));
         assert!(code.contains("execute"));

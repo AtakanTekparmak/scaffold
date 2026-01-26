@@ -5,11 +5,13 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use scaffold_ir::{ToolIR, ToolImplIR, ToolExprIR, ToolStatementIR, ToolSpecIR, ToolVariantIR, LiteralIR, TypeIR};
+use scaffold_ir::{
+    LiteralIR, ToolExprIR, ToolIR, ToolImplIR, ToolSpecIR, ToolStatementIR, ToolVariantIR, TypeIR,
+};
 
-use crate::types::gen_type;
 use crate::expr::gen_expr;
-use crate::util::{to_snake_case, to_pascal_case, to_ident};
+use crate::types::gen_type;
+use crate::util::{to_ident, to_pascal_case, to_snake_case};
 
 /// Generate input/output type - either use existing type or generate inline struct
 use scaffold_ir::ExprIR;
@@ -38,10 +40,13 @@ fn interpolate_shell_command(command: &str) -> (TokenStream, bool) {
     let format_str = re.replace_all(command, "{}").to_string();
 
     // Generate the variable accessors
-    let var_accesses: Vec<_> = vars.iter().map(|v| {
-        let var_ident = format_ident!("{}", v);
-        quote! { input.#var_ident }
-    }).collect();
+    let var_accesses: Vec<_> = vars
+        .iter()
+        .map(|v| {
+            let var_ident = format_ident!("{}", v);
+            quote! { input.#var_ident }
+        })
+        .collect();
 
     let code = quote! {
         scaffold_runtime::shell::execute(&format!(#format_str, #(#var_accesses),*))?
@@ -62,18 +67,28 @@ fn gen_expr_or_tool_call(
             // Treat as a tool call - generate proper tool invocation
             let tool_struct = format_ident!("{}Tool", to_pascal_case(function));
             let tool_mod = format_ident!("{}", to_snake_case(function));
-            let arg_codes: Vec<_> = args.iter().map(|arg| gen_expr_or_tool_call(arg, tools_index, input_fields, local_vars)).collect();
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|arg| gen_expr_or_tool_call(arg, tools_index, input_fields, local_vars))
+                .collect();
 
             // Look up the tool to determine its input type
             if let Some(tool_ir) = tools_index.get(function) {
                 match &tool_ir.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
                         // Construct the tool's Input struct
-                        let field_inits: Vec<_> = fields.keys().enumerate().map(|(i, k)| {
-                            let fname = format_ident!("{}", to_ident(k));
-                            let val = arg_codes.get(i).cloned().unwrap_or(quote! { Default::default() });
-                            quote! { #fname: #val }
-                        }).collect();
+                        let field_inits: Vec<_> = fields
+                            .keys()
+                            .enumerate()
+                            .map(|(i, k)| {
+                                let fname = format_ident!("{}", to_ident(k));
+                                let val = arg_codes
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(quote! { Default::default() });
+                                quote! { #fname: #val }
+                            })
+                            .collect();
                         quote! {
                             {
                                 let __call_input = crate::tools::#tool_mod::Input { #(#field_inits),* };
@@ -220,7 +235,10 @@ pub fn gen_tools_mod(tool_names: &[&str]) -> TokenStream {
 }
 
 /// Generate a tool module
-pub fn gen_tool_module(tool: &ToolIR, tools_index: &std::collections::HashMap<String, ToolIR>) -> TokenStream {
+pub fn gen_tool_module(
+    tool: &ToolIR,
+    tools_index: &std::collections::HashMap<String, ToolIR>,
+) -> TokenStream {
     let tool_name = &tool.name;
     let struct_name = format_ident!("{}Tool", to_pascal_case(tool_name));
 
@@ -237,7 +255,13 @@ pub fn gen_tool_module(tool: &ToolIR, tools_index: &std::collections::HashMap<St
 
     // Generate the main execute method (with expected output type context)
     let execute_body = match &tool.implementation {
-        Some(impl_) => gen_tool_impl_with_ctx(impl_, Some(&tool.output), tools_index, &input_fields, &empty_locals),
+        Some(impl_) => gen_tool_impl_with_ctx(
+            impl_,
+            Some(&tool.output),
+            tools_index,
+            &input_fields,
+            &empty_locals,
+        ),
         None => quote! { todo!("Tool implementation not provided") },
     };
 
@@ -248,15 +272,19 @@ pub fn gen_tool_module(tool: &ToolIR, tools_index: &std::collections::HashMap<St
     };
 
     // Generate variants as separate methods
-    let variant_methods: Vec<_> = tool.variants.iter().map(|v| {
-        gen_variant_method(v, &input_type, &output_type, tools_index, &input_fields)
-    }).collect();
+    let variant_methods: Vec<_> = tool
+        .variants
+        .iter()
+        .map(|v| gen_variant_method(v, &input_type, &output_type, tools_index, &input_fields))
+        .collect();
 
     // Generate variant enum if there are variants
     let variant_enum = if !tool.variants.is_empty() {
-        let variant_names: Vec<_> = tool.variants.iter().map(|v| {
-            format_ident!("{}", to_pascal_case(&v.name))
-        }).collect();
+        let variant_names: Vec<_> = tool
+            .variants
+            .iter()
+            .map(|v| format_ident!("{}", to_pascal_case(&v.name)))
+            .collect();
 
         quote! {
             /// Available implementation variants
@@ -273,13 +301,17 @@ pub fn gen_tool_module(tool: &ToolIR, tools_index: &std::collections::HashMap<St
 
     // Generate execute_variant method if there are variants
     let execute_variant = if !tool.variants.is_empty() {
-        let variant_arms: Vec<_> = tool.variants.iter().map(|v| {
-            let variant_name = format_ident!("{}", to_pascal_case(&v.name));
-            let method_name = format_ident!("execute_{}", to_snake_case(&v.name));
-            quote! {
-                Variant::#variant_name => self.#method_name(input),
-            }
-        }).collect();
+        let variant_arms: Vec<_> = tool
+            .variants
+            .iter()
+            .map(|v| {
+                let variant_name = format_ident!("{}", to_pascal_case(&v.name));
+                let method_name = format_ident!("execute_{}", to_snake_case(&v.name));
+                quote! {
+                    Variant::#variant_name => self.#method_name(input),
+                }
+            })
+            .collect();
 
         quote! {
             /// Execute with a specific variant
@@ -416,7 +448,8 @@ fn gen_tool_impl_with_ctx(
 ) -> TokenStream {
     match impl_ {
         ToolImplIR::Expr { expr } => {
-            let expr_code = gen_tool_expr_with_ctx(expr, expected, tools_index, input_fields, local_vars);
+            let expr_code =
+                gen_tool_expr_with_ctx(expr, expected, tools_index, input_fields, local_vars);
             quote! { Ok(#expr_code) }
         }
         ToolImplIR::Sequence { statements } => {
@@ -425,7 +458,8 @@ fn gen_tool_impl_with_ctx(
             let mut stmts: Vec<TokenStream> = Vec::new();
 
             for stmt in statements {
-                let stmt_code = gen_tool_statement_with_ctx(stmt, tools_index, input_fields, &current_locals);
+                let stmt_code =
+                    gen_tool_statement_with_ctx(stmt, tools_index, input_fields, &current_locals);
                 stmts.push(stmt_code);
                 // Add binding to local vars for subsequent statements
                 if let Some(name) = &stmt.binding {
@@ -434,7 +468,8 @@ fn gen_tool_impl_with_ctx(
             }
 
             // Collect all binding names for output construction
-            let bindings: std::collections::HashSet<String> = statements.iter()
+            let bindings: std::collections::HashSet<String> = statements
+                .iter()
                 .filter_map(|s| s.binding.clone())
                 .collect();
 
@@ -443,10 +478,13 @@ fn gen_tool_impl_with_ctx(
                 if !fields.is_empty() {
                     let all_match = fields.keys().all(|k| bindings.contains(k));
                     if all_match {
-                        let field_inits: Vec<_> = fields.keys().map(|k| {
-                            let ident = format_ident!("{}", to_ident(k));
-                            quote! { #ident: #ident }
-                        }).collect();
+                        let field_inits: Vec<_> = fields
+                            .keys()
+                            .map(|k| {
+                                let ident = format_ident!("{}", to_ident(k));
+                                quote! { #ident: #ident }
+                            })
+                            .collect();
                         return quote! {
                             #(#stmts)*
                             let __output = Output { #(#field_inits),* };
@@ -478,7 +516,8 @@ fn gen_tool_impl_with_ctx(
             let mut stmts: Vec<TokenStream> = Vec::new();
 
             for stmt in statements {
-                let stmt_code = gen_tool_statement_with_ctx(stmt, tools_index, input_fields, &current_locals);
+                let stmt_code =
+                    gen_tool_statement_with_ctx(stmt, tools_index, input_fields, &current_locals);
                 stmts.push(stmt_code);
                 if let Some(name) = &stmt.binding {
                     current_locals.insert(name.clone());
@@ -486,7 +525,8 @@ fn gen_tool_impl_with_ctx(
             }
 
             // Collect all binding names for output construction
-            let bindings: std::collections::HashSet<String> = statements.iter()
+            let bindings: std::collections::HashSet<String> = statements
+                .iter()
                 .filter_map(|s| s.binding.clone())
                 .collect();
 
@@ -495,10 +535,13 @@ fn gen_tool_impl_with_ctx(
                 if !fields.is_empty() {
                     let all_match = fields.keys().all(|k| bindings.contains(k));
                     if all_match {
-                        let field_inits: Vec<_> = fields.keys().map(|k| {
-                            let ident = format_ident!("{}", to_ident(k));
-                            quote! { #ident: #ident }
-                        }).collect();
+                        let field_inits: Vec<_> = fields
+                            .keys()
+                            .map(|k| {
+                                let ident = format_ident!("{}", to_ident(k));
+                                quote! { #ident: #ident }
+                            })
+                            .collect();
                         return quote! {
                             // TODO: Execute in parallel (currently sequential)
                             #(#stmts)*
@@ -553,14 +596,22 @@ fn gen_tool_expr_with_ctx(
             }
         }
         ToolExprIR::FieldAccess { base, field } => {
-            let base_code = gen_tool_expr_with_ctx(base, None, tools_index, input_fields, local_vars);
+            let base_code =
+                gen_tool_expr_with_ctx(base, None, tools_index, input_fields, local_vars);
             let field_ident = format_ident!("{}", field);
             quote! { #base_code.#field_ident }
         }
-        ToolExprIR::ForeignCall { module, function, args } => {
+        ToolExprIR::ForeignCall {
+            module,
+            function,
+            args,
+        } => {
             let mod_ident = format_ident!("{}", to_snake_case(module));
             let fn_ident = format_ident!("{}", to_snake_case(function));
-            let arg_codes: Vec<_> = args.iter().map(|a| gen_tool_expr_with_ctx(a, None, tools_index, input_fields, local_vars)).collect();
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_tool_expr_with_ctx(a, None, tools_index, input_fields, local_vars))
+                .collect();
             quote! {
                 crate::foreign::#mod_ident::#fn_ident(#(#arg_codes),*)
             }
@@ -568,16 +619,26 @@ fn gen_tool_expr_with_ctx(
         ToolExprIR::ToolCall { tool, args } => {
             let tool_struct = format_ident!("{}Tool", to_pascal_case(tool));
             let callee_mod = format_ident!("{}", to_snake_case(tool));
-            let arg_codes: Vec<_> = args.iter().map(|a| gen_tool_expr_with_ctx(a, None, tools_index, input_fields, local_vars)).collect();
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_tool_expr_with_ctx(a, None, tools_index, input_fields, local_vars))
+                .collect();
 
             if let Some(callee) = tools_index.get(tool) {
                 match &callee.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
-                        let field_inits: Vec<_> = fields.keys().enumerate().map(|(i, k)| {
-                            let fname = format_ident!("{}", to_ident(k));
-                            let val = arg_codes.get(i).cloned().unwrap_or(quote! { Default::default() });
-                            quote! { #fname: #val }
-                        }).collect();
+                        let field_inits: Vec<_> = fields
+                            .keys()
+                            .enumerate()
+                            .map(|(i, k)| {
+                                let fname = format_ident!("{}", to_ident(k));
+                                let val = arg_codes
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(quote! { Default::default() });
+                                quote! { #fname: #val }
+                            })
+                            .collect();
                         quote! {
                             {
                                 let __input = crate::tools::#callee_mod::Input { #(#field_inits),* };
@@ -610,24 +671,40 @@ fn gen_tool_expr_with_ctx(
         ToolExprIR::Shell { command } => {
             // Parse template variables like {text} and replace with input.text
             let (formatted_cmd, has_vars) = interpolate_shell_command(command);
-            let base_exec = if has_vars { formatted_cmd } else { quote! { scaffold_runtime::shell::execute(#command)? } };
+            let base_exec = if has_vars {
+                formatted_cmd
+            } else {
+                quote! { scaffold_runtime::shell::execute(#command)? }
+            };
             if let Some(exp) = expected {
                 match exp {
                     TypeIR::String => quote! {{ let __out = #base_exec; __out.trim().to_string() }},
-                    TypeIR::Int => quote! {{ let __out = #base_exec; scaffold_runtime::parse::parse_i64(__out.trim())? }},
-                    TypeIR::Float => quote! {{ let __out = #base_exec; scaffold_runtime::parse::parse_f64(__out.trim())? }},
-                    TypeIR::Bool => quote! {{ let __out = #base_exec; scaffold_runtime::parse::parse_bool(__out.trim())? }},
+                    TypeIR::Int => {
+                        quote! {{ let __out = #base_exec; scaffold_runtime::parse::parse_i64(__out.trim())? }}
+                    }
+                    TypeIR::Float => {
+                        quote! {{ let __out = #base_exec; scaffold_runtime::parse::parse_f64(__out.trim())? }}
+                    }
+                    TypeIR::Bool => {
+                        quote! {{ let __out = #base_exec; scaffold_runtime::parse::parse_bool(__out.trim())? }}
+                    }
                     TypeIR::Bytes => quote! { scaffold_runtime::shell::execute_bytes(#command)? },
-                    TypeIR::Any => quote! {{ let __out = #base_exec; scaffold_runtime::Value::from(__out) }},
-                    _ => quote! {{ let __out = #base_exec; serde_json::from_str::<Output>(__out.trim()).map_err(|e| scaffold_runtime::Error::ParseError(e.to_string()))? }},
+                    TypeIR::Any => {
+                        quote! {{ let __out = #base_exec; scaffold_runtime::Value::from(__out) }}
+                    }
+                    _ => {
+                        quote! {{ let __out = #base_exec; serde_json::from_str::<Output>(__out.trim()).map_err(|e| scaffold_runtime::Error::ParseError(e.to_string()))? }}
+                    }
                 }
             } else {
                 base_exec
             }
         }
         ToolExprIR::Pipe { left, right } => {
-            let left_code = gen_tool_expr_with_ctx(left, None, tools_index, input_fields, local_vars);
-            let right_code = gen_tool_expr_with_ctx(right, None, tools_index, input_fields, local_vars);
+            let left_code =
+                gen_tool_expr_with_ctx(left, None, tools_index, input_fields, local_vars);
+            let right_code =
+                gen_tool_expr_with_ctx(right, None, tools_index, input_fields, local_vars);
             // Pipe passes left result to right
             quote! {
                 {
@@ -637,11 +714,23 @@ fn gen_tool_expr_with_ctx(
                 }
             }
         }
-        ToolExprIR::If { condition, then_branch, else_branch } => {
+        ToolExprIR::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
             let cond_code = gen_expr(condition);
-            let then_code = gen_tool_impl_with_ctx(then_branch, expected, tools_index, input_fields, local_vars);
+            let then_code = gen_tool_impl_with_ctx(
+                then_branch,
+                expected,
+                tools_index,
+                input_fields,
+                local_vars,
+            );
             let else_code = match else_branch {
-                Some(branch) => gen_tool_impl_with_ctx(branch, expected, tools_index, input_fields, local_vars),
+                Some(branch) => {
+                    gen_tool_impl_with_ctx(branch, expected, tools_index, input_fields, local_vars)
+                }
                 None => quote! { Ok(Default::default()) },
             };
             quote! {
@@ -653,14 +742,24 @@ fn gen_tool_expr_with_ctx(
             }
         }
         ToolExprIR::Match { scrutinee, arms } => {
-            let scrutinee_code = gen_tool_expr_with_ctx(scrutinee, None, tools_index, input_fields, local_vars);
-            let arm_codes: Vec<_> = arms.iter().map(|arm| {
-                let pattern = gen_expr(&arm.pattern);
-                let body = gen_tool_impl_with_ctx(&arm.body, expected, tools_index, input_fields, local_vars);
-                quote! {
-                    #pattern => { #body }
-                }
-            }).collect();
+            let scrutinee_code =
+                gen_tool_expr_with_ctx(scrutinee, None, tools_index, input_fields, local_vars);
+            let arm_codes: Vec<_> = arms
+                .iter()
+                .map(|arm| {
+                    let pattern = gen_expr(&arm.pattern);
+                    let body = gen_tool_impl_with_ctx(
+                        &arm.body,
+                        expected,
+                        tools_index,
+                        input_fields,
+                        local_vars,
+                    );
+                    quote! {
+                        #pattern => { #body }
+                    }
+                })
+                .collect();
             quote! {
                 match #scrutinee_code {
                     #(#arm_codes)*
@@ -668,16 +767,20 @@ fn gen_tool_expr_with_ctx(
                 }?
             }
         }
-        ToolExprIR::Literal { value } => {
-            gen_literal(value)
-        }
-        ToolExprIR::For { variable, iterable, body } => {
+        ToolExprIR::Literal { value } => gen_literal(value),
+        ToolExprIR::For {
+            variable,
+            iterable,
+            body,
+        } => {
             let var_ident = format_ident!("{}", variable);
-            let iterable_code = gen_tool_expr_with_ctx(iterable, None, tools_index, input_fields, local_vars);
+            let iterable_code =
+                gen_tool_expr_with_ctx(iterable, None, tools_index, input_fields, local_vars);
             // Add loop variable to local vars for body
             let mut body_locals = local_vars.clone();
             body_locals.insert(variable.clone());
-            let body_code = gen_tool_impl_with_ctx(body, None, tools_index, input_fields, &body_locals);
+            let body_code =
+                gen_tool_impl_with_ctx(body, None, tools_index, input_fields, &body_locals);
             quote! {
                 {
                     let mut __for_result = Ok(Default::default());
@@ -695,7 +798,8 @@ fn gen_tool_expr_with_ctx(
         }
         ToolExprIR::While { condition, body } => {
             let cond_code = gen_expr(condition);
-            let body_code = gen_tool_impl_with_ctx(body, None, tools_index, input_fields, local_vars);
+            let body_code =
+                gen_tool_impl_with_ctx(body, None, tools_index, input_fields, local_vars);
             quote! {
                 {
                     let mut __while_result = Ok(Default::default());
@@ -712,7 +816,8 @@ fn gen_tool_expr_with_ctx(
             }
         }
         ToolExprIR::Loop { body } => {
-            let body_code = gen_tool_impl_with_ctx(body, None, tools_index, input_fields, local_vars);
+            let body_code =
+                gen_tool_impl_with_ctx(body, None, tools_index, input_fields, local_vars);
             quote! {
                 {
                     let mut __loop_result = Ok(Default::default());
@@ -779,15 +884,19 @@ fn gen_tool_statement_with_ctx(
 /// Generate spec checks (preconditions, postconditions)
 fn gen_spec_checks(spec: &ToolSpecIR) -> (TokenStream, TokenStream, TokenStream) {
     // Generate precondition checks
-    let pre_checks: Vec<_> = spec.preconditions.iter().map(|expr| {
-        let expr_code = gen_expr(expr);
-        let expr_str = format!("{:?}", expr);
-        quote! {
-            if !(#expr_code) {
-                return Err(scaffold_runtime::Error::PreconditionFailed(#expr_str.to_string()));
+    let pre_checks: Vec<_> = spec
+        .preconditions
+        .iter()
+        .map(|expr| {
+            let expr_code = gen_expr(expr);
+            let expr_str = format!("{:?}", expr);
+            quote! {
+                if !(#expr_code) {
+                    return Err(scaffold_runtime::Error::PreconditionFailed(#expr_str.to_string()));
+                }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     let pre_check = if pre_checks.is_empty() {
         quote! {}
@@ -844,7 +953,13 @@ fn gen_variant_method(
     let method_name = format_ident!("execute_{}", to_snake_case(&variant.name));
     let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
     // No explicit expected type; rely on implementation and type checker
-    let body = gen_tool_impl_with_ctx(&variant.implementation, None, tools_index, input_fields, &empty_locals);
+    let body = gen_tool_impl_with_ctx(
+        &variant.implementation,
+        None,
+        tools_index,
+        input_fields,
+        &empty_locals,
+    );
 
     let doc = format!("Execute using the '{}' variant", variant.name);
 
@@ -899,7 +1014,9 @@ mod tests {
             },
             output: TypeIR::Bytes,
             implementation: Some(ToolImplIR::Expr {
-                expr: ToolExprIR::Shell { command: "cat {path}".to_string() },
+                expr: ToolExprIR::Shell {
+                    command: "cat {path}".to_string(),
+                },
             }),
             spec: None,
             variants: vec![],

@@ -33,10 +33,12 @@ use std::path::Path;
 
 pub use agents::{gen_agent_module, gen_agents_mod};
 pub use expr::gen_expr;
-pub use foreign::{gen_extern_crate_deps, gen_foreign_impl_module, gen_foreign_module, gen_foreign_types_module};
+pub use foreign::{
+    gen_extern_crate_deps, gen_foreign_impl_module, gen_foreign_module, gen_foreign_types_module,
+};
 pub use pipelines::{gen_pipeline_module, gen_pipelines_mod};
 pub use prompts::{gen_prompt_module, gen_prompts_mod};
-    pub use tools::{gen_tool_module, gen_tools_mod};
+pub use tools::{gen_tool_module, gen_tools_mod};
 pub use types::{gen_struct_def, gen_type, gen_types_module};
 pub use util::{to_pascal_case, to_snake_case};
 
@@ -142,14 +144,18 @@ impl CodeGenerator {
         if !ir.foreign_modules.is_empty() {
             // Generate foreign_types.rs (wrapper types for foreign type aliases)
             let foreign_types_code = foreign::gen_foreign_types_module(&ir.foreign_modules);
-            output.add_file("src/foreign_types.rs", self.format_tokens(foreign_types_code));
+            output.add_file(
+                "src/foreign_types.rs",
+                self.format_tokens(foreign_types_code),
+            );
 
             // Generate foreign_impl.rs (implementation stubs for foreign functions)
             let foreign_impl_code = foreign::gen_foreign_impl_module(&ir.foreign_modules);
             output.add_file("src/foreign_impl.rs", self.format_tokens(foreign_impl_code));
 
             // Generate foreign/mod.rs
-            let foreign_names: Vec<_> = ir.foreign_modules.iter().map(|m| m.name.as_str()).collect();
+            let foreign_names: Vec<_> =
+                ir.foreign_modules.iter().map(|m| m.name.as_str()).collect();
             let foreign_mod = foreign::gen_foreign_mod(&foreign_names);
             output.add_file("src/foreign/mod.rs", self.format_tokens(foreign_mod));
 
@@ -163,7 +169,9 @@ impl CodeGenerator {
 
         // Build a map of tools by name for context-aware generation (used by tools and pipelines)
         let mut tools_index: HashMap<String, scaffold_ir::ToolIR> = HashMap::new();
-        for t in &ir.tools { tools_index.insert(t.name.clone(), t.clone()); }
+        for t in &ir.tools {
+            tools_index.insert(t.name.clone(), t.clone());
+        }
 
         // Generate tools
         if !ir.tools.is_empty() {
@@ -244,8 +252,17 @@ impl CodeGenerator {
             ExprIR::Call { function, args } => {
                 // Skip built-in functions
                 let builtins = [
-                    "len", "is_empty", "contains", "is_some", "is_none",
-                    "unwrap", "unwrap_or", "abs", "min", "max", "not"
+                    "len",
+                    "is_empty",
+                    "contains",
+                    "is_some",
+                    "is_none",
+                    "unwrap",
+                    "unwrap_or",
+                    "abs",
+                    "min",
+                    "max",
+                    "not",
                 ];
                 if !builtins.contains(&function.as_str()) {
                     // Track maximum arg count seen for this function
@@ -262,6 +279,12 @@ impl CodeGenerator {
             }
             ExprIR::FieldAccess { base, .. } => {
                 self.collect_calls_from_expr(base, calls);
+            }
+            ExprIR::ForeignCall { args, .. } => {
+                // Foreign calls - just recurse into arguments
+                for arg in args {
+                    self.collect_calls_from_expr(arg, calls);
+                }
             }
             ExprIR::Literal { .. } | ExprIR::Ident { .. } => {}
         }
@@ -289,7 +312,10 @@ impl CodeGenerator {
         for (func, arg_count) in calls {
             let snake = to_snake_case(&func);
             code.push_str("/// TODO: Implement this function\n");
-            code.push_str(&format!("/// This is a stub generated because '{}' was called in the scaffold file.\n", func));
+            code.push_str(&format!(
+                "/// This is a stub generated because '{}' was called in the scaffold file.\n",
+                func
+            ));
 
             // Generate function signature based on argument count
             // Use references (&impl ...) to avoid move errors
@@ -304,9 +330,15 @@ impl CodeGenerator {
             // Generate print statement with all args
             let arg_refs: Vec<String> = (0..arg_count).map(|i| format!("arg{}", i)).collect();
             if arg_count == 0 {
-                code.push_str(&format!("    eprintln!(\"WARNING: stub function '{}' called\");\n", snake));
+                code.push_str(&format!(
+                    "    eprintln!(\"WARNING: stub function '{}' called\");\n",
+                    snake
+                ));
             } else if arg_count == 1 {
-                code.push_str(&format!("    eprintln!(\"WARNING: stub function '{}' called with {{:?}}\", {});\n", snake, arg_refs[0]));
+                code.push_str(&format!(
+                    "    eprintln!(\"WARNING: stub function '{}' called with {{:?}}\", {});\n",
+                    snake, arg_refs[0]
+                ));
             } else {
                 let format_placeholders: Vec<&str> = (0..arg_count).map(|_| "{:?}").collect();
                 code.push_str(&format!(
@@ -458,10 +490,26 @@ tokio = {{ version = "1.0", features = ["full"] }}
             .join("\n");
 
         // Generate list output
-        let list_pipelines = pipeline_names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n");
-        let list_tools = tool_names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n");
-        let list_agents = agent_names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n");
-        let list_prompts = prompt_names.iter().map(|n| format!("  - {}", n)).collect::<Vec<_>>().join("\n");
+        let list_pipelines = pipeline_names
+            .iter()
+            .map(|n| format!("  - {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let list_tools = tool_names
+            .iter()
+            .map(|n| format!("  - {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let list_agents = agent_names
+            .iter()
+            .map(|n| format!("  - {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let list_prompts = prompt_names
+            .iter()
+            .map(|n| format!("  - {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         format!(
             r#"//! Generated CLI entrypoint

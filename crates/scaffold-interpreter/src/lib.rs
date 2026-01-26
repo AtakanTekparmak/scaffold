@@ -64,8 +64,7 @@ impl Interpreter {
         // Load prompts from prompts/ directory if it exists
         let prompts_dir = path.parent().map(|p| p.join("prompts"));
         let prompts = if let Some(dir) = prompts_dir {
-            PromptManager::with_template_dir(dir)
-                .unwrap_or_else(|_| PromptManager::new())
+            PromptManager::with_template_dir(dir).unwrap_or_else(|_| PromptManager::new())
         } else {
             PromptManager::new()
         };
@@ -99,7 +98,9 @@ impl Interpreter {
         self.tool_executor.register_prompts(&self.ir.prompts);
         self.tool_executor.register_agents(&self.ir.agents);
         self.tool_executor.register_pipelines(&self.ir.pipelines);
-        self.prompts.reload().map_err(|e| InterpreterError::Runtime(e.to_string()))?;
+        self.prompts
+            .reload()
+            .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
         Ok(())
     }
 
@@ -125,42 +126,66 @@ impl Interpreter {
 
     /// Run a tool with the given input
     pub async fn run_tool(&mut self, tool_name: &str, input: Value) -> Result<Value> {
-        let tool = self.ir.tools.iter()
+        let tool = self
+            .ir
+            .tools
+            .iter()
             .find(|t| t.name == tool_name)
             .ok_or_else(|| InterpreterError::ToolNotFound(tool_name.to_string()))?
             .clone();
 
-        self.tool_executor.execute(&tool, input, &self.prompts).await
+        self.tool_executor
+            .execute(&tool, input, &self.prompts)
+            .await
     }
 
     /// Run a prompt with the given input
     pub async fn run_prompt(&mut self, prompt_name: &str, input: Value) -> Result<Value> {
-        let prompt = self.ir.prompts.iter()
+        let prompt = self
+            .ir
+            .prompts
+            .iter()
             .find(|p| p.name == prompt_name)
-            .ok_or_else(|| InterpreterError::Runtime(format!("Prompt '{}' not found", prompt_name)))?
+            .ok_or_else(|| {
+                InterpreterError::Runtime(format!("Prompt '{}' not found", prompt_name))
+            })?
             .clone();
 
-        self.tool_executor.execute_prompt(&prompt, input, &self.prompts).await
+        self.tool_executor
+            .execute_prompt(&prompt, input, &self.prompts)
+            .await
     }
 
     /// Run an agent with the given input
     pub async fn run_agent(&mut self, agent_name: &str, input: Value) -> Result<Value> {
-        let agent = self.ir.agents.iter()
+        let agent = self
+            .ir
+            .agents
+            .iter()
             .find(|a| a.name == agent_name)
             .ok_or_else(|| InterpreterError::Runtime(format!("Agent '{}' not found", agent_name)))?
             .clone();
 
-        self.tool_executor.execute_agent(&agent, input, &self.prompts).await
+        self.tool_executor
+            .execute_agent(&agent, input, &self.prompts)
+            .await
     }
 
     /// Run a pipeline with the given input
     pub async fn run_pipeline(&mut self, pipeline_name: &str, input: Value) -> Result<Value> {
-        let pipeline = self.ir.pipelines.iter()
+        let pipeline = self
+            .ir
+            .pipelines
+            .iter()
             .find(|p| p.name == pipeline_name)
-            .ok_or_else(|| InterpreterError::Runtime(format!("Pipeline '{}' not found", pipeline_name)))?
+            .ok_or_else(|| {
+                InterpreterError::Runtime(format!("Pipeline '{}' not found", pipeline_name))
+            })?
             .clone();
 
-        self.tool_executor.execute_pipeline(&pipeline, input, &self.prompts).await
+        self.tool_executor
+            .execute_pipeline(&pipeline, input, &self.prompts)
+            .await
     }
 
     /// Get the loaded IR (for inspection)
@@ -195,14 +220,14 @@ impl Interpreter {
     where
         F: Fn(Vec<Value>) -> Result<Value> + Send + Sync + 'static,
     {
-        self.tool_executor.foreign_registry_mut().register(module, function, f);
+        self.tool_executor
+            .foreign_registry_mut()
+            .register(module, function, f);
     }
 
     /// Initialize standard library foreign functions
     pub fn with_stdlib(mut self) -> Self {
-        let registry = ForeignRegistryBuilder::new()
-            .with_stdlib()
-            .build();
+        let registry = ForeignRegistryBuilder::new().with_stdlib().build();
         self.tool_executor = self.tool_executor.with_foreign_registry(registry);
         self
     }

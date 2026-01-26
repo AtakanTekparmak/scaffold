@@ -91,70 +91,52 @@ impl ForeignRegistryBuilder {
     pub fn with_stdlib(mut self) -> Self {
         // String functions
         self.registry.register("string", "length", |args| {
-            let s = args.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::Int(s.len() as i64))
         });
 
         self.registry.register("string", "to_upper", |args| {
-            let s = args.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::String(s.to_uppercase()))
         });
 
         self.registry.register("string", "to_lower", |args| {
-            let s = args.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::String(s.to_lowercase()))
         });
 
         self.registry.register("string", "trim", |args| {
-            let s = args.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             Ok(Value::String(s.trim().to_string()))
         });
 
         self.registry.register("string", "split", |args| {
-            let s = args.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let sep = args.get(1)
-                .and_then(|v| v.as_str())
-                .unwrap_or(" ");
-            let parts: Vec<Value> = s.split(sep)
-                .map(|p| Value::String(p.to_string()))
-                .collect();
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
+            let sep = args.get(1).and_then(|v| v.as_str()).unwrap_or(" ");
+            let parts: Vec<Value> = s.split(sep).map(|p| Value::String(p.to_string())).collect();
             Ok(Value::List(parts))
         });
 
         self.registry.register("string", "join", |args| {
-            let list = args.first()
+            let list = args
+                .first()
                 .and_then(|v| match v {
                     Value::List(l) => Some(l.clone()),
                     _ => None,
                 })
                 .unwrap_or_default();
-            let sep = args.get(1)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let parts: Vec<&str> = list.iter()
-                .filter_map(|v| v.as_str())
-                .collect();
+            let sep = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+            let parts: Vec<&str> = list.iter().filter_map(|v| v.as_str()).collect();
             Ok(Value::String(parts.join(sep)))
         });
 
         // Math functions
-        self.registry.register("math", "abs", |args| {
-            match args.first() {
+        self.registry
+            .register("math", "abs", |args| match args.first() {
                 Some(Value::Int(n)) => Ok(Value::Int(n.abs())),
                 Some(Value::Float(n)) => Ok(Value::Float(n.abs())),
                 _ => Ok(Value::Int(0)),
-            }
-        });
+            });
 
         self.registry.register("math", "max", |args| {
             let a = args.first().and_then(|v| v.as_int()).unwrap_or(0);
@@ -169,7 +151,8 @@ impl ForeignRegistryBuilder {
         });
 
         self.registry.register("math", "sqrt", |args| {
-            let n = args.first()
+            let n = args
+                .first()
                 .and_then(|v| v.as_float())
                 .or_else(|| args.first().and_then(|v| v.as_int()).map(|i| i as f64))
                 .unwrap_or(0.0);
@@ -177,11 +160,13 @@ impl ForeignRegistryBuilder {
         });
 
         self.registry.register("math", "pow", |args| {
-            let base = args.first()
+            let base = args
+                .first()
                 .and_then(|v| v.as_float())
                 .or_else(|| args.first().and_then(|v| v.as_int()).map(|i| i as f64))
                 .unwrap_or(0.0);
-            let exp = args.get(1)
+            let exp = args
+                .get(1)
                 .and_then(|v| v.as_float())
                 .or_else(|| args.get(1).and_then(|v| v.as_int()).map(|i| i as f64))
                 .unwrap_or(1.0);
@@ -199,30 +184,27 @@ impl ForeignRegistryBuilder {
             Ok(Value::Int(len as i64))
         });
 
-        self.registry.register("list", "first", |args| {
-            match args.first() {
+        self.registry
+            .register("list", "first", |args| match args.first() {
                 Some(Value::List(l)) => Ok(l.first().cloned().unwrap_or(Value::Null)),
                 _ => Ok(Value::Null),
-            }
-        });
+            });
 
-        self.registry.register("list", "last", |args| {
-            match args.first() {
+        self.registry
+            .register("list", "last", |args| match args.first() {
                 Some(Value::List(l)) => Ok(l.last().cloned().unwrap_or(Value::Null)),
                 _ => Ok(Value::Null),
-            }
-        });
+            });
 
-        self.registry.register("list", "reverse", |args| {
-            match args.first() {
+        self.registry
+            .register("list", "reverse", |args| match args.first() {
                 Some(Value::List(l)) => {
                     let mut reversed = l.clone();
                     reversed.reverse();
                     Ok(Value::List(reversed))
                 }
                 _ => Ok(Value::List(vec![])),
-            }
-        });
+            });
 
         self.registry.register("list", "contains", |args| {
             let list = match args.first() {
@@ -235,25 +217,30 @@ impl ForeignRegistryBuilder {
 
         // JSON functions
         self.registry.register("json", "parse", |args| {
-            let s = args.first()
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let s = args.first().and_then(|v| v.as_str()).unwrap_or("");
             match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(json) => Ok(json_to_value(json)),
-                Err(e) => Err(InterpreterError::Runtime(format!("JSON parse error: {}", e))),
+                Err(e) => Err(InterpreterError::Runtime(format!(
+                    "JSON parse error: {}",
+                    e
+                ))),
             }
         });
 
         self.registry.register("json", "stringify", |args| {
             let val = args.first().cloned().unwrap_or(Value::Null);
             let json = value_to_json(&val);
-            Ok(Value::String(serde_json::to_string(&json).unwrap_or_default()))
+            Ok(Value::String(
+                serde_json::to_string(&json).unwrap_or_default(),
+            ))
         });
 
         self.registry.register("json", "stringify_pretty", |args| {
             let val = args.first().cloned().unwrap_or(Value::Null);
             let json = value_to_json(&val);
-            Ok(Value::String(serde_json::to_string_pretty(&json).unwrap_or_default()))
+            Ok(Value::String(
+                serde_json::to_string_pretty(&json).unwrap_or_default(),
+            ))
         });
 
         self
@@ -286,11 +273,10 @@ fn json_to_value(json: serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(s),
-        serde_json::Value::Array(arr) => {
-            Value::List(arr.into_iter().map(json_to_value).collect())
-        }
+        serde_json::Value::Array(arr) => Value::List(arr.into_iter().map(json_to_value).collect()),
         serde_json::Value::Object(obj) => {
-            let map: HashMap<String, Value> = obj.into_iter()
+            let map: HashMap<String, Value> = obj
+                .into_iter()
                 .map(|(k, v)| (k, json_to_value(v)))
                 .collect();
             Value::Map(map)
@@ -308,16 +294,20 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Int(i) => serde_json::json!(*i),
         Value::Float(f) => serde_json::json!(*f),
         Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Bytes(b) => serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b)),
+        Value::Bytes(b) => {
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+        }
         Value::List(l) => serde_json::Value::Array(l.iter().map(value_to_json).collect()),
         Value::Map(m) => {
-            let obj: serde_json::Map<String, serde_json::Value> = m.iter()
+            let obj: serde_json::Map<String, serde_json::Value> = m
+                .iter()
                 .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect();
             serde_json::Value::Object(obj)
         }
         Value::Struct { fields, .. } => {
-            let obj: serde_json::Map<String, serde_json::Value> = fields.iter()
+            let obj: serde_json::Map<String, serde_json::Value> = fields
+                .iter()
                 .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect();
             serde_json::Value::Object(obj)
@@ -348,33 +338,43 @@ mod tests {
             Ok(Value::Int(n * 2))
         });
 
-        let result = registry.call("math", "double", vec![Value::Int(21)]).unwrap();
+        let result = registry
+            .call("math", "double", vec![Value::Int(21)])
+            .unwrap();
         assert_eq!(result, Value::Int(42));
     }
 
     #[test]
     fn test_stdlib_string_functions() {
-        let registry = ForeignRegistryBuilder::new()
-            .with_stdlib()
-            .build();
+        let registry = ForeignRegistryBuilder::new().with_stdlib().build();
 
-        let result = registry.call("string", "to_upper", vec![Value::String("hello".to_string())]).unwrap();
+        let result = registry
+            .call(
+                "string",
+                "to_upper",
+                vec![Value::String("hello".to_string())],
+            )
+            .unwrap();
         assert_eq!(result, Value::String("HELLO".to_string()));
 
-        let result = registry.call("string", "length", vec![Value::String("hello".to_string())]).unwrap();
+        let result = registry
+            .call("string", "length", vec![Value::String("hello".to_string())])
+            .unwrap();
         assert_eq!(result, Value::Int(5));
     }
 
     #[test]
     fn test_stdlib_math_functions() {
-        let registry = ForeignRegistryBuilder::new()
-            .with_stdlib()
-            .build();
+        let registry = ForeignRegistryBuilder::new().with_stdlib().build();
 
-        let result = registry.call("math", "max", vec![Value::Int(5), Value::Int(10)]).unwrap();
+        let result = registry
+            .call("math", "max", vec![Value::Int(5), Value::Int(10)])
+            .unwrap();
         assert_eq!(result, Value::Int(10));
 
-        let result = registry.call("math", "sqrt", vec![Value::Float(16.0)]).unwrap();
+        let result = registry
+            .call("math", "sqrt", vec![Value::Float(16.0)])
+            .unwrap();
         assert_eq!(result, Value::Float(4.0));
     }
 

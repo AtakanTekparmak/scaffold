@@ -29,8 +29,8 @@
 pub mod config;
 pub mod error;
 pub mod llm;
-pub mod prompt;
 pub mod parse;
+pub mod prompt;
 pub mod shell;
 pub mod state;
 pub mod task;
@@ -41,14 +41,17 @@ pub mod value;
 // Re-exports for convenience
 pub use config::{config, Config};
 pub use error::{Error, Result};
-pub use llm::{query as llm_query, query_with_model, query_with_config, query_structured, Agent, AgentBuilder, LlmConfig, LlmBackend};
+pub use llm::{
+    query as llm_query, query_structured, query_with_config, query_with_model, Agent, AgentBuilder,
+    LlmBackend, LlmConfig,
+};
 pub use prompt::PromptManager;
+pub use rig::completion::request::ToolDefinition;
 pub use state::{ExecutionState, StateCheckpoint};
 pub use task::{Deadline, FailureStrategy, SubgoalResult, TaskContext};
 pub use tool::ToolError;
-pub use rig::completion::request::ToolDefinition;
-pub use trace::{tracer, Tracer, TracerConfig, TraceEvent, TraceLevel, TraceOutput, TraceRecord};
-pub use value::{Value, ResultValue};
+pub use trace::{tracer, TraceEvent, TraceLevel, TraceOutput, TraceRecord, Tracer, TracerConfig};
+pub use value::{ResultValue, Value};
 
 // Re-export rig types for generated code
 pub use rig;
@@ -59,8 +62,8 @@ pub mod prelude {
     pub use crate::state::ExecutionState;
     pub use crate::task::{Deadline, FailureStrategy, SubgoalResult, TaskContext};
     pub use crate::tool::ToolError;
-    pub use rig::completion::request::ToolDefinition;
     pub use crate::value::Value;
+    pub use rig::completion::request::ToolDefinition;
 
     // Re-export rig tool trait for implementations
     pub use rig::tool::Tool;

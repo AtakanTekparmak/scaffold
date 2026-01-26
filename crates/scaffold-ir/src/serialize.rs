@@ -42,11 +42,7 @@ impl Lowerer {
     }
 
     /// Lower a complete program to IR
-    pub fn lower(
-        &self,
-        program: &Program,
-        _type_env: &TypeEnv,
-    ) -> LowerResult<ScaffoldIR> {
+    pub fn lower(&self, program: &Program, _type_env: &TypeEnv) -> LowerResult<ScaffoldIR> {
         let mut ir = ScaffoldIR::new();
 
         for decl in &program.declarations {
@@ -55,7 +51,8 @@ impl Lowerer {
                     ir.types.push(self.lower_type_decl(type_decl)?);
                 }
                 Declaration::ExternCrate(extern_crate) => {
-                    ir.extern_crates.push(self.lower_extern_crate(extern_crate)?);
+                    ir.extern_crates
+                        .push(self.lower_extern_crate(extern_crate)?);
                 }
                 Declaration::Foreign(foreign) => {
                     ir.foreign_modules.push(self.lower_foreign(foreign)?);
@@ -87,7 +84,9 @@ impl Lowerer {
 
     fn lower_type_ref(&self, ty: &Spanned<TypeExpr>) -> LowerResult<TypeRefIR> {
         match &ty.node {
-            TypeExpr::Named(name) => Ok(TypeRefIR::Named { ref_name: name.clone() }),
+            TypeExpr::Named(name) => Ok(TypeRefIR::Named {
+                ref_name: name.clone(),
+            }),
             _ => Ok(TypeRefIR::Inline(self.lower_type_expr(&ty.node)?)),
         }
     }
@@ -152,6 +151,21 @@ impl Lowerer {
                 }
                 Ok(ExprIR::Call {
                     function: name.clone(),
+                    args: ir_args,
+                })
+            }
+            Expr::ForeignCall {
+                module,
+                function,
+                args,
+            } => {
+                let mut ir_args = Vec::new();
+                for arg in args {
+                    ir_args.push(self.lower_expr(&arg.node)?);
+                }
+                Ok(ExprIR::ForeignCall {
+                    module: module.clone(),
+                    function: function.clone(),
                     args: ir_args,
                 })
             }
@@ -262,14 +276,18 @@ impl Lowerer {
                 for stmt in stmts {
                     ir_stmts.push(self.lower_tool_statement(stmt)?);
                 }
-                Ok(ToolImplIR::Sequence { statements: ir_stmts })
+                Ok(ToolImplIR::Sequence {
+                    statements: ir_stmts,
+                })
             }
             ToolImpl::Parallel(stmts) => {
                 let mut ir_stmts = Vec::new();
                 for stmt in stmts {
                     ir_stmts.push(self.lower_tool_statement(stmt)?);
                 }
-                Ok(ToolImplIR::Parallel { statements: ir_stmts })
+                Ok(ToolImplIR::Parallel {
+                    statements: ir_stmts,
+                })
             }
         }
     }
@@ -281,7 +299,11 @@ impl Lowerer {
                 base: Box::new(self.lower_tool_expr(&base.node)?),
                 field: field.node.clone(),
             }),
-            ToolExpr::ForeignCall { module, function, args } => {
+            ToolExpr::ForeignCall {
+                module,
+                function,
+                args,
+            } => {
                 let mut ir_args = Vec::new();
                 for arg in args {
                     ir_args.push(self.lower_tool_expr(&arg.node)?);
@@ -302,12 +324,18 @@ impl Lowerer {
                     args: ir_args,
                 })
             }
-            ToolExpr::Shell(cmd) => Ok(ToolExprIR::Shell { command: cmd.clone() }),
+            ToolExpr::Shell(cmd) => Ok(ToolExprIR::Shell {
+                command: cmd.clone(),
+            }),
             ToolExpr::Pipe(left, right) => Ok(ToolExprIR::Pipe {
                 left: Box::new(self.lower_tool_expr(&left.node)?),
                 right: Box::new(self.lower_tool_expr(&right.node)?),
             }),
-            ToolExpr::If { condition, then_branch, else_branch } => Ok(ToolExprIR::If {
+            ToolExpr::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => Ok(ToolExprIR::If {
                 condition: self.lower_expr(&condition.node)?,
                 then_branch: Box::new(self.lower_tool_impl(then_branch)?),
                 else_branch: match else_branch {
@@ -328,7 +356,11 @@ impl Lowerer {
                     arms: ir_arms,
                 })
             }
-            ToolExpr::For { variable, iterable, body } => Ok(ToolExprIR::For {
+            ToolExpr::For {
+                variable,
+                iterable,
+                body,
+            } => Ok(ToolExprIR::For {
                 variable: variable.node.clone(),
                 iterable: Box::new(self.lower_tool_expr(&iterable.node)?),
                 body: Box::new(self.lower_tool_impl(body)?),
@@ -415,10 +447,15 @@ impl Lowerer {
         })
     }
 
-    fn lower_error_strategy(&self, strategy: &scaffold_syntax::ast::ErrorStrategy) -> ErrorStrategyIR {
+    fn lower_error_strategy(
+        &self,
+        strategy: &scaffold_syntax::ast::ErrorStrategy,
+    ) -> ErrorStrategyIR {
         match strategy {
             scaffold_syntax::ast::ErrorStrategy::Abort => ErrorStrategyIR::Abort,
-            scaffold_syntax::ast::ErrorStrategy::Retry(count) => ErrorStrategyIR::Retry { count: *count },
+            scaffold_syntax::ast::ErrorStrategy::Retry(count) => {
+                ErrorStrategyIR::Retry { count: *count }
+            }
         }
     }
 

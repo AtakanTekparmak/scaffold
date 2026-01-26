@@ -61,8 +61,8 @@ pub fn execute_bytes(command: &str) -> Result<Vec<u8>> {
 
 /// Execute a shell command with a timeout
 pub fn execute_with_timeout(command: &str, timeout_ms: u64) -> Result<String> {
-    use std::time::Duration;
     use std::thread;
+    use std::time::Duration;
 
     let command = command.to_string();
     let handle = thread::spawn(move || execute(&command));
@@ -73,7 +73,9 @@ pub fn execute_with_timeout(command: &str, timeout_ms: u64) -> Result<String> {
 
     loop {
         if handle.is_finished() {
-            return handle.join().map_err(|_| Error::Runtime("thread panicked".to_string()))?;
+            return handle
+                .join()
+                .map_err(|_| Error::Runtime("thread panicked".to_string()))?;
         }
         if start.elapsed() > timeout {
             return Err(Error::Timeout("shell command".to_string()));

@@ -80,6 +80,10 @@ Repository Layout
 - `crates/scaffold-codegen` — Rust code generator for tools/prompts/agents/pipelines.
 - `crates/scaffold-cli` — command line interface providing `scaffold`.
 
+For LLMs
+--------
+- Read the authoring guide: `docs/LLM_GUIDE.md` for exact syntax, patterns, and constraints to generate correct scaffolds.
+
 Design Principles
 -----------------
 - Constrain the representation so an LLM can reliably produce correct scaffolds and failures are detectable early.
@@ -97,4 +101,3 @@ Contributing
 ------------
 - Please open issues/PRs with clear problem statements and repros.
 - Keep additions aligned with the core goal: verifiable, analyzable scaffolds authored by LLMs.
-

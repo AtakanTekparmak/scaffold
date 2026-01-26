@@ -159,13 +159,46 @@ fn main() -> ExitCode {
 
     match cli.command {
         Commands::Check { file, verbose } => cmd_check(&file, verbose),
-        Commands::Compile { file, output, compact } => cmd_compile(&file, output.as_deref(), compact),
+        Commands::Compile {
+            file,
+            output,
+            compact,
+        } => cmd_compile(&file, output.as_deref(), compact),
         Commands::Parse { file } => cmd_parse(&file),
-        Commands::Codegen { file, output, format, strict } => cmd_codegen(&file, &output, format, strict),
-        Commands::Build { file, output, bin_name, format, strict, runtime_path, release } => {
-            cmd_build(&file, output.as_deref(), bin_name.as_deref(), format, strict, runtime_path.as_deref(), release)
-        }
-        Commands::Run { file, task, tool, prompt, agent, pipeline, input, verbose, verify } => {
+        Commands::Codegen {
+            file,
+            output,
+            format,
+            strict,
+        } => cmd_codegen(&file, &output, format, strict),
+        Commands::Build {
+            file,
+            output,
+            bin_name,
+            format,
+            strict,
+            runtime_path,
+            release,
+        } => cmd_build(
+            &file,
+            output.as_deref(),
+            bin_name.as_deref(),
+            format,
+            strict,
+            runtime_path.as_deref(),
+            release,
+        ),
+        Commands::Run {
+            file,
+            task,
+            tool,
+            prompt,
+            agent,
+            pipeline,
+            input,
+            verbose,
+            verify,
+        } => {
             // Run the async runtime
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
             rt.block_on(cmd_run(
@@ -259,7 +292,11 @@ fn cmd_check(file: &PathBuf, verbose: bool) -> ExitCode {
             .with_label(
                 Label::new((&file_name, error.span.start..error.span.end))
                     .with_message(&error.message)
-                    .with_color(if has_errors { Color::Red } else { Color::Yellow }),
+                    .with_color(if has_errors {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    }),
             )
             .finish()
             .eprint((&file_name, Source::from(&source)))
@@ -273,10 +310,16 @@ fn cmd_check(file: &PathBuf, verbose: bool) -> ExitCode {
     if verbose {
         println!("Verification passed");
         if !verify_result.deadlock.is_empty() {
-            println!("  Deadlock analysis: {} tasks checked", verify_result.deadlock.len());
+            println!(
+                "  Deadlock analysis: {} tasks checked",
+                verify_result.deadlock.len()
+            );
         }
         if !verify_result.bounds.is_empty() {
-            println!("  Bounds analysis: {} subgoals checked", verify_result.bounds.len());
+            println!(
+                "  Bounds analysis: {} subgoals checked",
+                verify_result.bounds.len()
+            );
         }
     }
 
@@ -553,7 +596,9 @@ fn cmd_codegen(file: &PathBuf, output: &PathBuf, format: bool, strict: bool) -> 
     };
 
     // Generate code
-    let generator = CodeGenerator::new().with_formatting(format).with_strict(strict);
+    let generator = CodeGenerator::new()
+        .with_formatting(format)
+        .with_strict(strict);
     let generated = match generator.generate(&ir) {
         Ok(g) => g,
         Err(e) => {
@@ -568,7 +613,11 @@ fn cmd_codegen(file: &PathBuf, output: &PathBuf, format: bool, strict: bool) -> 
         return ExitCode::FAILURE;
     }
 
-    eprintln!("Generated {} files to {}", generated.files.len(), output.display());
+    eprintln!(
+        "Generated {} files to {}",
+        generated.files.len(),
+        output.display()
+    );
     for path in generated.files.keys() {
         eprintln!("  {}", path);
     }
@@ -667,7 +716,9 @@ fn cmd_build(
     }
 
     // Generate code
-    let generator = CodeGenerator::new().with_formatting(format).with_strict(strict);
+    let generator = CodeGenerator::new()
+        .with_formatting(format)
+        .with_strict(strict);
     let generated = match generator.generate(&ir) {
         Ok(g) => g,
         Err(e) => {
@@ -688,10 +739,16 @@ fn cmd_build(
             // Replace package name and bin name heuristically
             // If no pipeline/tool present, default name is scaffold_generated
             if cargo_toml.contains("name = \"scaffold_generated\"") {
-                cargo_toml = cargo_toml.replace("name = \"scaffold_generated\"", &format!("name = \"{}\"", name));
+                cargo_toml = cargo_toml.replace(
+                    "name = \"scaffold_generated\"",
+                    &format!("name = \"{}\"", name),
+                );
             }
             if cargo_toml.contains("[[bin]]\nname = \"scaffold_generated\"") {
-                cargo_toml = cargo_toml.replace("[[bin]]\nname = \"scaffold_generated\"", &format!("[[bin]]\nname = \"{}\"", name));
+                cargo_toml = cargo_toml.replace(
+                    "[[bin]]\nname = \"scaffold_generated\"",
+                    &format!("[[bin]]\nname = \"{}\"", name),
+                );
             }
             if let Err(e) = fs::write(&manifest_path, cargo_toml) {
                 eprintln!("Warning: failed to set bin name: {}", e);
@@ -702,7 +759,9 @@ fn cmd_build(
     // Run cargo build in the generated dir
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("build");
-    if release { cmd.arg("--release"); }
+    if release {
+        cmd.arg("--release");
+    }
     cmd.current_dir(&out_dir);
     match cmd.status() {
         Ok(status) if status.success() => {
@@ -732,7 +791,7 @@ fn cmd_build(
 
 async fn cmd_run(
     file: &PathBuf,
-    _task: Option<&str>,  // Deprecated - tasks removed
+    _task: Option<&str>, // Deprecated - tasks removed
     tool: Option<&str>,
     prompt: Option<&str>,
     agent: Option<&str>,
@@ -811,15 +870,34 @@ async fn cmd_run(
         interpreter.run_pipeline(pipeline_name, input).await
     } else {
         // Default: try to run first tool/agent/etc or list available
-        let tools: Vec<String> = interpreter.tool_names().iter().map(|s| s.to_string()).collect();
-        let prompts: Vec<String> = interpreter.prompt_names().iter().map(|s| s.to_string()).collect();
-        let agents: Vec<String> = interpreter.agent_names().iter().map(|s| s.to_string()).collect();
-        let pipelines: Vec<String> = interpreter.pipeline_names().iter().map(|s| s.to_string()).collect();
+        let tools: Vec<String> = interpreter
+            .tool_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let prompts: Vec<String> = interpreter
+            .prompt_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let agents: Vec<String> = interpreter
+            .agent_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let pipelines: Vec<String> = interpreter
+            .pipeline_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let total = tools.len() + prompts.len() + agents.len() + pipelines.len();
 
         if total == 0 {
-            eprintln!("No tools, prompts, agents, or pipelines found in {}", file.display());
+            eprintln!(
+                "No tools, prompts, agents, or pipelines found in {}",
+                file.display()
+            );
             return ExitCode::FAILURE;
         }
 
@@ -829,19 +907,31 @@ async fn cmd_run(
                 eprintln!("Running default tool: {}", tool_name);
             }
             interpreter.run_tool(tool_name, input).await
-        } else if prompts.len() == 1 && tools.is_empty() && agents.is_empty() && pipelines.is_empty() {
+        } else if prompts.len() == 1
+            && tools.is_empty()
+            && agents.is_empty()
+            && pipelines.is_empty()
+        {
             let prompt_name = &prompts[0];
             if verbose {
                 eprintln!("Running default prompt: {}", prompt_name);
             }
             interpreter.run_prompt(prompt_name, input).await
-        } else if agents.len() == 1 && tools.is_empty() && prompts.is_empty() && pipelines.is_empty() {
+        } else if agents.len() == 1
+            && tools.is_empty()
+            && prompts.is_empty()
+            && pipelines.is_empty()
+        {
             let agent_name = &agents[0];
             if verbose {
                 eprintln!("Running default agent: {}", agent_name);
             }
             interpreter.run_agent(agent_name, input).await
-        } else if pipelines.len() == 1 && tools.is_empty() && prompts.is_empty() && agents.is_empty() {
+        } else if pipelines.len() == 1
+            && tools.is_empty()
+            && prompts.is_empty()
+            && agents.is_empty()
+        {
             let pipeline_name = &pipelines[0];
             if verbose {
                 eprintln!("Running default pipeline: {}", pipeline_name);
@@ -869,7 +959,8 @@ async fn cmd_run(
     match result {
         Ok(output) => {
             // Output the result as JSON
-            let json = serde_json::to_string_pretty(&output).unwrap_or_else(|_| format!("{:?}", output));
+            let json =
+                serde_json::to_string_pretty(&output).unwrap_or_else(|_| format!("{:?}", output));
             println!("{}", json);
             ExitCode::SUCCESS
         }

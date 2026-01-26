@@ -72,12 +72,26 @@ pub enum TypeIR {
     String,
     Bytes,
     Any,
-    List { element: Box<TypeIR> },
-    Map { key: Box<TypeIR>, value: Box<TypeIR> },
-    Option { inner: Box<TypeIR> },
-    Result { ok: Box<TypeIR>, err: Box<TypeIR> },
-    Struct { fields: HashMap<String, TypeIR> },
-    Named { name: String },
+    List {
+        element: Box<TypeIR>,
+    },
+    Map {
+        key: Box<TypeIR>,
+        value: Box<TypeIR>,
+    },
+    Option {
+        inner: Box<TypeIR>,
+    },
+    Result {
+        ok: Box<TypeIR>,
+        err: Box<TypeIR>,
+    },
+    Struct {
+        fields: HashMap<String, TypeIR>,
+    },
+    Named {
+        name: String,
+    },
 }
 
 /// Type reference IR (for input/output types)
@@ -92,11 +106,30 @@ pub enum TypeRefIR {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ExprIR {
-    Literal { value: LiteralIR },
-    Ident { name: String },
-    FieldAccess { base: Box<ExprIR>, field: String },
-    Binary { left: Box<ExprIR>, op: String, right: Box<ExprIR> },
-    Call { function: String, args: Vec<ExprIR> },
+    Literal {
+        value: LiteralIR,
+    },
+    Ident {
+        name: String,
+    },
+    FieldAccess {
+        base: Box<ExprIR>,
+        field: String,
+    },
+    Binary {
+        left: Box<ExprIR>,
+        op: String,
+        right: Box<ExprIR>,
+    },
+    Call {
+        function: String,
+        args: Vec<ExprIR>,
+    },
+    ForeignCall {
+        module: String,
+        function: String,
+        args: Vec<ExprIR>,
+    },
 }
 
 /// Literal value IR
@@ -203,23 +236,47 @@ pub enum ToolExprIR {
     /// Variable reference
     Ident { name: String },
     /// Field access
-    FieldAccess { base: Box<ToolExprIR>, field: String },
+    FieldAccess {
+        base: Box<ToolExprIR>,
+        field: String,
+    },
     /// Foreign function call
-    ForeignCall { module: String, function: String, args: Vec<ToolExprIR> },
+    ForeignCall {
+        module: String,
+        function: String,
+        args: Vec<ToolExprIR>,
+    },
     /// Local tool call
     ToolCall { tool: String, args: Vec<ToolExprIR> },
     /// Shell command
     Shell { command: String },
     /// Pipe expression
-    Pipe { left: Box<ToolExprIR>, right: Box<ToolExprIR> },
+    Pipe {
+        left: Box<ToolExprIR>,
+        right: Box<ToolExprIR>,
+    },
     /// Conditional
-    If { condition: ExprIR, then_branch: Box<ToolImplIR>, else_branch: Option<Box<ToolImplIR>> },
+    If {
+        condition: ExprIR,
+        then_branch: Box<ToolImplIR>,
+        else_branch: Option<Box<ToolImplIR>>,
+    },
     /// Match expression
-    Match { scrutinee: Box<ToolExprIR>, arms: Vec<MatchArmIR> },
+    Match {
+        scrutinee: Box<ToolExprIR>,
+        arms: Vec<MatchArmIR>,
+    },
     /// For loop
-    For { variable: String, iterable: Box<ToolExprIR>, body: Box<ToolImplIR> },
+    For {
+        variable: String,
+        iterable: Box<ToolExprIR>,
+        body: Box<ToolImplIR>,
+    },
     /// While loop
-    While { condition: ExprIR, body: Box<ToolImplIR> },
+    While {
+        condition: ExprIR,
+        body: Box<ToolImplIR>,
+    },
     /// Infinite loop
     Loop { body: Box<ToolImplIR> },
     /// Break out of loop

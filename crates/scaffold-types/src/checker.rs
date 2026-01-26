@@ -138,7 +138,10 @@ impl TypeChecker {
         for tool_ref in &agent_decl.tools {
             if !self.env.has_tool(&tool_ref.node) {
                 self.errors.push(TypeError::new(
-                    format!("undefined tool '{}' in agent '{}'", tool_ref.node, agent_decl.name.node),
+                    format!(
+                        "undefined tool '{}' in agent '{}'",
+                        tool_ref.node, agent_decl.name.node
+                    ),
                     tool_ref.span,
                 ));
             }
@@ -174,7 +177,10 @@ impl TypeChecker {
                 scaffold_syntax::ast::PipelineCall::Prompt { name, .. } => {
                     if !self.env.has_prompt(name) {
                         self.errors.push(TypeError::new(
-                            format!("undefined prompt '{}' in pipeline '{}'", name, pipeline_decl.name.node),
+                            format!(
+                                "undefined prompt '{}' in pipeline '{}'",
+                                name, pipeline_decl.name.node
+                            ),
                             step.span,
                         ));
                     }
@@ -183,7 +189,10 @@ impl TypeChecker {
                     // Check if it's a tool OR a prompt (parser doesn't distinguish)
                     if !self.env.has_tool(name) && !self.env.has_prompt(name) {
                         self.errors.push(TypeError::new(
-                            format!("undefined tool or prompt '{}' in pipeline '{}'", name, pipeline_decl.name.node),
+                            format!(
+                                "undefined tool or prompt '{}' in pipeline '{}'",
+                                name, pipeline_decl.name.node
+                            ),
                             step.span,
                         ));
                     }
@@ -257,7 +266,8 @@ impl TypeChecker {
                     // Comparison operators
                     BinOp::Eq | BinOp::Ne => {
                         // Allow comparing anything with null (Unit)
-                        let null_comparison = matches!(left_ty, Type::Unit) || matches!(right_ty, Type::Unit);
+                        let null_comparison =
+                            matches!(left_ty, Type::Unit) || matches!(right_ty, Type::Unit);
                         if !null_comparison && !left_ty.is_compatible_with(&right_ty) {
                             self.errors.push(TypeError::new(
                                 format!(
@@ -276,7 +286,8 @@ impl TypeChecker {
                                 left.span,
                             ));
                         }
-                        if !right_ty.is_comparable() && !matches!(right_ty, Type::Any | Type::Error) {
+                        if !right_ty.is_comparable() && !matches!(right_ty, Type::Any | Type::Error)
+                        {
                             self.errors.push(TypeError::new(
                                 format!("cannot compare type {} with {}", right_ty, op),
                                 right.span,
@@ -334,6 +345,19 @@ impl TypeChecker {
                 }
                 Type::Any
             }
+            Expr::ForeignCall {
+                module: _,
+                function: _,
+                args,
+            } => {
+                // Foreign function calls - type check arguments
+                // Return type is determined by the foreign function signature
+                // For now, treat as returning Any
+                for arg in args {
+                    self.check_expr(arg);
+                }
+                Type::Any
+            }
             Expr::Paren(inner) => self.check_expr(inner),
         }
     }
@@ -368,10 +392,7 @@ impl TypeChecker {
             TypeExpr::Struct(fields) => {
                 let mut type_fields = HashMap::new();
                 for field in fields {
-                    type_fields.insert(
-                        field.name.node.clone(),
-                        self.resolve_type_expr(&field.ty),
-                    );
+                    type_fields.insert(field.name.node.clone(), self.resolve_type_expr(&field.ty));
                 }
                 Type::Struct(StructType::with_fields(type_fields))
             }
@@ -494,7 +515,9 @@ mod tests {
         let result = check(&program);
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.message.contains("undefined tool 'nonexistent_tool'")));
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("undefined tool 'nonexistent_tool'")));
     }
 
     #[test]
@@ -512,7 +535,9 @@ mod tests {
         let result = check(&program);
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.message.contains("undefined tool or prompt 'nonexistent_call'")));
+        assert!(errors.iter().any(|e| e
+            .message
+            .contains("undefined tool or prompt 'nonexistent_call'")));
     }
 
     #[test]

@@ -95,7 +95,10 @@ pub async fn query_with_config(prompt: &str, llm_config: &LlmConfig) -> Result<S
         return Ok(format!("Mock LLM response for: {}", prompt));
     }
 
-    let model = llm_config.model.as_deref().unwrap_or(&config().default_model);
+    let model = llm_config
+        .model
+        .as_deref()
+        .unwrap_or(&config().default_model);
     let (provider, model_name) = parse_model_id(model);
 
     match provider {
@@ -230,11 +233,12 @@ pub async fn query_structured(prompt: &str, schema: &str) -> Result<crate::Value
     let json_str = extract_json(&response);
 
     // Parse into serde_json::Value first
-    let json_value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| Error::Runtime(format!(
+    let json_value: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+        Error::Runtime(format!(
             "Failed to parse LLM response as JSON: {}. Response was: {}",
             e, response
-        )))?;
+        ))
+    })?;
 
     // Convert to our Value type
     Ok(json_to_value(json_value))
@@ -285,9 +289,11 @@ fn json_to_value(v: serde_json::Value) -> crate::Value {
         serde_json::Value::Array(arr) => {
             crate::Value::List(arr.into_iter().map(json_to_value).collect())
         }
-        serde_json::Value::Object(obj) => {
-            crate::Value::Map(obj.into_iter().map(|(k, v)| (k, json_to_value(v))).collect())
-        }
+        serde_json::Value::Object(obj) => crate::Value::Map(
+            obj.into_iter()
+                .map(|(k, v)| (k, json_to_value(v)))
+                .collect(),
+        ),
     }
 }
 

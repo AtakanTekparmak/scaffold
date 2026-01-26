@@ -5,14 +5,14 @@
 use crate::error::{InterpreterError, Result};
 use crate::foreign::ForeignRegistry;
 use scaffold_ir::{
-    ToolIR, ToolImplIR, ToolExprIR, ExprIR, LiteralIR,
-    PromptIR, AgentIR, PipelineIR, PipelineCallIR, StringOrFileIR, TypeIR,
+    AgentIR, ExprIR, LiteralIR, PipelineCallIR, PipelineIR, PromptIR, StringOrFileIR, ToolExprIR,
+    ToolIR, ToolImplIR, TypeIR,
 };
 use scaffold_runtime::{PromptManager, Value};
 use std::collections::HashMap;
 use std::future::Future;
-use std::pin::Pin;
 use std::path::Path;
+use std::pin::Pin;
 
 /// Tool executor - executes tool implementations
 pub struct ToolExecutor {
@@ -98,7 +98,8 @@ impl ToolExecutor {
     /// Register pipelines
     pub fn register_pipelines(&mut self, pipelines: &[PipelineIR]) {
         for pipeline in pipelines {
-            self.pipelines.insert(pipeline.name.clone(), pipeline.clone());
+            self.pipelines
+                .insert(pipeline.name.clone(), pipeline.clone());
         }
     }
 
@@ -132,11 +133,13 @@ impl ToolExecutor {
                 } else {
                     Path::new(path).to_path_buf()
                 };
-                std::fs::read_to_string(&full_path)
-                    .map_err(|e| InterpreterError::Runtime(format!(
+                std::fs::read_to_string(&full_path).map_err(|e| {
+                    InterpreterError::Runtime(format!(
                         "Failed to read file '{}': {}",
-                        full_path.display(), e
-                    )))
+                        full_path.display(),
+                        e
+                    ))
+                })
             }
         }
     }
@@ -159,7 +162,8 @@ impl ToolExecutor {
             TypeIR::Option { inner } => self.type_to_json_schema(inner),
             TypeIR::Result { ok, .. } => self.type_to_json_schema(ok),
             TypeIR::Struct { fields } => {
-                let field_strs: Vec<String> = fields.iter()
+                let field_strs: Vec<String> = fields
+                    .iter()
                     .map(|(k, v)| format!("\"{}\": {}", k, self.type_to_json_schema(v)))
                     .collect();
                 format!("{{ {} }}", field_strs.join(", "))
@@ -187,7 +191,10 @@ impl ToolExecutor {
 
         // Execute implementation with expected output type
         let result = match &tool.implementation {
-            Some(impl_) => self.execute_impl(impl_, &input, prompts, Some(&tool.output)).await?,
+            Some(impl_) => {
+                self.execute_impl(impl_, &input, prompts, Some(&tool.output))
+                    .await?
+            }
             None => {
                 return Err(InterpreterError::Runtime(format!(
                     "Tool '{}' has no implementation",
@@ -233,7 +240,8 @@ impl ToolExecutor {
         let template = self.resolve_string_or_file(&prompt.template)?;
 
         // Interpolate template with input
-        let rendered = prompts.interpolate(&template, &input)
+        let rendered = prompts
+            .interpolate(&template, &input)
             .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
 
         // Generate JSON schema from output type
@@ -269,17 +277,22 @@ impl ToolExecutor {
         let mut conversation_history = Vec::new();
 
         // Add initial user input to history
-        let input_str = serde_json::to_string_pretty(&input)
-            .unwrap_or_else(|_| format!("{:?}", input));
+        let input_str =
+            serde_json::to_string_pretty(&input).unwrap_or_else(|_| format!("{:?}", input));
         conversation_history.push(format!("User input: {}", input_str));
 
         // Build tool descriptions for the system prompt
-        let tool_descriptions: Vec<String> = agent.tools.iter()
+        let tool_descriptions: Vec<String> = agent
+            .tools
+            .iter()
             .filter_map(|tool_name| {
                 self.tools.get(tool_name).map(|tool| {
                     let input_schema = self.type_to_json_schema(&tool.input);
                     let output_schema = self.type_to_json_schema(&tool.output);
-                    format!("- {}: input={}, output={}", tool.name, input_schema, output_schema)
+                    format!(
+                        "- {}: input={}, output={}",
+                        tool.name, input_schema, output_schema
+                    )
                 })
             })
             .collect();
@@ -295,7 +308,8 @@ impl ToolExecutor {
         loop {
             if turn >= max_turns {
                 return Err(InterpreterError::Runtime(format!(
-                    "Agent exceeded max_turns ({})", max_turns
+                    "Agent exceeded max_turns ({})",
+                    max_turns
                 )));
             }
             turn += 1;
@@ -319,11 +333,13 @@ impl ToolExecutor {
                     let json_str = response[done_idx + 5..].trim();
                     // Try to extract JSON from the response
                     let json_str = extract_json(json_str);
-                    let json_value: serde_json::Value = serde_json::from_str(json_str)
-                        .map_err(|e| InterpreterError::Runtime(format!(
-                            "Failed to parse agent final answer as JSON: {}. Response was: {}",
-                            e, json_str
-                        )))?;
+                    let json_value: serde_json::Value =
+                        serde_json::from_str(json_str).map_err(|e| {
+                            InterpreterError::Runtime(format!(
+                                "Failed to parse agent final answer as JSON: {}. Response was: {}",
+                                e, json_str
+                            ))
+                        })?;
                     return Ok(json_to_value(json_value));
                 }
             } else if response.contains("TOOL_CALL:") {
@@ -405,10 +421,9 @@ impl ToolExecutor {
             let result = match &step.call {
                 PipelineCallIR::Prompt { name, args } => {
                     // Get the prompt
-                    let prompt = self.prompts_ir.get(name).cloned()
-                        .ok_or_else(|| InterpreterError::Runtime(format!(
-                            "Prompt '{}' not found", name
-                        )))?;
+                    let prompt = self.prompts_ir.get(name).cloned().ok_or_else(|| {
+                        InterpreterError::Runtime(format!("Prompt '{}' not found", name))
+                    })?;
 
                     // Build input from args
                     let mut input_map = HashMap::new();
@@ -419,17 +434,22 @@ impl ToolExecutor {
 
                     for (i, arg) in args.iter().enumerate() {
                         let val = self.execute_tool_expr(arg, &ctx, prompts, None).await?;
-                        let key = field_names.get(i)
+                        let key = field_names
+                            .get(i)
                             .cloned()
                             .unwrap_or_else(|| format!("arg{}", i));
                         input_map.insert(key, val);
                     }
 
-                    self.execute_prompt(&prompt, Value::Map(input_map), prompts).await?
+                    self.execute_prompt(&prompt, Value::Map(input_map), prompts)
+                        .await?
                 }
                 PipelineCallIR::Tool { name, args } => {
                     // Get the tool
-                    let tool = self.tools.get(name).cloned()
+                    let tool = self
+                        .tools
+                        .get(name)
+                        .cloned()
                         .ok_or_else(|| InterpreterError::ToolNotFound(name.clone()))?;
 
                     // Build input from args
@@ -441,7 +461,8 @@ impl ToolExecutor {
 
                     for (i, arg) in args.iter().enumerate() {
                         let val = self.execute_tool_expr(arg, &ctx, prompts, None).await?;
-                        let key = field_names.get(i)
+                        let key = field_names
+                            .get(i)
                             .cloned()
                             .unwrap_or_else(|| format!("arg{}", i));
                         input_map.insert(key, val);
@@ -503,7 +524,9 @@ impl ToolExecutor {
 
                     for stmt in statements {
                         let ctx = Value::Map(bindings.clone());
-                        let value = self.execute_tool_expr(&stmt.expr, &ctx, prompts, None).await?;
+                        let value = self
+                            .execute_tool_expr(&stmt.expr, &ctx, prompts, None)
+                            .await?;
 
                         if let Some(ref name) = stmt.binding {
                             bindings.insert(name.clone(), value.clone());
@@ -538,7 +561,9 @@ impl ToolExecutor {
 
                     for stmt in statements {
                         let ctx = Value::Map(bindings.clone());
-                        let value = self.execute_tool_expr(&stmt.expr, &ctx, prompts, None).await?;
+                        let value = self
+                            .execute_tool_expr(&stmt.expr, &ctx, prompts, None)
+                            .await?;
 
                         if let Some(ref name) = stmt.binding {
                             bindings.insert(name.clone(), value.clone());
@@ -575,19 +600,16 @@ impl ToolExecutor {
     ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
             match expr {
-                ToolExprIR::Ident { name } => {
-                    self.get_value(ctx, name)
-                }
+                ToolExprIR::Ident { name } => self.get_value(ctx, name),
                 ToolExprIR::FieldAccess { base, field } => {
                     let base_val = self.execute_tool_expr(base, ctx, prompts, None).await?;
                     self.get_field(&base_val, field)
                 }
-                ToolExprIR::Literal { value } => {
-                    Ok(self.literal_to_value(value))
-                }
+                ToolExprIR::Literal { value } => Ok(self.literal_to_value(value)),
                 ToolExprIR::Shell { command } => {
                     // Interpolate variables in command
-                    let cmd = prompts.interpolate(command, ctx)
+                    let cmd = prompts
+                        .interpolate(command, ctx)
                         .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
                     if let Some(exp) = expected {
                         match exp {
@@ -629,12 +651,21 @@ impl ToolExecutor {
                                 if fields.len() == 1 {
                                     let (fname, fty) = fields.iter().next().unwrap();
                                     let inner = match fty {
-                                        TypeIR::Int => Value::Int(scaffold_runtime::parse::parse_i64(st)
-                                            .map_err(|e| InterpreterError::Runtime(e.to_string()))?),
-                                        TypeIR::Float => Value::Float(scaffold_runtime::parse::parse_f64(st)
-                                            .map_err(|e| InterpreterError::Runtime(e.to_string()))?),
-                                        TypeIR::Bool => Value::Bool(scaffold_runtime::parse::parse_bool(st)
-                                            .map_err(|e| InterpreterError::Runtime(e.to_string()))?),
+                                        TypeIR::Int => Value::Int(
+                                            scaffold_runtime::parse::parse_i64(st).map_err(
+                                                |e| InterpreterError::Runtime(e.to_string()),
+                                            )?,
+                                        ),
+                                        TypeIR::Float => Value::Float(
+                                            scaffold_runtime::parse::parse_f64(st).map_err(
+                                                |e| InterpreterError::Runtime(e.to_string()),
+                                            )?,
+                                        ),
+                                        TypeIR::Bool => Value::Bool(
+                                            scaffold_runtime::parse::parse_bool(st).map_err(
+                                                |e| InterpreterError::Runtime(e.to_string()),
+                                            )?,
+                                        ),
                                         TypeIR::String => Value::String(st.to_string()),
                                         _ => match serde_json::from_str::<serde_json::Value>(st) {
                                             Ok(j) => json_to_value(j),
@@ -663,7 +694,11 @@ impl ToolExecutor {
                         Ok(Value::String(output))
                     }
                 }
-                ToolExprIR::ForeignCall { module, function, args } => {
+                ToolExprIR::ForeignCall {
+                    module,
+                    function,
+                    args,
+                } => {
                     // Evaluate arguments
                     let mut arg_values = Vec::new();
                     for arg in args {
@@ -676,14 +711,14 @@ impl ToolExecutor {
                 }
                 ToolExprIR::ToolCall { tool, args } => {
                     // Look up the tool first to get input field names
-                    let tool_ir = self.get_tool(tool).cloned()
+                    let tool_ir = self
+                        .get_tool(tool)
+                        .cloned()
                         .ok_or_else(|| InterpreterError::ToolNotFound(tool.clone()))?;
 
                     // Get field names from tool's input type
                     let field_names: Vec<String> = match &tool_ir.input {
-                        scaffold_ir::TypeIR::Struct { fields } => {
-                            fields.keys().cloned().collect()
-                        }
+                        scaffold_ir::TypeIR::Struct { fields } => fields.keys().cloned().collect(),
                         _ => Vec::new(),
                     };
 
@@ -691,7 +726,8 @@ impl ToolExecutor {
                     let mut input_map = HashMap::new();
                     for (i, arg) in args.iter().enumerate() {
                         let val = self.execute_tool_expr(arg, ctx, prompts, None).await?;
-                        let key = field_names.get(i)
+                        let key = field_names
+                            .get(i)
                             .cloned()
                             .unwrap_or_else(|| format!("arg{}", i));
                         input_map.insert(key, val);
@@ -704,9 +740,14 @@ impl ToolExecutor {
                 ToolExprIR::Pipe { left, right } => {
                     let left_val = self.execute_tool_expr(left, ctx, prompts, None).await?;
                     // Use left result as input to right
-                    self.execute_tool_expr(right, &left_val, prompts, expected).await
+                    self.execute_tool_expr(right, &left_val, prompts, expected)
+                        .await
                 }
-                ToolExprIR::If { condition, then_branch, else_branch } => {
+                ToolExprIR::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
                     let cond = self.eval_expr(condition, ctx)?;
                     if cond.as_bool().unwrap_or(false) {
                         self.execute_impl(then_branch, ctx, prompts, expected).await
@@ -717,7 +758,9 @@ impl ToolExecutor {
                     }
                 }
                 ToolExprIR::Match { scrutinee, arms } => {
-                    let scrutinee_val = self.execute_tool_expr(scrutinee, ctx, prompts, None).await?;
+                    let scrutinee_val = self
+                        .execute_tool_expr(scrutinee, ctx, prompts, None)
+                        .await?;
 
                     for arm in arms {
                         // Simple pattern matching - check equality
@@ -730,16 +773,22 @@ impl ToolExecutor {
                     // No match - return null
                     Ok(Value::Null)
                 }
-                ToolExprIR::For { variable, iterable, body } => {
+                ToolExprIR::For {
+                    variable,
+                    iterable,
+                    body,
+                } => {
                     let iterable_val = self.execute_tool_expr(iterable, ctx, prompts, None).await?;
 
                     // Get list to iterate over
                     let items = match &iterable_val {
                         Value::List(items) => items.clone(),
-                        _ => return Err(InterpreterError::TypeMismatch {
-                            expected: "list".to_string(),
-                            actual: iterable_val.type_name().to_string(),
-                        }),
+                        _ => {
+                            return Err(InterpreterError::TypeMismatch {
+                                expected: "list".to_string(),
+                                actual: iterable_val.type_name().to_string(),
+                            })
+                        }
                     };
 
                     let mut last_result = Value::Null;
@@ -835,6 +884,19 @@ impl ToolExecutor {
 
                 self.eval_builtin(function, &arg_vals)
             }
+            ExprIR::ForeignCall {
+                module,
+                function,
+                args,
+            } => {
+                // Evaluate arguments and call foreign function
+                let arg_vals: Vec<Value> = args
+                    .iter()
+                    .map(|a| self.eval_expr(a, ctx))
+                    .collect::<Result<Vec<_>>>()?;
+
+                self.foreign_registry.call(module, function, arg_vals)
+            }
         }
     }
 
@@ -856,9 +918,13 @@ impl ToolExecutor {
             return Ok(ctx.clone());
         }
         match ctx {
-            Value::Map(m) => m.get(name).cloned()
+            Value::Map(m) => m
+                .get(name)
+                .cloned()
                 .ok_or_else(|| InterpreterError::VariableNotFound(name.to_string())),
-            Value::Struct { fields, .. } => fields.get(name).cloned()
+            Value::Struct { fields, .. } => fields
+                .get(name)
+                .cloned()
                 .ok_or_else(|| InterpreterError::VariableNotFound(name.to_string())),
             _ => Err(InterpreterError::VariableNotFound(name.to_string())),
         }
@@ -867,16 +933,22 @@ impl ToolExecutor {
     /// Get a field from a value
     fn get_field(&self, val: &Value, field: &str) -> Result<Value> {
         match val {
-            Value::Map(m) => m.get(field).cloned()
+            Value::Map(m) => m
+                .get(field)
+                .cloned()
                 .ok_or_else(|| InterpreterError::FieldNotFound {
                     type_name: "map".to_string(),
                     field: field.to_string(),
                 }),
-            Value::Struct { type_name, fields } => fields.get(field).cloned()
-                .ok_or_else(|| InterpreterError::FieldNotFound {
-                    type_name: type_name.clone(),
-                    field: field.to_string(),
-                }),
+            Value::Struct { type_name, fields } => {
+                fields
+                    .get(field)
+                    .cloned()
+                    .ok_or_else(|| InterpreterError::FieldNotFound {
+                        type_name: type_name.clone(),
+                        field: field.to_string(),
+                    })
+            }
             _ => Err(InterpreterError::FieldNotFound {
                 type_name: val.type_name().to_string(),
                 field: field.to_string(),
@@ -889,100 +961,84 @@ impl ToolExecutor {
         match op {
             "==" => Ok(Value::Bool(left == right)),
             "!=" => Ok(Value::Bool(left != right)),
-            "<" => {
-                match (left.as_int(), right.as_int()) {
+            "<" => match (left.as_int(), right.as_int()) {
+                (Some(l), Some(r)) => Ok(Value::Bool(l < r)),
+                _ => match (left.as_float(), right.as_float()) {
                     (Some(l), Some(r)) => Ok(Value::Bool(l < r)),
-                    _ => match (left.as_float(), right.as_float()) {
-                        (Some(l), Some(r)) => Ok(Value::Bool(l < r)),
-                        _ => Err(InterpreterError::TypeMismatch {
-                            expected: "number".to_string(),
-                            actual: format!("{}, {}", left.type_name(), right.type_name()),
-                        }),
-                    }
-                }
-            }
-            "<=" => {
-                match (left.as_int(), right.as_int()) {
+                    _ => Err(InterpreterError::TypeMismatch {
+                        expected: "number".to_string(),
+                        actual: format!("{}, {}", left.type_name(), right.type_name()),
+                    }),
+                },
+            },
+            "<=" => match (left.as_int(), right.as_int()) {
+                (Some(l), Some(r)) => Ok(Value::Bool(l <= r)),
+                _ => match (left.as_float(), right.as_float()) {
                     (Some(l), Some(r)) => Ok(Value::Bool(l <= r)),
-                    _ => match (left.as_float(), right.as_float()) {
-                        (Some(l), Some(r)) => Ok(Value::Bool(l <= r)),
-                        _ => Err(InterpreterError::TypeMismatch {
-                            expected: "number".to_string(),
-                            actual: format!("{}, {}", left.type_name(), right.type_name()),
-                        }),
-                    }
-                }
-            }
-            ">" => {
-                match (left.as_int(), right.as_int()) {
+                    _ => Err(InterpreterError::TypeMismatch {
+                        expected: "number".to_string(),
+                        actual: format!("{}, {}", left.type_name(), right.type_name()),
+                    }),
+                },
+            },
+            ">" => match (left.as_int(), right.as_int()) {
+                (Some(l), Some(r)) => Ok(Value::Bool(l > r)),
+                _ => match (left.as_float(), right.as_float()) {
                     (Some(l), Some(r)) => Ok(Value::Bool(l > r)),
-                    _ => match (left.as_float(), right.as_float()) {
-                        (Some(l), Some(r)) => Ok(Value::Bool(l > r)),
-                        _ => Err(InterpreterError::TypeMismatch {
-                            expected: "number".to_string(),
-                            actual: format!("{}, {}", left.type_name(), right.type_name()),
-                        }),
-                    }
-                }
-            }
-            ">=" => {
-                match (left.as_int(), right.as_int()) {
+                    _ => Err(InterpreterError::TypeMismatch {
+                        expected: "number".to_string(),
+                        actual: format!("{}, {}", left.type_name(), right.type_name()),
+                    }),
+                },
+            },
+            ">=" => match (left.as_int(), right.as_int()) {
+                (Some(l), Some(r)) => Ok(Value::Bool(l >= r)),
+                _ => match (left.as_float(), right.as_float()) {
                     (Some(l), Some(r)) => Ok(Value::Bool(l >= r)),
-                    _ => match (left.as_float(), right.as_float()) {
-                        (Some(l), Some(r)) => Ok(Value::Bool(l >= r)),
-                        _ => Err(InterpreterError::TypeMismatch {
-                            expected: "number".to_string(),
-                            actual: format!("{}, {}", left.type_name(), right.type_name()),
-                        }),
-                    }
-                }
-            }
-            "+" => {
-                match (left, right) {
-                    (Value::Int(l), Value::Int(r)) => Ok(Value::Int(l + r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
-                    (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 + r)),
-                    (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l + *r as f64)),
-                    (Value::String(l), Value::String(r)) => Ok(Value::String(format!("{}{}", l, r))),
-                    _ => Err(InterpreterError::TypeMismatch {
-                        expected: "number or string".to_string(),
-                        actual: format!("{}, {}", left.type_name(), right.type_name()),
-                    }),
-                }
-            }
-            "-" => {
-                match (left, right) {
-                    (Value::Int(l), Value::Int(r)) => Ok(Value::Int(l - r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
-                    (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 - r)),
-                    (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l - *r as f64)),
                     _ => Err(InterpreterError::TypeMismatch {
                         expected: "number".to_string(),
                         actual: format!("{}, {}", left.type_name(), right.type_name()),
                     }),
-                }
-            }
-            "*" => {
-                match (left, right) {
-                    (Value::Int(l), Value::Int(r)) => Ok(Value::Int(l * r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l * r)),
-                    (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 * r)),
-                    (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l * *r as f64)),
-                    _ => Err(InterpreterError::TypeMismatch {
-                        expected: "number".to_string(),
-                        actual: format!("{}, {}", left.type_name(), right.type_name()),
-                    }),
-                }
-            }
-            "/" => {
-                match (left, right) {
-                    (Value::Int(l), Value::Int(r)) if *r != 0 => Ok(Value::Int(l / r)),
-                    (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l / r)),
-                    (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 / r)),
-                    (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l / *r as f64)),
-                    _ => Err(InterpreterError::Runtime("Division error".to_string())),
-                }
-            }
+                },
+            },
+            "+" => match (left, right) {
+                (Value::Int(l), Value::Int(r)) => Ok(Value::Int(l + r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l + r)),
+                (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 + r)),
+                (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l + *r as f64)),
+                (Value::String(l), Value::String(r)) => Ok(Value::String(format!("{}{}", l, r))),
+                _ => Err(InterpreterError::TypeMismatch {
+                    expected: "number or string".to_string(),
+                    actual: format!("{}, {}", left.type_name(), right.type_name()),
+                }),
+            },
+            "-" => match (left, right) {
+                (Value::Int(l), Value::Int(r)) => Ok(Value::Int(l - r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l - r)),
+                (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 - r)),
+                (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l - *r as f64)),
+                _ => Err(InterpreterError::TypeMismatch {
+                    expected: "number".to_string(),
+                    actual: format!("{}, {}", left.type_name(), right.type_name()),
+                }),
+            },
+            "*" => match (left, right) {
+                (Value::Int(l), Value::Int(r)) => Ok(Value::Int(l * r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l * r)),
+                (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 * r)),
+                (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l * *r as f64)),
+                _ => Err(InterpreterError::TypeMismatch {
+                    expected: "number".to_string(),
+                    actual: format!("{}, {}", left.type_name(), right.type_name()),
+                }),
+            },
+            "/" => match (left, right) {
+                (Value::Int(l), Value::Int(r)) if *r != 0 => Ok(Value::Int(l / r)),
+                (Value::Float(l), Value::Float(r)) => Ok(Value::Float(l / r)),
+                (Value::Int(l), Value::Float(r)) => Ok(Value::Float(*l as f64 / r)),
+                (Value::Float(l), Value::Int(r)) => Ok(Value::Float(l / *r as f64)),
+                _ => Err(InterpreterError::Runtime("Division error".to_string())),
+            },
             "&&" | "and" => {
                 let l = left.as_bool().unwrap_or(false);
                 let r = right.as_bool().unwrap_or(false);
@@ -993,7 +1049,10 @@ impl ToolExecutor {
                 let r = right.as_bool().unwrap_or(false);
                 Ok(Value::Bool(l || r))
             }
-            _ => Err(InterpreterError::Runtime(format!("Unknown operator: {}", op))),
+            _ => Err(InterpreterError::Runtime(format!(
+                "Unknown operator: {}",
+                op
+            ))),
         }
     }
 
@@ -1012,12 +1071,14 @@ impl ToolExecutor {
                     Ok(Value::Int(0))
                 }
             }
-            "is_some" => {
-                Ok(Value::Bool(!matches!(args.first(), Some(Value::Null) | None)))
-            }
-            "is_none" => {
-                Ok(Value::Bool(matches!(args.first(), Some(Value::Null) | None)))
-            }
+            "is_some" => Ok(Value::Bool(!matches!(
+                args.first(),
+                Some(Value::Null) | None
+            ))),
+            "is_none" => Ok(Value::Bool(matches!(
+                args.first(),
+                Some(Value::Null) | None
+            ))),
             "not" => {
                 let b = args.first().and_then(|v| v.as_bool()).unwrap_or(false);
                 Ok(Value::Bool(!b))
@@ -1033,7 +1094,10 @@ impl ToolExecutor {
                     Ok(Value::Int(0))
                 }
             }
-            _ => Err(InterpreterError::Runtime(format!("Unknown function: {}", name))),
+            _ => Err(InterpreterError::Runtime(format!(
+                "Unknown function: {}",
+                name
+            ))),
         }
     }
 }
@@ -1069,18 +1133,16 @@ fn json_to_value(json: serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::String(s),
-        serde_json::Value::Array(arr) => {
-            Value::List(arr.into_iter().map(json_to_value).collect())
-        }
+        serde_json::Value::Array(arr) => Value::List(arr.into_iter().map(json_to_value).collect()),
         serde_json::Value::Object(obj) => {
-            let map: HashMap<String, Value> = obj.into_iter()
+            let map: HashMap<String, Value> = obj
+                .into_iter()
                 .map(|(k, v)| (k, json_to_value(v)))
                 .collect();
             Value::Map(map)
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1104,9 +1166,13 @@ mod tests {
         let ctx = Value::Map(HashMap::new());
 
         let expr = ExprIR::Binary {
-            left: Box::new(ExprIR::Literal { value: LiteralIR::Int { value: 10 } }),
+            left: Box::new(ExprIR::Literal {
+                value: LiteralIR::Int { value: 10 },
+            }),
             op: "+".to_string(),
-            right: Box::new(ExprIR::Literal { value: LiteralIR::Int { value: 5 } }),
+            right: Box::new(ExprIR::Literal {
+                value: LiteralIR::Int { value: 5 },
+            }),
         };
         let result = executor.eval_expr(&expr, &ctx).unwrap();
         assert_eq!(result, Value::Int(15));
@@ -1118,9 +1184,13 @@ mod tests {
         let ctx = Value::Map(HashMap::new());
 
         let expr = ExprIR::Binary {
-            left: Box::new(ExprIR::Literal { value: LiteralIR::Int { value: 10 } }),
+            left: Box::new(ExprIR::Literal {
+                value: LiteralIR::Int { value: 10 },
+            }),
             op: ">".to_string(),
-            right: Box::new(ExprIR::Literal { value: LiteralIR::Int { value: 5 } }),
+            right: Box::new(ExprIR::Literal {
+                value: LiteralIR::Int { value: 5 },
+            }),
         };
         let result = executor.eval_expr(&expr, &ctx).unwrap();
         assert_eq!(result, Value::Bool(true));
@@ -1139,7 +1209,9 @@ mod tests {
         };
 
         let expr = ExprIR::FieldAccess {
-            base: Box::new(ExprIR::Ident { name: "input".to_string() }),
+            base: Box::new(ExprIR::Ident {
+                name: "input".to_string(),
+            }),
             field: "x".to_string(),
         };
 

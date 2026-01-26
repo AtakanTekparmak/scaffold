@@ -191,7 +191,8 @@ impl Value {
             Value::String(s) => minijinja::Value::from(s.clone()),
             Value::Bytes(b) => minijinja::Value::from(format!("<{} bytes>", b.len())),
             Value::List(l) => {
-                let items: Vec<minijinja::Value> = l.iter().map(|v| v.to_template_value()).collect();
+                let items: Vec<minijinja::Value> =
+                    l.iter().map(|v| v.to_template_value()).collect();
                 minijinja::Value::from(items)
             }
             Value::Map(m) => {
@@ -228,7 +229,9 @@ impl fmt::Display for Value {
             Value::List(l) => {
                 write!(f, "[")?;
                 for (i, v) in l.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, "]")
@@ -236,7 +239,9 @@ impl fmt::Display for Value {
             Value::Map(m) => {
                 write!(f, "{{")?;
                 for (i, (k, v)) in m.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}: {}", k, v)?;
                 }
                 write!(f, "}}")
@@ -244,7 +249,9 @@ impl fmt::Display for Value {
             Value::Struct { type_name, fields } => {
                 write!(f, "{}{{", type_name)?;
                 for (i, (k, v)) in fields.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}: {}", k, v)?;
                 }
                 write!(f, "}}")

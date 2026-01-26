@@ -41,10 +41,7 @@ impl Type {
 
     /// Check if this type is comparable
     pub fn is_comparable(&self) -> bool {
-        matches!(
-            self,
-            Type::Int | Type::Float | Type::String | Type::Bool
-        )
+        matches!(self, Type::Int | Type::Float | Type::String | Type::Bool)
     }
 
     /// Check if this type is the error type
@@ -219,10 +216,7 @@ impl TypeEnv {
     /// Resolve a named type to its definition
     pub fn resolve_type(&self, ty: &Type) -> Type {
         match ty {
-            Type::Named(name) => self
-                .lookup_type(name)
-                .cloned()
-                .unwrap_or(Type::Error),
+            Type::Named(name) => self.lookup_type(name).cloned().unwrap_or(Type::Error),
             Type::List(inner) => Type::List(Box::new(self.resolve_type(inner))),
             Type::Map(k, v) => Type::Map(
                 Box::new(self.resolve_type(k)),
@@ -250,4 +244,3 @@ impl Default for TypeEnv {
         Self::new()
     }
 }
-

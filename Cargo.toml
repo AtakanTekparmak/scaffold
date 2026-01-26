@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scaffold-syntax",
+    "crates/scaffold-types",
+    "crates/scaffold-verify",
+    "crates/scaffold-ir",
+    "crates/scaffold-runtime",
+    "crates/scaffold-codegen",
+    "crates/scaffold-interpreter",
+    "crates/scaffold-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Scaffold Lang Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Parsing
+logos = "0.14"
+
+# Error reporting
+ariadne = "0.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Graph analysis
+petgraph = "0.6"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Internal crates
+scaffold-syntax = { path = "crates/scaffold-syntax" }
+scaffold-types = { path = "crates/scaffold-types" }
+scaffold-verify = { path = "crates/scaffold-verify" }
+scaffold-ir = { path = "crates/scaffold-ir" }
+scaffold-runtime = { path = "crates/scaffold-runtime" }
+scaffold-codegen = { path = "crates/scaffold-codegen" }
+scaffold-interpreter = { path = "crates/scaffold-interpreter" }
+
+# Code generation
+proc-macro2 = "1.0"
+quote = "1.0"
+heck = "0.5"
+thiserror = "1.0"

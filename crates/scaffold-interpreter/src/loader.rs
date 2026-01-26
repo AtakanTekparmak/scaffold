@@ -24,7 +24,9 @@ impl Default for Loader {
 impl Loader {
     /// Create a new loader
     pub fn new() -> Self {
-        Self { verify_enabled: false }
+        Self {
+            verify_enabled: false,
+        }
     }
 
     /// Enable verification
@@ -47,9 +49,7 @@ impl Loader {
     /// Load from source string
     pub fn load_source(&self, source: &str, filename: &str) -> Result<ScaffoldIR> {
         // Parse
-        let ast = parse(source).map_err(|e| {
-            InterpreterError::ParseError(e.message)
-        })?;
+        let ast = parse(source).map_err(|e| InterpreterError::ParseError(e.message))?;
 
         // Type check
         let type_env = check(&ast).map_err(|errors| {
@@ -62,7 +62,9 @@ impl Loader {
 
         // Check for verification errors
         if self.verify_enabled && verify_result.has_errors() {
-            let error_msgs: Vec<String> = verify_result.errors.iter()
+            let error_msgs: Vec<String> = verify_result
+                .errors
+                .iter()
                 .map(|e| e.message.clone())
                 .collect();
             return Err(InterpreterError::Runtime(format!(
@@ -73,7 +75,8 @@ impl Loader {
 
         // Lower to IR
         let lowerer = Lowerer::new().with_source_file(filename.to_string());
-        let ir = lowerer.lower(&ast, &type_env)
+        let ir = lowerer
+            .lower(&ast, &type_env)
             .map_err(|e| InterpreterError::Runtime(format!("IR lowering failed: {}", e.message)))?;
 
         Ok(ir)

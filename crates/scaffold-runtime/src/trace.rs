@@ -412,7 +412,9 @@ mod tests {
 
         let records = tracer.get_records();
         assert_eq!(records.len(), 1);
-        assert!(matches!(&records[0].event, TraceEvent::ToolCall { tool_name, .. } if tool_name == "test_tool"));
+        assert!(
+            matches!(&records[0].event, TraceEvent::ToolCall { tool_name, .. } if tool_name == "test_tool")
+        );
     }
 
     #[test]

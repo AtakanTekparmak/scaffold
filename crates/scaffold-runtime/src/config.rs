@@ -174,7 +174,11 @@ impl Config {
         match provider {
             "openai" => self.llm.openai.api_key.as_deref(),
             "anthropic" => self.llm.anthropic.api_key.as_deref(),
-            other => self.llm.providers.get(other).and_then(|p| p.api_key.as_deref()),
+            other => self
+                .llm
+                .providers
+                .get(other)
+                .and_then(|p| p.api_key.as_deref()),
         }
     }
 
@@ -183,7 +187,11 @@ impl Config {
         match provider {
             "openai" => self.llm.openai.base_url.as_deref(),
             "anthropic" => self.llm.anthropic.base_url.as_deref(),
-            other => self.llm.providers.get(other).and_then(|p| p.base_url.as_deref()),
+            other => self
+                .llm
+                .providers
+                .get(other)
+                .and_then(|p| p.base_url.as_deref()),
         }
     }
 
@@ -256,8 +264,14 @@ mod tests {
     fn test_parse_model_id() {
         assert_eq!(parse_model_id("gpt-4"), ("openai", "gpt-4"));
         assert_eq!(parse_model_id("gpt-4o-mini"), ("openai", "gpt-4o-mini"));
-        assert_eq!(parse_model_id("claude-3-sonnet"), ("anthropic", "claude-3-sonnet"));
-        assert_eq!(parse_model_id("anthropic/claude-3-opus"), ("anthropic", "claude-3-opus"));
+        assert_eq!(
+            parse_model_id("claude-3-sonnet"),
+            ("anthropic", "claude-3-sonnet")
+        );
+        assert_eq!(
+            parse_model_id("anthropic/claude-3-opus"),
+            ("anthropic", "claude-3-opus")
+        );
         assert_eq!(parse_model_id("ollama/llama3"), ("ollama", "llama3"));
     }
 

@@ -4,7 +4,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use scaffold_ir::{ExternCrateIR, ForeignModuleIR, ForeignFnIR, ForeignTypeAliasIR, TypeIR};
+use scaffold_ir::{ExternCrateIR, ForeignFnIR, ForeignModuleIR, ForeignTypeAliasIR, TypeIR};
 
 use crate::types::gen_type;
 use crate::util::{to_snake_case, to_type_name};
@@ -74,16 +74,19 @@ fn parse_type_path(path: &str) -> TokenStream {
         return quote! { () };
     }
 
-    let idents: Vec<_> = segments.iter().map(|s| {
-        // Handle generic parameters like "Elf<'static>"
-        if let Some(idx) = s.find('<') {
-            let name = &s[..idx];
-            // Strip generics - they'll be handled separately
-            format_ident!("{}", name)
-        } else {
-            format_ident!("{}", *s)
-        }
-    }).collect();
+    let idents: Vec<_> = segments
+        .iter()
+        .map(|s| {
+            // Handle generic parameters like "Elf<'static>"
+            if let Some(idx) = s.find('<') {
+                let name = &s[..idx];
+                // Strip generics - they'll be handled separately
+                format_ident!("{}", name)
+            } else {
+                format_ident!("{}", *s)
+            }
+        })
+        .collect();
 
     // Check if the original path has lifetime parameters
     let has_lifetime = path.contains("<'");
@@ -109,20 +112,26 @@ fn parse_type_path(path: &str) -> TokenStream {
 /// Generate a foreign module with type aliases and function bindings
 pub fn gen_foreign_module(module: &ForeignModuleIR) -> TokenStream {
     // Generate type re-exports that reference actual external types
-    let type_reexports: Vec<_> = module.type_aliases.iter().map(|alias| {
-        let scaffold_name = format_ident!("{}", to_type_name(&alias.name));
-        let doc = format!("Type alias for `{}`", alias.external_type);
+    let type_reexports: Vec<_> = module
+        .type_aliases
+        .iter()
+        .map(|alias| {
+            let scaffold_name = format_ident!("{}", to_type_name(&alias.name));
+            let doc = format!("Type alias for `{}`", alias.external_type);
 
-        quote! {
-            #[doc = #doc]
-            pub use crate::foreign_types::#scaffold_name;
-        }
-    }).collect();
+            quote! {
+                #[doc = #doc]
+                pub use crate::foreign_types::#scaffold_name;
+            }
+        })
+        .collect();
 
     // Generate function bindings
-    let functions: Vec<_> = module.functions.iter().map(|func| {
-        gen_foreign_fn(&module.name, func, &module.type_aliases)
-    }).collect();
+    let functions: Vec<_> = module
+        .functions
+        .iter()
+        .map(|func| gen_foreign_fn(&module.name, func, &module.type_aliases))
+        .collect();
 
     let mod_doc = format!("Foreign bindings for `{} {}`", module.language, module.name);
 
@@ -142,22 +151,32 @@ pub fn gen_foreign_module(module: &ForeignModuleIR) -> TokenStream {
 }
 
 /// Generate a foreign function binding that actually calls the external function
-fn gen_foreign_fn(module_name: &str, func: &ForeignFnIR, type_aliases: &[ForeignTypeAliasIR]) -> TokenStream {
+fn gen_foreign_fn(
+    module_name: &str,
+    func: &ForeignFnIR,
+    type_aliases: &[ForeignTypeAliasIR],
+) -> TokenStream {
     let fn_name = format_ident!("{}", to_snake_case(&func.name));
 
     // Generate parameters
-    let params: Vec<_> = func.params.iter().map(|p| {
-        let name = format_ident!("{}", to_snake_case(&p.name));
-        let ty = gen_type(&p.ty);
-        quote! { #name: #ty }
-    }).collect();
+    let params: Vec<_> = func
+        .params
+        .iter()
+        .map(|p| {
+            let name = format_ident!("{}", to_snake_case(&p.name));
+            let ty = gen_type(&p.ty);
+            quote! { #name: #ty }
+        })
+        .collect();
 
     let return_ty = gen_type(&func.return_type);
 
     // Generate parameter names for the call
-    let param_names: Vec<_> = func.params.iter().map(|p| {
-        format_ident!("{}", to_snake_case(&p.name))
-    }).collect();
+    let param_names: Vec<_> = func
+        .params
+        .iter()
+        .map(|p| format_ident!("{}", to_snake_case(&p.name)))
+        .collect();
 
     // Generate the function body based on the return type
     let body = gen_foreign_fn_body(func, &param_names, type_aliases);
@@ -173,18 +192,26 @@ fn gen_foreign_fn(module_name: &str, func: &ForeignFnIR, type_aliases: &[Foreign
 }
 
 /// Generate the body of a foreign function
-fn gen_foreign_fn_body(func: &ForeignFnIR, param_names: &[proc_macro2::Ident], _type_aliases: &[ForeignTypeAliasIR]) -> TokenStream {
+fn gen_foreign_fn_body(
+    func: &ForeignFnIR,
+    param_names: &[proc_macro2::Ident],
+    _type_aliases: &[ForeignTypeAliasIR],
+) -> TokenStream {
     // Check if return type is Result
     let is_result = matches!(&func.return_type, TypeIR::Result { .. });
 
     // Generate parameter conversions
-    let conversions: Vec<_> = func.params.iter().zip(param_names.iter()).map(|(param, name)| {
-        gen_param_conversion(name, &param.ty)
-    }).collect();
+    let conversions: Vec<_> = func
+        .params
+        .iter()
+        .zip(param_names.iter())
+        .map(|(param, name)| gen_param_conversion(name, &param.ty))
+        .collect();
 
-    let converted_names: Vec<_> = param_names.iter().map(|n| {
-        format_ident!("{}_converted", n)
-    }).collect();
+    let converted_names: Vec<_> = param_names
+        .iter()
+        .map(|n| format_ident!("{}_converted", n))
+        .collect();
 
     // The actual foreign call placeholder - users implement this in foreign_impl module
     let fn_name = to_snake_case(&func.name);
@@ -300,11 +327,15 @@ pub fn gen_foreign_impl_module(modules: &[ForeignModuleIR]) -> TokenStream {
             let fn_name = format_ident!("{}_impl", to_snake_case(&func.name));
 
             // Generate parameters with converted types
-            let params: Vec<_> = func.params.iter().map(|p| {
-                let name = format_ident!("{}_converted", to_snake_case(&p.name));
-                let ty = gen_impl_param_type(&p.ty);
-                quote! { #name: #ty }
-            }).collect();
+            let params: Vec<_> = func
+                .params
+                .iter()
+                .map(|p| {
+                    let name = format_ident!("{}_converted", to_snake_case(&p.name));
+                    let ty = gen_impl_param_type(&p.ty);
+                    quote! { #name: #ty }
+                })
+                .collect();
 
             let return_ty = gen_type(&func.return_type);
 
@@ -352,7 +383,11 @@ fn gen_impl_param_type(ty: &TypeIR) -> TokenStream {
 }
 
 /// Generate an example implementation comment
-fn gen_impl_example(fn_name: &str, type_aliases: &[ForeignTypeAliasIR], func: &ForeignFnIR) -> String {
+fn gen_impl_example(
+    fn_name: &str,
+    type_aliases: &[ForeignTypeAliasIR],
+    func: &ForeignFnIR,
+) -> String {
     let mut example = String::from("```rust,ignore\n");
 
     // Check if this looks like a parse function
@@ -367,12 +402,14 @@ fn gen_impl_example(fn_name: &str, type_aliases: &[ForeignTypeAliasIR], func: &F
                     ));
                     example.push_str(&format!(
                         "let parsed = {}::parse(data)\n",
-                        alias.external_type.split("::").take(2).collect::<Vec<_>>().join("::")
+                        alias
+                            .external_type
+                            .split("::")
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .join("::")
                     ));
-                    example.push_str(&format!(
-                        "    .map(|v| {}::new(v))\n",
-                        name
-                    ));
+                    example.push_str(&format!("    .map(|v| {}::new(v))\n", name));
                     example.push_str("    .map_err(|e| e.to_string())\n");
                 }
             }
@@ -386,7 +423,7 @@ fn gen_impl_example(fn_name: &str, type_aliases: &[ForeignTypeAliasIR], func: &F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scaffold_ir::{ForeignTypeAliasIR, ForeignParamIR, TypeIR};
+    use scaffold_ir::{ForeignParamIR, ForeignTypeAliasIR, TypeIR};
 
     #[test]
     fn test_gen_extern_crate_deps() {
@@ -413,27 +450,23 @@ mod tests {
         let module = ForeignModuleIR {
             language: "rust".to_string(),
             name: "parsing".to_string(),
-            type_aliases: vec![
-                ForeignTypeAliasIR {
-                    name: "ElfBinary".to_string(),
-                    external_type: "goblin::elf::Elf".to_string(),
-                }
-            ],
-            functions: vec![
-                ForeignFnIR {
-                    name: "parse_elf".to_string(),
-                    params: vec![
-                        ForeignParamIR {
-                            name: "data".to_string(),
-                            ty: TypeIR::Bytes,
-                        }
-                    ],
-                    return_type: TypeIR::Result {
-                        ok: Box::new(TypeIR::Named { name: "ElfBinary".to_string() }),
-                        err: Box::new(TypeIR::String),
-                    },
-                }
-            ],
+            type_aliases: vec![ForeignTypeAliasIR {
+                name: "ElfBinary".to_string(),
+                external_type: "goblin::elf::Elf".to_string(),
+            }],
+            functions: vec![ForeignFnIR {
+                name: "parse_elf".to_string(),
+                params: vec![ForeignParamIR {
+                    name: "data".to_string(),
+                    ty: TypeIR::Bytes,
+                }],
+                return_type: TypeIR::Result {
+                    ok: Box::new(TypeIR::Named {
+                        name: "ElfBinary".to_string(),
+                    }),
+                    err: Box::new(TypeIR::String),
+                },
+            }],
         };
 
         let code = gen_foreign_module(&module).to_string();
@@ -452,25 +485,19 @@ mod tests {
 
     #[test]
     fn test_gen_foreign_impl_module() {
-        let modules = vec![
-            ForeignModuleIR {
-                language: "rust".to_string(),
-                name: "parsing".to_string(),
-                type_aliases: vec![],
-                functions: vec![
-                    ForeignFnIR {
-                        name: "parse_data".to_string(),
-                        params: vec![
-                            ForeignParamIR {
-                                name: "input".to_string(),
-                                ty: TypeIR::Bytes,
-                            }
-                        ],
-                        return_type: TypeIR::String,
-                    }
-                ],
-            }
-        ];
+        let modules = vec![ForeignModuleIR {
+            language: "rust".to_string(),
+            name: "parsing".to_string(),
+            type_aliases: vec![],
+            functions: vec![ForeignFnIR {
+                name: "parse_data".to_string(),
+                params: vec![ForeignParamIR {
+                    name: "input".to_string(),
+                    ty: TypeIR::Bytes,
+                }],
+                return_type: TypeIR::String,
+            }],
+        }];
 
         let code = gen_foreign_impl_module(&modules).to_string();
         assert!(code.contains("parse_data_impl"));

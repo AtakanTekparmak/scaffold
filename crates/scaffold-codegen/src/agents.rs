@@ -59,12 +59,16 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
     let max_turns = agent.max_turns.unwrap_or(10);
 
     // Generate tool registration calls for rig agent builder
-    let tool_registrations: Vec<_> = agent.tools.iter().map(|t| {
-        let tool_struct = format_ident!("{}Tool", to_pascal_case(t));
-        quote! {
-            .tool(crate::tools::#tool_struct::new())
-        }
-    }).collect();
+    let tool_registrations: Vec<_> = agent
+        .tools
+        .iter()
+        .map(|t| {
+            let tool_struct = format_ident!("{}Tool", to_pascal_case(t));
+            quote! {
+                .tool(crate::tools::#tool_struct::new())
+            }
+        })
+        .collect();
 
     let doc = format!("Agent: {}", agent_name);
 
@@ -292,9 +296,12 @@ mod tests {
                 fields: {
                     let mut f = HashMap::new();
                     f.insert("answer".to_string(), TypeIR::String);
-                    f.insert("sources".to_string(), TypeIR::List {
-                        element: Box::new(TypeIR::String),
-                    });
+                    f.insert(
+                        "sources".to_string(),
+                        TypeIR::List {
+                            element: Box::new(TypeIR::String),
+                        },
+                    );
                     f
                 },
             },

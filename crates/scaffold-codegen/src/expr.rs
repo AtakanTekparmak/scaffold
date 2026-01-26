@@ -13,6 +13,24 @@ pub fn gen_expr(expr: &ExprIR) -> TokenStream {
         ExprIR::FieldAccess { base, field } => gen_field_access(base, field),
         ExprIR::Binary { left, op, right } => gen_binary(left, op, right),
         ExprIR::Call { function, args } => gen_call(function, args),
+        ExprIR::ForeignCall {
+            module,
+            function,
+            args,
+        } => gen_foreign_call(module, function, args),
+    }
+}
+
+/// Generate foreign function call
+fn gen_foreign_call(module: &str, function: &str, args: &[ExprIR]) -> TokenStream {
+    let arg_exprs: Vec<_> = args.iter().map(gen_expr).collect();
+    let module_ident = format_ident!("{}", to_ident(module));
+    let func_ident = format_ident!("{}", to_ident(function));
+
+    if arg_exprs.is_empty() {
+        quote! { #module_ident::#func_ident() }
+    } else {
+        quote! { #module_ident::#func_ident(#(#arg_exprs),*) }
     }
 }
 
@@ -82,20 +100,30 @@ pub fn gen_condition_with_input_fields(expr: &ExprIR, input_fields: &[String]) -
 
 /// Generate condition expression with both input and state field prefixing
 /// Input fields are prefixed with "input.", state fields with "self.state."
-pub fn gen_condition_with_fields(expr: &ExprIR, input_fields: &[String], state_fields: &[String]) -> TokenStream {
+pub fn gen_condition_with_fields(
+    expr: &ExprIR,
+    input_fields: &[String],
+    state_fields: &[String],
+) -> TokenStream {
     gen_expr_with_field_prefixing(expr, input_fields, state_fields)
 }
 
 /// Check if an expression is a null literal
 fn is_null_literal(expr: &ExprIR) -> bool {
     match expr {
-        ExprIR::Literal { value: LiteralIR::Null } => true,
+        ExprIR::Literal {
+            value: LiteralIR::Null,
+        } => true,
         ExprIR::Ident { name } if name == "null" || name == "None" => true,
         _ => false,
     }
 }
 
-fn gen_expr_with_field_prefixing(expr: &ExprIR, input_fields: &[String], state_fields: &[String]) -> TokenStream {
+fn gen_expr_with_field_prefixing(
+    expr: &ExprIR,
+    input_fields: &[String],
+    state_fields: &[String],
+) -> TokenStream {
     match expr {
         ExprIR::Literal { value } => gen_literal(value),
         ExprIR::Ident { name } => {
@@ -177,8 +205,17 @@ fn gen_expr_with_field_prefixing(expr: &ExprIR, input_fields: &[String], state_f
 
             // Check if this is a built-in function (don't pass by reference)
             let builtins = [
-                "len", "is_empty", "contains", "is_some", "is_none",
-                "unwrap", "unwrap_or", "abs", "min", "max", "not"
+                "len",
+                "is_empty",
+                "contains",
+                "is_some",
+                "is_none",
+                "unwrap",
+                "unwrap_or",
+                "abs",
+                "min",
+                "max",
+                "not",
             ];
 
             if builtins.contains(&function.as_str()) {
@@ -196,10 +233,32 @@ fn gen_expr_with_field_prefixing(expr: &ExprIR, input_fields: &[String], state_f
                 }
             }
         }
+        ExprIR::ForeignCall {
+            module,
+            function,
+            args,
+        } => {
+            let arg_exprs: Vec<_> = args
+                .iter()
+                .map(|a| gen_expr_with_field_prefixing(a, input_fields, state_fields))
+                .collect();
+            let module_ident = format_ident!("{}", to_ident(module));
+            let func_ident = format_ident!("{}", to_ident(function));
+
+            if arg_exprs.is_empty() {
+                quote! { #module_ident::#func_ident() }
+            } else {
+                quote! { #module_ident::#func_ident(#(#arg_exprs),*) }
+            }
+        }
     }
 }
 
-fn gen_expr_with_input_prefix(expr: &ExprIR, prefix_all: bool, input_fields: &[String]) -> TokenStream {
+fn gen_expr_with_input_prefix(
+    expr: &ExprIR,
+    prefix_all: bool,
+    input_fields: &[String],
+) -> TokenStream {
     match expr {
         ExprIR::Literal { value } => gen_literal(value),
         ExprIR::Ident { name } => {
@@ -260,6 +319,24 @@ fn gen_expr_with_input_prefix(expr: &ExprIR, prefix_all: bool, input_fields: &[S
                 quote! { #func_name() }
             } else {
                 quote! { #func_name(#(#arg_exprs),*) }
+            }
+        }
+        ExprIR::ForeignCall {
+            module,
+            function,
+            args,
+        } => {
+            let arg_exprs: Vec<_> = args
+                .iter()
+                .map(|a| gen_expr_with_input_prefix(a, prefix_all, input_fields))
+                .collect();
+            let module_ident = format_ident!("{}", to_ident(module));
+            let func_ident = format_ident!("{}", to_ident(function));
+
+            if arg_exprs.is_empty() {
+                quote! { #module_ident::#func_ident() }
+            } else {
+                quote! { #module_ident::#func_ident(#(#arg_exprs),*) }
             }
         }
     }
@@ -464,6 +541,16 @@ fn rewrite_expr(expr: &ExprIR, input_name: &str) -> TokenStream {
             let rewritten_args: Vec<_> = args.iter().map(|a| rewrite_expr(a, input_name)).collect();
             let func_name = format_ident!("{}", to_ident(function));
             quote! { #func_name(#(#rewritten_args),*) }
+        }
+        ExprIR::ForeignCall {
+            module,
+            function,
+            args,
+        } => {
+            let rewritten_args: Vec<_> = args.iter().map(|a| rewrite_expr(a, input_name)).collect();
+            let module_ident = format_ident!("{}", to_ident(module));
+            let func_ident = format_ident!("{}", to_ident(function));
+            quote! { #module_ident::#func_ident(#(#rewritten_args),*) }
         }
         _ => gen_expr(expr),
     }
