@@ -1,0 +1,10 @@
+[package]
+name = "scaffold-verify"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scaffold-syntax.workspace = true
+scaffold-types.workspace = true
+petgraph.workspace = true
+ariadne.workspace = true

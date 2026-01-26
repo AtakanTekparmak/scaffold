@@ -1,0 +1,8 @@
+[package]
+name = "scaffold-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+scaffold-syntax.workspace = true
+ariadne.workspace = true

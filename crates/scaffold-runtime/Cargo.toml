@@ -1,0 +1,25 @@
+[package]
+name = "scaffold-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Runtime library for scaffold-generated code"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+minijinja = "2.0"  # Fast Jinja2-compatible templating
+tokio = { version = "1.0", features = ["full"] }
+toml = "0.8"
+dirs = "5.0"
+
+# LLM providers via rig.rs
+rig = { package = "rig-core", version = "0.29" }
+schemars = "0.8"
+
+# Provider-specific crates (features control which are included)
+[features]
+default = ["openai", "anthropic"]
+openai = []
+anthropic = []
+all-providers = ["openai", "anthropic"]

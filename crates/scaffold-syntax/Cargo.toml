@@ -1,0 +1,8 @@
+[package]
+name = "scaffold-syntax"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+logos.workspace = true
+ariadne.workspace = true
