@@ -6,7 +6,7 @@ use crate::error::{InterpreterError, Result};
 use crate::foreign::ForeignRegistry;
 use scaffold_ir::{
     AgentIR, ExprIR, LiteralIR, PipelineCallIR, PipelineIR, PromptIR, StringOrFileIR, ToolExprIR,
-    ToolIR, ToolImplIR, TypeIR,
+    ToolIR, ToolImplIR, TypeDefIR, TypeIR,
 };
 use scaffold_runtime::{PromptManager, Value};
 use std::collections::HashMap;
@@ -27,6 +27,8 @@ pub struct ToolExecutor {
     agents: HashMap<String, AgentIR>,
     /// Registered pipelines
     pipelines: HashMap<String, PipelineIR>,
+    /// Registered type definitions (for resolving Named types)
+    types: HashMap<String, TypeDefIR>,
     /// Base path for file() references
     base_path: Option<std::path::PathBuf>,
     /// Foreign function registry
@@ -47,6 +49,7 @@ impl ToolExecutor {
             prompts_ir: HashMap::new(),
             agents: HashMap::new(),
             pipelines: HashMap::new(),
+            types: HashMap::new(),
             base_path: None,
             foreign_registry: ForeignRegistry::new(),
         }
@@ -100,6 +103,27 @@ impl ToolExecutor {
         for pipeline in pipelines {
             self.pipelines
                 .insert(pipeline.name.clone(), pipeline.clone());
+        }
+    }
+
+    /// Register type definitions
+    pub fn register_types(&mut self, types: &[TypeDefIR]) {
+        for type_def in types {
+            self.types.insert(type_def.name.clone(), type_def.clone());
+        }
+    }
+
+    /// Resolve a type, looking up Named types in the types registry
+    fn resolve_type<'a>(&'a self, ty: &'a TypeIR) -> &'a TypeIR {
+        match ty {
+            TypeIR::Named { name } => {
+                if let Some(type_def) = self.types.get(name) {
+                    &type_def.definition
+                } else {
+                    ty
+                }
+            }
+            _ => ty,
         }
     }
 
@@ -483,7 +507,9 @@ impl ToolExecutor {
         }
 
         // If pipeline declares a struct output, synthesize from bindings
-        if let TypeIR::Struct { fields } = &pipeline.output {
+        // Resolve Named types to get the actual struct fields
+        let resolved_output = self.resolve_type(&pipeline.output);
+        if let TypeIR::Struct { fields } = resolved_output {
             let mut out_map: HashMap<String, Value> = HashMap::new();
             for (k, _) in fields {
                 if let Some(v) = bindings.get(k).cloned() {

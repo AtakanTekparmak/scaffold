@@ -80,6 +80,7 @@ impl Interpreter {
         tool_executor.register_prompts(&ir.prompts);
         tool_executor.register_agents(&ir.agents);
         tool_executor.register_pipelines(&ir.pipelines);
+        tool_executor.register_types(&ir.types);
 
         Ok(Self {
             ir,
@@ -98,6 +99,7 @@ impl Interpreter {
         self.tool_executor.register_prompts(&self.ir.prompts);
         self.tool_executor.register_agents(&self.ir.agents);
         self.tool_executor.register_pipelines(&self.ir.pipelines);
+        self.tool_executor.register_types(&self.ir.types);
         self.prompts
             .reload()
             .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
