@@ -29,11 +29,19 @@ pub type LowerResult<T> = Result<T, LowerError>;
 pub struct Lowerer {
     /// Source file name (for debugging)
     source_file: Option<String>,
+    /// Known tool names (for classifying pipeline calls)
+    tool_names: std::collections::HashSet<String>,
+    /// Known prompt names (for classifying pipeline calls)
+    prompt_names: std::collections::HashSet<String>,
 }
 
 impl Lowerer {
     pub fn new() -> Self {
-        Self { source_file: None }
+        Self {
+            source_file: None,
+            tool_names: std::collections::HashSet::new(),
+            prompt_names: std::collections::HashSet::new(),
+        }
     }
 
     pub fn with_source_file(mut self, file: String) -> Self {
@@ -43,31 +51,55 @@ impl Lowerer {
 
     /// Lower a complete program to IR
     pub fn lower(&self, program: &Program, _type_env: &TypeEnv) -> LowerResult<ScaffoldIR> {
+        // First pass: collect tool and prompt names for classifying pipeline calls
+        let mut tool_names = std::collections::HashSet::new();
+        let mut prompt_names = std::collections::HashSet::new();
+
+        for decl in &program.declarations {
+            match decl {
+                Declaration::Tool(tool) => {
+                    tool_names.insert(tool.name.node.clone());
+                }
+                Declaration::Prompt(prompt) => {
+                    prompt_names.insert(prompt.name.node.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Create a new lowerer with the collected names
+        let lowerer = Lowerer {
+            source_file: self.source_file.clone(),
+            tool_names,
+            prompt_names,
+        };
+
+        // Second pass: lower all declarations
         let mut ir = ScaffoldIR::new();
 
         for decl in &program.declarations {
             match decl {
                 Declaration::Type(type_decl) => {
-                    ir.types.push(self.lower_type_decl(type_decl)?);
+                    ir.types.push(lowerer.lower_type_decl(type_decl)?);
                 }
                 Declaration::ExternCrate(extern_crate) => {
                     ir.extern_crates
-                        .push(self.lower_extern_crate(extern_crate)?);
+                        .push(lowerer.lower_extern_crate(extern_crate)?);
                 }
                 Declaration::Foreign(foreign) => {
-                    ir.foreign_modules.push(self.lower_foreign(foreign)?);
+                    ir.foreign_modules.push(lowerer.lower_foreign(foreign)?);
                 }
                 Declaration::Tool(tool) => {
-                    ir.tools.push(self.lower_tool(tool)?);
+                    ir.tools.push(lowerer.lower_tool(tool)?);
                 }
                 Declaration::Prompt(prompt) => {
-                    ir.prompts.push(self.lower_prompt(prompt)?);
+                    ir.prompts.push(lowerer.lower_prompt(prompt)?);
                 }
                 Declaration::Agent(agent) => {
-                    ir.agents.push(self.lower_agent(agent)?);
+                    ir.agents.push(lowerer.lower_agent(agent)?);
                 }
                 Declaration::Pipeline(pipeline) => {
-                    ir.pipelines.push(self.lower_pipeline(pipeline)?);
+                    ir.pipelines.push(lowerer.lower_pipeline(pipeline)?);
                 }
             }
         }
@@ -496,9 +528,17 @@ impl Lowerer {
                 for arg in args {
                     ir_args.push(self.lower_tool_expr(&arg.node)?);
                 }
-                PipelineCallIR::Tool {
-                    name: name.clone(),
-                    args: ir_args,
+                // Check if this is actually a prompt call (parser doesn't distinguish)
+                if self.prompt_names.contains(name) {
+                    PipelineCallIR::Prompt {
+                        name: name.clone(),
+                        args: ir_args,
+                    }
+                } else {
+                    PipelineCallIR::Tool {
+                        name: name.clone(),
+                        args: ir_args,
+                    }
                 }
             }
             PipelineCall::Expr(expr) => {

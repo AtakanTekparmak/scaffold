@@ -15,7 +15,7 @@ dirs = "5.0"
 
 # LLM providers via rig.rs
 rig = { package = "rig-core", version = "0.29" }
-schemars = "0.8"
+schemars = "1.2.0"
 
 # Provider-specific crates (features control which are included)
 [features]

@@ -63,9 +63,15 @@ pipeline full_analysis {
     input: { text: string }
     output: AnalysisResult
     steps {
+        // Call tools and prompts
         let count_result = word_counter(text)
         let sentiment_result = analyze_sentiment(text)
         let summary_result = summarize(text)
+
+        // Extract fields to match output type (AnalysisResult)
+        let word_count = count_result.count
+        let sentiment = sentiment_result.sentiment
+        let summary = summary_result.summary
     }
-    reward: count_result.count > 0
+    reward: word_count > 0
 }

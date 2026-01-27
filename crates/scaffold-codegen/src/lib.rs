@@ -167,10 +167,20 @@ impl CodeGenerator {
             }
         }
 
-        // Build a map of tools by name for context-aware generation (used by tools and pipelines)
+        // Build maps of tools and prompts by name for context-aware generation (used by pipelines)
         let mut tools_index: HashMap<String, scaffold_ir::ToolIR> = HashMap::new();
         for t in &ir.tools {
             tools_index.insert(t.name.clone(), t.clone());
+        }
+
+        let mut prompts_index: HashMap<String, scaffold_ir::PromptIR> = HashMap::new();
+        for p in &ir.prompts {
+            prompts_index.insert(p.name.clone(), p.clone());
+        }
+
+        let mut types_index: HashMap<String, scaffold_ir::TypeDefIR> = HashMap::new();
+        for t in &ir.types {
+            types_index.insert(t.name.clone(), t.clone());
         }
 
         // Generate tools
@@ -227,7 +237,12 @@ impl CodeGenerator {
 
             // Generate individual pipeline files
             for pipeline in &ir.pipelines {
-                let pipeline_code = pipelines::gen_pipeline_module(pipeline, &tools_index);
+                let pipeline_code = pipelines::gen_pipeline_module(
+                    pipeline,
+                    &tools_index,
+                    &prompts_index,
+                    &types_index,
+                );
                 let filename = format!("src/pipelines/{}.rs", to_snake_case(&pipeline.name));
                 output.add_file(&filename, self.format_tokens(pipeline_code));
             }
@@ -401,7 +416,7 @@ path = "src/lib.rs"
 {runtime_dep}
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
-schemars = "0.8"
+schemars = "1.2.0"
 clap = {{ version = "4.0", features = ["derive"] }}
 tokio = {{ version = "1.0", features = ["full"] }}
 {extern_deps}"#

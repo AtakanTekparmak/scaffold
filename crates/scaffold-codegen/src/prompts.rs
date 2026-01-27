@@ -5,10 +5,10 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use scaffold_ir::{PromptIR, StringOrFileIR};
+use scaffold_ir::{PromptIR, StringOrFileIR, TypeIR};
 
 use crate::types::gen_type;
-use crate::util::{to_pascal_case, to_snake_case};
+use crate::util::{to_ident, to_pascal_case, to_snake_case};
 
 /// Generate the prompts mod.rs
 pub fn gen_prompts_mod(prompt_names: &[&str]) -> TokenStream {
@@ -42,12 +42,45 @@ pub fn gen_prompts_mod(prompt_names: &[&str]) -> TokenStream {
     }
 }
 
+/// Generate input/output type for prompts, handling inline structs
+fn gen_io_type(ty: &TypeIR, type_name: &str) -> (TokenStream, TokenStream) {
+    match ty {
+        TypeIR::Struct { fields } if !fields.is_empty() => {
+            let struct_ident = format_ident!("{}", type_name);
+            let field_defs: Vec<_> = fields
+                .iter()
+                .map(|(name, field_ty)| {
+                    let field_name = format_ident!("{}", to_ident(name));
+                    let field_type = gen_type(field_ty);
+                    quote! { pub #field_name: #field_type }
+                })
+                .collect();
+
+            let struct_def = quote! {
+                #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+                pub struct #struct_ident {
+                    #(#field_defs),*
+                }
+            };
+
+            (struct_def, quote! { #struct_ident })
+        }
+        TypeIR::Struct { fields } if fields.is_empty() => (quote! {}, quote! { () }),
+        other => {
+            let ty = gen_type(other);
+            (quote! {}, ty)
+        }
+    }
+}
+
 /// Generate a prompt module
 pub fn gen_prompt_module(prompt: &PromptIR) -> TokenStream {
     let prompt_name = &prompt.name;
     let struct_name = format_ident!("{}Prompt", to_pascal_case(prompt_name));
-    let input_type = gen_type(&prompt.input);
-    let output_type = gen_type(&prompt.output);
+
+    // Generate input/output types, creating inline structs if needed
+    let (input_struct_def, input_type) = gen_io_type(&prompt.input, "Input");
+    let (output_struct_def, output_type) = gen_io_type(&prompt.output, "Output");
 
     // Generate template string
     let template_str = gen_string_or_file(&prompt.template);
@@ -84,6 +117,30 @@ pub fn gen_prompt_module(prompt: &PromptIR) -> TokenStream {
         }
     };
 
+    // Determine if we need type aliases (when struct def is empty, the type is already defined elsewhere)
+    let input_needs_alias = input_struct_def.is_empty();
+    let output_needs_alias = output_struct_def.is_empty();
+
+    let input_type_decl = if input_needs_alias {
+        quote! {
+            /// Input type for this prompt
+            pub type Input = #input_type;
+        }
+    } else {
+        // Struct is defined inline, use it directly
+        quote! {}
+    };
+
+    let output_type_decl = if output_needs_alias {
+        quote! {
+            /// Output type for this prompt
+            pub type Output = #output_type;
+        }
+    } else {
+        // Struct is defined inline, use it directly
+        quote! {}
+    };
+
     quote! {
         #![doc = #doc]
 
@@ -93,11 +150,13 @@ pub fn gen_prompt_module(prompt: &PromptIR) -> TokenStream {
         use scaffold_runtime::rig::extractor::Extractor;
         use schemars::JsonSchema;
 
-        /// Input type for this prompt
-        pub type Input = #input_type;
+        #input_struct_def
 
-        /// Output type for this prompt
-        pub type Output = #output_type;
+        #output_struct_def
+
+        #input_type_decl
+
+        #output_type_decl
 
         /// Prompt implementation struct
         #[derive(Clone, Debug)]

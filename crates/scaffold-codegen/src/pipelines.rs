@@ -4,7 +4,9 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use scaffold_ir::{PipelineCallIR, PipelineIR, PipelineStepIR, ToolExprIR, ToolIR};
+use scaffold_ir::{
+    PipelineCallIR, PipelineIR, PipelineStepIR, PromptIR, ToolExprIR, ToolIR, TypeDefIR,
+};
 
 use crate::types::gen_type;
 use crate::util::{to_ident, to_pascal_case, to_snake_case};
@@ -77,6 +79,8 @@ fn gen_io_type(ty: &TypeIR, type_name: &str) -> (TokenStream, TokenStream, bool)
 pub fn gen_pipeline_module(
     pipeline: &PipelineIR,
     tools_index: &std::collections::HashMap<String, ToolIR>,
+    prompts_index: &std::collections::HashMap<String, PromptIR>,
+    types_index: &std::collections::HashMap<String, TypeDefIR>,
 ) -> TokenStream {
     let pipeline_name = &pipeline.name;
     let struct_name = format_ident!("{}Pipeline", to_pascal_case(pipeline_name));
@@ -110,6 +114,8 @@ pub fn gen_pipeline_module(
         &input_fields,
         &pipeline.output,
         tools_index,
+        prompts_index,
+        types_index,
     );
 
     let doc = format!("Pipeline: {}", pipeline_name);
@@ -163,12 +169,31 @@ pub fn gen_pipeline_module(
     }
 }
 
+/// Resolve a type, looking up Named types in the types index
+fn resolve_type<'a>(
+    ty: &'a TypeIR,
+    types_index: &'a std::collections::HashMap<String, TypeDefIR>,
+) -> &'a TypeIR {
+    match ty {
+        TypeIR::Named { name } => {
+            if let Some(type_def) = types_index.get(name) {
+                &type_def.definition
+            } else {
+                ty
+            }
+        }
+        _ => ty,
+    }
+}
+
 /// Generate code for pipeline steps
 fn gen_pipeline_steps(
     steps: &[PipelineStepIR],
     input_fields: &std::collections::HashSet<String>,
     output_type: &TypeIR,
     tools_index: &std::collections::HashMap<String, ToolIR>,
+    prompts_index: &std::collections::HashMap<String, PromptIR>,
+    types_index: &std::collections::HashMap<String, TypeDefIR>,
 ) -> TokenStream {
     // Track local variables from step bindings
     let mut local_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -177,7 +202,13 @@ fn gen_pipeline_steps(
         .iter()
         .enumerate()
         .map(|(idx, step)| {
-            let call_code = gen_pipeline_call(&step.call, input_fields, &local_vars, tools_index);
+            let call_code = gen_pipeline_call(
+                &step.call,
+                input_fields,
+                &local_vars,
+                tools_index,
+                prompts_index,
+            );
 
             match &step.binding {
                 Some(name) => {
@@ -203,9 +234,12 @@ fn gen_pipeline_steps(
     if steps.is_empty() {
         quote! { Ok(Default::default()) }
     } else {
+        // Resolve the output type (in case it's a Named reference)
+        let resolved_output = resolve_type(output_type, types_index);
+
         // If pipeline output is a struct with fields, try to construct it from bindings
         // Only use fields that have matching bindings
-        if let TypeIR::Struct { fields } = output_type {
+        if let TypeIR::Struct { fields } = resolved_output {
             let matching_fields: Vec<_> =
                 fields.keys().filter(|k| local_vars.contains(*k)).collect();
 
@@ -241,22 +275,63 @@ fn gen_pipeline_call(
     input_fields: &std::collections::HashSet<String>,
     local_vars: &std::collections::HashSet<String>,
     tools_index: &std::collections::HashMap<String, ToolIR>,
+    prompts_index: &std::collections::HashMap<String, PromptIR>,
 ) -> TokenStream {
     match call {
         PipelineCallIR::Prompt { name, args } => {
+            let prompt_mod = format_ident!("{}", to_snake_case(name));
             let prompt_struct = format_ident!("{}Prompt", to_pascal_case(name));
             let arg_codes: Vec<_> = args
                 .iter()
                 .map(|a| gen_tool_expr(a, input_fields, local_vars))
                 .collect();
 
-            if args.is_empty() {
-                quote! { crate::prompts::#prompt_struct::new().execute(&client, model, ()).await? }
-            } else if args.len() == 1 {
-                let arg = &arg_codes[0];
-                quote! { crate::prompts::#prompt_struct::new().execute(&client, model, #arg).await? }
+            // Look up the prompt to determine its input type
+            if let Some(prompt_ir) = prompts_index.get(name) {
+                match &prompt_ir.input {
+                    TypeIR::Struct { fields } if !fields.is_empty() => {
+                        // Construct the prompt's Input struct
+                        let field_inits: Vec<_> = fields
+                            .keys()
+                            .enumerate()
+                            .map(|(i, k)| {
+                                let fname = format_ident!("{}", to_ident(k));
+                                let val = arg_codes
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(quote! { Default::default() });
+                                quote! { #fname: #val }
+                            })
+                            .collect();
+                        quote! {
+                            {
+                                let __prompt_input = crate::prompts::#prompt_mod::Input { #(#field_inits),* };
+                                crate::prompts::#prompt_struct::new().execute(&client, model, __prompt_input).await?
+                            }
+                        }
+                    }
+                    _ => {
+                        // Simple input types
+                        if args.is_empty() {
+                            quote! { crate::prompts::#prompt_struct::new().execute(&client, model, ()).await? }
+                        } else if args.len() == 1 {
+                            let arg = &arg_codes[0];
+                            quote! { crate::prompts::#prompt_struct::new().execute(&client, model, #arg).await? }
+                        } else {
+                            quote! { crate::prompts::#prompt_struct::new().execute(&client, model, (#(#arg_codes),*)).await? }
+                        }
+                    }
+                }
             } else {
-                quote! { crate::prompts::#prompt_struct::new().execute(&client, model, (#(#arg_codes),*)).await? }
+                // Prompt not in index, fall back to direct passing
+                if args.is_empty() {
+                    quote! { crate::prompts::#prompt_struct::new().execute(&client, model, ()).await? }
+                } else if args.len() == 1 {
+                    let arg = &arg_codes[0];
+                    quote! { crate::prompts::#prompt_struct::new().execute(&client, model, #arg).await? }
+                } else {
+                    quote! { crate::prompts::#prompt_struct::new().execute(&client, model, (#(#arg_codes),*)).await? }
+                }
             }
         }
         PipelineCallIR::Tool { name, args } => {
@@ -487,7 +562,12 @@ mod tests {
 
         let tools_index: std::collections::HashMap<String, ToolIR> =
             std::collections::HashMap::new();
-        let code = gen_pipeline_module(&pipeline, &tools_index).to_string();
+        let prompts_index: std::collections::HashMap<String, PromptIR> =
+            std::collections::HashMap::new();
+        let types_index: std::collections::HashMap<String, TypeDefIR> =
+            std::collections::HashMap::new();
+        let code =
+            gen_pipeline_module(&pipeline, &tools_index, &prompts_index, &types_index).to_string();
         assert!(code.contains("AnalyzePipeline"));
         assert!(code.contains("execute"));
         assert!(code.contains("extracted"));

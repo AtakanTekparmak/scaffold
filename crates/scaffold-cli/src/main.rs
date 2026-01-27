@@ -74,8 +74,8 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Format generated code with rustfmt
-        #[arg(long)]
+        /// Format generated code with rustfmt (enabled by default)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         format: bool,
 
         /// Enforce strict validation (no unresolved identifiers/calls)
@@ -97,15 +97,15 @@ enum Commands {
         #[arg(long)]
         bin_name: Option<String>,
 
-        /// Format generated code with rustfmt
-        #[arg(long)]
+        /// Format generated code with rustfmt (enabled by default)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         format: bool,
 
         /// Enforce strict validation (no unresolved identifiers/calls)
         #[arg(long)]
         strict: bool,
 
-        /// Path to scaffold-runtime crate (if not using SCAFFOLD_RUNTIME_VERSION)
+        /// Path to scaffold-runtime crate (auto-detected if not specified)
         #[arg(long)]
         runtime_path: Option<String>,
 
@@ -506,7 +506,39 @@ fn cmd_parse(file: &PathBuf) -> ExitCode {
     }
 }
 
+/// Try to auto-detect scaffold-runtime path from the CLI executable location
+fn detect_runtime_path() -> Option<String> {
+    // If env var is already set, use that
+    if std::env::var("SCAFFOLD_RUNTIME_PATH").is_ok()
+        || std::env::var("SCAFFOLD_RUNTIME_VERSION").is_ok()
+    {
+        return None;
+    }
+
+    // Try to find scaffold-runtime relative to the current executable
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Go up from target/debug or target/release to find crates/scaffold-runtime
+        let mut path = exe_path.clone();
+        for _ in 0..5 {
+            path = match path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => break,
+            };
+            let runtime_path = path.join("crates/scaffold-runtime");
+            if runtime_path.join("Cargo.toml").exists() {
+                return Some(runtime_path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    None
+}
+
 fn cmd_codegen(file: &PathBuf, output: &PathBuf, format: bool, strict: bool) -> ExitCode {
+    // Auto-detect scaffold-runtime path
+    if let Some(runtime_path) = detect_runtime_path() {
+        std::env::set_var("SCAFFOLD_RUNTIME_PATH", runtime_path);
+    }
     let source = match fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -710,9 +742,11 @@ fn cmd_build(
         return ExitCode::FAILURE;
     }
 
-    // Configure runtime path env for codegen if provided
+    // Configure runtime path env for codegen
     if let Some(path) = runtime_path {
         std::env::set_var("SCAFFOLD_RUNTIME_PATH", path);
+    } else if let Some(detected) = detect_runtime_path() {
+        std::env::set_var("SCAFFOLD_RUNTIME_PATH", detected);
     }
 
     // Generate code
