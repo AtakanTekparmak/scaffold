@@ -1,0 +1,53 @@
+// Pipeline with agent calls, branching, and parallel execution
+
+tool word_counter {
+    input: { text: string }
+    output: { count: int }
+    impl: shell("echo '{text}' | wc -w")
+}
+
+prompt summarize {
+    input: { text: string }
+    output: { summary: string }
+    template: "Summarize briefly: {text}"
+}
+
+agent researcher {
+    input: { question: string }
+    output: { answer: string }
+    tools: [word_counter]
+    system: "You are a research agent. Answer concisely."
+    model: "openai/gpt-5.2"
+    max_turns: 3
+}
+
+agent writer {
+    input: { answer: string }
+    output: { final: string }
+    tools: []
+    system: "Rewrite the answer in a clear, final form."
+    model: "openai/gpt-5.2"
+    max_turns: 3
+}
+
+pipeline multi_agent_flow {
+    input: { question: string }
+    output: { final: string }
+
+    steps {
+        let research = researcher(question)
+
+        let final = if research.answer != "" {
+            let refined = writer(research.answer)
+            refined.final
+        } else {
+            let summary = summarize(question)
+            summary.summary
+        }
+
+        parallel {
+            { let _draft = summarize(research.answer) }
+            { let _count = word_counter(research.answer) }
+        }
+    }
+}

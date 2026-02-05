@@ -4,9 +4,10 @@
 
 use crate::error::{InterpreterError, Result};
 use crate::foreign::ForeignRegistry;
+use futures::future::join_all;
 use scaffold_ir::{
-    AgentIR, ExprIR, LiteralIR, PipelineCallIR, PipelineIR, PromptIR, StringOrFileIR, ToolExprIR,
-    ToolIR, ToolImplIR, TypeDefIR, TypeIR,
+    AgentIR, ExprIR, LiteralIR, PipelineCallIR, PipelineIR, PipelineStepIR, PromptIR,
+    StringOrFileIR, ToolExprIR, ToolIR, ToolImplIR, TypeDefIR, TypeIR,
 };
 use scaffold_runtime::{PromptManager, Value};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 /// Tool executor - executes tool implementations
+#[derive(Clone)]
 pub struct ToolExecutor {
     /// Cached tool results (for pure tools)
     #[allow(dead_code)]
@@ -345,10 +347,16 @@ impl ToolExecutor {
                 system, tools_prompt, output_schema, history_str
             );
 
-            // Query LLM
-            let response = scaffold_runtime::llm_query(&turn_prompt)
-                .await
-                .map_err(|e| InterpreterError::LlmError(e.to_string()))?;
+            // Query LLM (use agent-specific model if specified)
+            let response = if let Some(ref model) = agent.model {
+                scaffold_runtime::query_with_model(model, &turn_prompt)
+                    .await
+                    .map_err(|e| InterpreterError::LlmError(e.to_string()))?
+            } else {
+                scaffold_runtime::llm_query(&turn_prompt)
+                    .await
+                    .map_err(|e| InterpreterError::LlmError(e.to_string()))?
+            };
 
             // Parse response for tool calls or done signal
             if response.contains("DONE:") {
@@ -437,15 +445,47 @@ impl ToolExecutor {
         }
         bindings.insert("input".to_string(), input.clone());
 
-        let mut last_value = Value::Null;
+        let last_value = self
+            .execute_pipeline_steps(&pipeline.steps, &mut bindings, prompts)
+            .await?;
 
-        for step in &pipeline.steps {
-            let ctx = Value::Map(bindings.clone());
+        // If pipeline declares a struct output, synthesize from bindings
+        // Resolve Named types to get the actual struct fields
+        let resolved_output = self.resolve_type(&pipeline.output);
+        if let TypeIR::Struct { fields } = resolved_output {
+            let mut out_map: HashMap<String, Value> = HashMap::new();
+            for (k, _) in fields {
+                if let Some(v) = bindings.get(k).cloned() {
+                    out_map.insert(k.clone(), v);
+                }
+            }
+            if !out_map.is_empty() {
+                return Ok(Value::Map(out_map));
+            }
+        }
+        Ok(last_value)
+    }
 
-            let result = match &step.call {
-                PipelineCallIR::Prompt { name, args } => {
+    fn execute_pipeline_steps<'a>(
+        &'a mut self,
+        steps: &'a [PipelineStepIR],
+        bindings: &'a mut HashMap<String, Value>,
+        prompts: &'a PromptManager,
+    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut last_value = Value::Null;
+
+            for step in steps {
+                let ctx = Value::Map(bindings.clone());
+
+                let result = match &step.call {
+                    PipelineCallIR::Prompt { name, args } => {
                     // Get the prompt
-                    let prompt = self.prompts_ir.get(name).cloned().ok_or_else(|| {
+                    let prompt = self
+                        .prompts_ir
+                        .get(name.as_str())
+                        .cloned()
+                        .ok_or_else(|| {
                         InterpreterError::Runtime(format!("Prompt '{}' not found", name))
                     })?;
 
@@ -472,7 +512,7 @@ impl ToolExecutor {
                     // Get the tool
                     let tool = self
                         .tools
-                        .get(name)
+                        .get(name.as_str())
                         .cloned()
                         .ok_or_else(|| InterpreterError::ToolNotFound(name.clone()))?;
 
@@ -494,33 +534,110 @@ impl ToolExecutor {
 
                     self.execute(&tool, Value::Map(input_map), prompts).await?
                 }
+                PipelineCallIR::Agent { name, args } => {
+                    // Get the agent
+                    let agent = self.agents.get(name.as_str()).cloned().ok_or_else(|| {
+                        InterpreterError::Runtime(format!("Agent '{}' not found", name))
+                    })?;
+
+                    // Build input from args
+                    let mut input_map = HashMap::new();
+                    let field_names: Vec<String> = match &agent.input {
+                        TypeIR::Struct { fields } => fields.keys().cloned().collect(),
+                        _ => Vec::new(),
+                    };
+
+                    for (i, arg) in args.iter().enumerate() {
+                        let val = self.execute_tool_expr(arg, &ctx, prompts, None).await?;
+                        let key = field_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("arg{}", i));
+                        input_map.insert(key, val);
+                    }
+
+                    self.execute_agent(&agent, Value::Map(input_map), prompts)
+                        .await?
+                }
                 PipelineCallIR::Expr { expr } => {
                     // Evaluate expression in current bindings context
-                    self.execute_tool_expr(expr, &ctx, prompts, None).await?
+                    self.execute_tool_expr(&expr, &ctx, prompts, None).await?
+                }
+                PipelineCallIR::If {
+                    condition,
+                    then_steps,
+                    else_steps,
+                } => {
+                    let cond_val = self.eval_expr(&condition, &ctx)?;
+                    let cond = cond_val.as_bool().unwrap_or(false);
+                    if cond {
+                        let mut branch_bindings = bindings.clone();
+                        self.execute_pipeline_steps(then_steps, &mut branch_bindings, prompts)
+                            .await?
+                    } else {
+                        let mut branch_bindings = bindings.clone();
+                        self.execute_pipeline_steps(else_steps, &mut branch_bindings, prompts)
+                            .await?
+                    }
+                }
+                PipelineCallIR::Match { scrutinee, arms } => {
+                    let scrut_val = self.eval_expr(&scrutinee, &ctx)?;
+                    let mut matched = false;
+                    let mut arm_result = Value::Null;
+                    for arm in arms {
+                        let pat_val = self.eval_expr(&arm.pattern, &ctx)?;
+                        if pat_val == scrut_val {
+                            let mut branch_bindings = bindings.clone();
+                            arm_result = self
+                                .execute_pipeline_steps(&arm.steps, &mut branch_bindings, prompts)
+                                .await?;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if matched {
+                        arm_result
+                    } else {
+                        Value::Null
+                    }
+                }
+                PipelineCallIR::Parallel { branches } => {
+                    if branches.is_empty() {
+                        Value::Null
+                    } else {
+                        let base_bindings = bindings.clone();
+                        let base_executor = self.clone();
+
+                        let futures = branches.iter().map(|branch| {
+                            let mut exec = base_executor.clone();
+                            let mut branch_bindings = base_bindings.clone();
+                            async move {
+                                let result = exec
+                                    .execute_pipeline_steps(branch, &mut branch_bindings, prompts)
+                                    .await?;
+                                Ok::<Value, InterpreterError>(result)
+                            }
+                        });
+
+                        let results = join_all(futures).await;
+                        for res in results {
+                            let _ = res?;
+                        }
+
+                        // Parallel branches do not export bindings/results
+                        Value::Null
+                    }
                 }
             };
 
-            if let Some(ref binding_name) = step.binding {
-                bindings.insert(binding_name.clone(), result.clone());
-            }
-            last_value = result;
-        }
-
-        // If pipeline declares a struct output, synthesize from bindings
-        // Resolve Named types to get the actual struct fields
-        let resolved_output = self.resolve_type(&pipeline.output);
-        if let TypeIR::Struct { fields } = resolved_output {
-            let mut out_map: HashMap<String, Value> = HashMap::new();
-            for (k, _) in fields {
-                if let Some(v) = bindings.get(k).cloned() {
-                    out_map.insert(k.clone(), v);
+                if let Some(ref binding_name) = step.binding {
+                    bindings.insert(binding_name.clone(), result.clone());
                 }
+                last_value = result;
             }
-            if !out_map.is_empty() {
-                return Ok(Value::Map(out_map));
-            }
-        }
-        Ok(last_value)
+
+            Ok(last_value)
+        })
     }
 
     /// Execute a tool implementation

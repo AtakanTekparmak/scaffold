@@ -108,6 +108,34 @@ pipeline analyze_and_summarize {
 }
 ```
 
+Pipelines can also call agents and use control flow:
+
+```scaffold
+pipeline research_flow {
+    input: { question: string }
+    output: { answer: string }
+
+    steps {
+        let research = researcher(question)
+
+        if length(research.answer) > 0 {
+            let final = writer(research)
+        } else {
+            let final = fallback_writer(question)
+        }
+
+        parallel {
+            { let draft = writer(research) }
+            { let critique = critic(research) }
+        }
+    }
+}
+```
+
+Notes:
+- `if`/`match` branches execute their own step blocks.
+- `parallel` executes each branch block concurrently, returns no value, and does not export branch-local bindings.
+
 ### Foreign Functions (FFI)
 
 ```scaffold

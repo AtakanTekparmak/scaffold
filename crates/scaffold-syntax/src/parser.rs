@@ -916,7 +916,7 @@ impl<'source> Parser<'source> {
 
     // =========== Agent Parsing ===========
 
-    /// Parse: agent name { input: ..., output: ..., tools: [...], system: ..., max_turns: ..., reward: ..., done: ... }
+    /// Parse: agent name { input: ..., output: ..., tools: [...], system: ..., model: ..., max_turns: ..., reward: ..., done: ... }
     fn parse_agent_decl(&mut self) -> ParseResult<AgentDecl> {
         let start = self.expect(Token::Agent)?.span;
         let name = self.parse_ident()?;
@@ -926,6 +926,7 @@ impl<'source> Parser<'source> {
         let mut output = None;
         let mut tools = Vec::new();
         let mut system = None;
+        let mut model = None;
         let mut max_turns = None;
         let mut reward = None;
         let mut done = None;
@@ -966,6 +967,11 @@ impl<'source> Parser<'source> {
                     self.expect(Token::Colon)?;
                     system = Some(self.parse_string_or_file()?);
                 }
+                Token::Model => {
+                    self.advance();
+                    self.expect(Token::Colon)?;
+                    model = Some(self.parse_string()?);
+                }
                 Token::MaxTurns => {
                     self.advance();
                     self.expect(Token::Colon)?;
@@ -993,7 +999,7 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     return Err(ParseError::new(
-                        format!("expected agent item (input, output, tools, system, max_turns, reward, done, on_error, timeout), found '{}'", token.token),
+                        format!("expected agent item (input, output, tools, system, model, max_turns, reward, done, on_error, timeout), found '{}'", token.token),
                         token.span,
                     ));
                 }
@@ -1018,6 +1024,7 @@ impl<'source> Parser<'source> {
             output,
             tools,
             system,
+            model,
             max_turns,
             reward,
             done,
@@ -1134,6 +1141,38 @@ impl<'source> Parser<'source> {
             None
         };
 
+        // Control-flow steps
+        if self.check(&Token::Parallel) {
+            let (call, end_span) = self.parse_pipeline_parallel()?;
+            if binding.is_some() {
+                return Err(ParseError::new(
+                    "parallel steps cannot be bound with let".to_string(),
+                    start_span,
+                ));
+            }
+            return Ok(PipelineStep {
+                binding,
+                call,
+                span: start_span.merge(end_span),
+            });
+        }
+        if self.check(&Token::If) {
+            let (call, end_span) = self.parse_pipeline_if()?;
+            return Ok(PipelineStep {
+                binding,
+                call,
+                span: start_span.merge(end_span),
+            });
+        }
+        if self.check(&Token::Match) {
+            let (call, end_span) = self.parse_pipeline_match()?;
+            return Ok(PipelineStep {
+                binding,
+                call,
+                span: start_span.merge(end_span),
+            });
+        }
+
         // Parse a general tool expression, then downcast to call if applicable
         let expr = self.parse_tool_expr()?;
         let end = expr.span;
@@ -1158,6 +1197,90 @@ impl<'source> Parser<'source> {
             call,
             span: start_span.merge(end),
         })
+    }
+
+    fn parse_pipeline_parallel(&mut self) -> ParseResult<(PipelineCall, Span)> {
+        let _start = self.expect(Token::Parallel)?.span;
+        self.expect(Token::LBrace)?;
+
+        let mut branches = Vec::new();
+        while !self.check(&Token::RBrace) {
+            self.expect(Token::LBrace)?;
+            let mut steps = Vec::new();
+            while !self.check(&Token::RBrace) {
+                steps.push(self.parse_pipeline_step()?);
+            }
+            let _end_branch = self.expect(Token::RBrace)?.span;
+            branches.push(steps);
+            // Optional comma between branches
+            if self.check(&Token::Comma) {
+                self.advance();
+            }
+            // If there's no comma, continue until RBrace
+        }
+
+        let end = self.expect(Token::RBrace)?.span;
+        Ok((PipelineCall::Parallel { branches }, end))
+    }
+
+    fn parse_pipeline_if(&mut self) -> ParseResult<(PipelineCall, Span)> {
+        let _start = self.expect(Token::If)?.span;
+        let condition = self.parse_expr()?;
+        self.expect(Token::LBrace)?;
+        let mut then_steps = Vec::new();
+        while !self.check(&Token::RBrace) {
+            then_steps.push(self.parse_pipeline_step()?);
+        }
+        let mut end_span = self.expect(Token::RBrace)?.span;
+
+        let mut else_steps = Vec::new();
+        if self.check(&Token::Else) {
+            self.advance();
+            self.expect(Token::LBrace)?;
+            while !self.check(&Token::RBrace) {
+                else_steps.push(self.parse_pipeline_step()?);
+            }
+            end_span = self.expect(Token::RBrace)?.span;
+        }
+
+        Ok((
+            PipelineCall::If {
+                condition,
+                then_steps,
+                else_steps,
+            },
+            end_span,
+        ))
+    }
+
+    fn parse_pipeline_match(&mut self) -> ParseResult<(PipelineCall, Span)> {
+        let _start = self.expect(Token::Match)?.span;
+        let scrutinee = self.parse_expr()?;
+        self.expect(Token::LBrace)?;
+
+        let mut arms = Vec::new();
+        while !self.check(&Token::RBrace) {
+            let pattern = self.parse_expr()?;
+            self.expect(Token::Arrow)?;
+            self.expect(Token::LBrace)?;
+            let mut steps = Vec::new();
+            while !self.check(&Token::RBrace) {
+                steps.push(self.parse_pipeline_step()?);
+            }
+            let arm_end = self.expect(Token::RBrace)?.span;
+            let arm_span = pattern.span.merge(arm_end);
+            arms.push(PipelineMatchArm {
+                pattern,
+                steps,
+                span: arm_span,
+            });
+            if self.check(&Token::Comma) {
+                self.advance();
+            }
+        }
+
+        let end = self.expect(Token::RBrace)?.span;
+        Ok((PipelineCall::Match { scrutinee, arms }, end))
     }
 
     /// Parse a string literal or file("path") reference

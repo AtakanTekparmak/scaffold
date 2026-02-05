@@ -178,6 +178,11 @@ impl CodeGenerator {
             prompts_index.insert(p.name.clone(), p.clone());
         }
 
+        let mut agents_index: HashMap<String, scaffold_ir::AgentIR> = HashMap::new();
+        for a in &ir.agents {
+            agents_index.insert(a.name.clone(), a.clone());
+        }
+
         let mut types_index: HashMap<String, scaffold_ir::TypeDefIR> = HashMap::new();
         for t in &ir.types {
             types_index.insert(t.name.clone(), t.clone());
@@ -241,6 +246,7 @@ impl CodeGenerator {
                     pipeline,
                     &tools_index,
                     &prompts_index,
+                    &agents_index,
                     &types_index,
                 );
                 let filename = format!("src/pipelines/{}.rs", to_snake_case(&pipeline.name));

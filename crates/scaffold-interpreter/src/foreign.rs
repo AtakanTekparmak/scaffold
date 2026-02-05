@@ -12,7 +12,7 @@ use crate::error::{InterpreterError, Result};
 pub type ForeignFn = Arc<dyn Fn(Vec<Value>) -> Result<Value> + Send + Sync>;
 
 /// Registry for foreign functions
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ForeignRegistry {
     /// Functions indexed by "module::function" key
     functions: HashMap<String, ForeignFn>,

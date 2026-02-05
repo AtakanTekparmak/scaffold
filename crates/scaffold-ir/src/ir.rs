@@ -416,6 +416,8 @@ pub struct AgentIR {
     pub tools: Vec<String>,
     /// System prompt (defines agent behavior)
     pub system: StringOrFileIR,
+    /// Model to use (e.g., "gpt-4o", "claude-sonnet-4-20250514")
+    pub model: Option<String>,
     /// Maximum turns before termination
     pub max_turns: Option<u64>,
     /// Process reward expression (for RL optimization)
@@ -466,6 +468,28 @@ pub enum PipelineCallIR {
     Prompt { name: String, args: Vec<ToolExprIR> },
     /// Call a tool
     Tool { name: String, args: Vec<ToolExprIR> },
+    /// Call an agent
+    Agent { name: String, args: Vec<ToolExprIR> },
     /// Evaluate an expression
     Expr { expr: ToolExprIR },
+    /// Parallel branches
+    Parallel { branches: Vec<Vec<PipelineStepIR>> },
+    /// Conditional branch
+    If {
+        condition: ExprIR,
+        then_steps: Vec<PipelineStepIR>,
+        else_steps: Vec<PipelineStepIR>,
+    },
+    /// Match branch
+    Match {
+        scrutinee: ExprIR,
+        arms: Vec<PipelineMatchArmIR>,
+    },
+}
+
+/// Match arm in pipeline IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineMatchArmIR {
+    pub pattern: ExprIR,
+    pub steps: Vec<PipelineStepIR>,
 }

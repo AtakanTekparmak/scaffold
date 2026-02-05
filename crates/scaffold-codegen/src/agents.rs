@@ -55,6 +55,9 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
     // Generate tool list
     let tool_names: Vec<_> = agent.tools.iter().collect();
 
+    // Generate model (optional, falls back to config default)
+    let model_str = agent.model.as_deref();
+
     // Generate max_turns
     let max_turns = agent.max_turns.unwrap_or(10);
 
@@ -92,6 +95,7 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
         #[derive(Clone, Debug)]
         pub struct #struct_name {
             system_prompt: String,
+            model: Option<String>,
             max_turns: u64,
         }
 
@@ -100,8 +104,14 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
             pub fn new() -> Self {
                 Self {
                     system_prompt: #system_str.to_string(),
+                    model: #model_str.map(|s| s.to_string()),
                     max_turns: #max_turns,
                 }
+            }
+
+            /// Get the model to use (agent-specific or config default)
+            pub fn model(&self) -> &str {
+                self.model.as_deref().unwrap_or(&scaffold_runtime::config().default_model)
             }
 
             /// Get the agent name
@@ -239,14 +249,14 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
             }
         }
 
-        /// Run the agent with the given input using environment-configured OpenAI client
+        /// Run the agent with the given input using environment-configured client
         pub async fn run(input: Input) -> scaffold_runtime::Result<Output> {
             use scaffold_runtime::rig::providers::openai;
             use scaffold_runtime::rig::client::ProviderClient;
 
             let agent = #struct_name::new();
             let client = openai::Client::from_env();
-            let model = &scaffold_runtime::config().default_model;
+            let model = agent.model();
             agent.run_with(&client, model, input).await
         }
     }
@@ -309,6 +319,7 @@ mod tests {
             system: StringOrFileIR::Literal {
                 value: "You are a research assistant.".to_string(),
             },
+            model: Some("gpt-4o".to_string()),
             max_turns: Some(5),
             reward: None,
             done: None,

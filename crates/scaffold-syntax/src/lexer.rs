@@ -61,6 +61,8 @@ pub enum Token {
     Tools,
     #[token("max_turns")]
     MaxTurns,
+    #[token("model")]
+    Model,
     #[token("file")]
     File,
 
@@ -289,6 +291,7 @@ impl std::fmt::Display for Token {
             Token::Template => write!(f, "template"),
             Token::Tools => write!(f, "tools"),
             Token::MaxTurns => write!(f, "max_turns"),
+            Token::Model => write!(f, "model"),
             Token::File => write!(f, "file"),
             Token::Extern => write!(f, "extern"),
             Token::Crate => write!(f, "crate"),

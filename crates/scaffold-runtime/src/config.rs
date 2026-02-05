@@ -61,6 +61,10 @@ pub struct LlmConfig {
     #[serde(default)]
     pub anthropic: ProviderConfig,
 
+    /// OpenRouter configuration (unified API for all models)
+    #[serde(default)]
+    pub openrouter: ProviderConfig,
+
     /// Custom providers (name -> config)
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
@@ -149,6 +153,9 @@ impl Config {
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             self.llm.anthropic.api_key = Some(key);
         }
+        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+            self.llm.openrouter.api_key = Some(key);
+        }
 
         // Base URLs
         if let Ok(url) = std::env::var("OPENAI_BASE_URL") {
@@ -174,6 +181,7 @@ impl Config {
         match provider {
             "openai" => self.llm.openai.api_key.as_deref(),
             "anthropic" => self.llm.anthropic.api_key.as_deref(),
+            "openrouter" => self.llm.openrouter.api_key.as_deref(),
             other => self
                 .llm
                 .providers
@@ -187,6 +195,7 @@ impl Config {
         match provider {
             "openai" => self.llm.openai.base_url.as_deref(),
             "anthropic" => self.llm.anthropic.base_url.as_deref(),
+            "openrouter" => self.llm.openrouter.base_url.as_deref(),
             other => self
                 .llm
                 .providers
@@ -200,6 +209,7 @@ impl Config {
         match provider {
             "openai" => Some(&self.llm.openai),
             "anthropic" => Some(&self.llm.anthropic),
+            "openrouter" => Some(&self.llm.openrouter),
             other => self.llm.providers.get(other),
         }
     }
@@ -209,6 +219,7 @@ impl LlmConfig {
     fn merge(mut self, other: LlmConfig) -> LlmConfig {
         self.openai = self.openai.merge(other.openai);
         self.anthropic = self.anthropic.merge(other.anthropic);
+        self.openrouter = self.openrouter.merge(other.openrouter);
 
         for (name, config) in other.providers {
             self.providers.insert(name, config);

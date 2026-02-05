@@ -488,6 +488,8 @@ pub struct AgentDecl {
     pub tools: Vec<Ident>,
     /// System prompt (defines agent behavior)
     pub system: StringOrFile,
+    /// Model to use for this agent (e.g., "gpt-4o", "claude-sonnet-4-20250514")
+    pub model: Option<String>,
     /// Maximum turns before termination
     pub max_turns: Option<u64>,
     /// Process reward expression (for RL optimization)
@@ -541,6 +543,34 @@ pub enum PipelineCall {
         name: String,
         args: Vec<Spanned<ToolExpr>>,
     },
+    /// Call an agent: agent_name(args)
+    Agent {
+        name: String,
+        args: Vec<Spanned<ToolExpr>>,
+    },
     /// Evaluate an expression: e.g., field access or literal/identifier
     Expr(Spanned<ToolExpr>),
+    /// Parallel branches: parallel { { ... } { ... } }
+    Parallel {
+        branches: Vec<Vec<PipelineStep>>,
+    },
+    /// Conditional branch: if cond { ... } else { ... }
+    If {
+        condition: Spanned<Expr>,
+        then_steps: Vec<PipelineStep>,
+        else_steps: Vec<PipelineStep>,
+    },
+    /// Match branch: match expr { pattern => { ... } ... }
+    Match {
+        scrutinee: Spanned<Expr>,
+        arms: Vec<PipelineMatchArm>,
+    },
+}
+
+/// Match arm in a pipeline match block
+#[derive(Debug, Clone)]
+pub struct PipelineMatchArm {
+    pub pattern: Spanned<Expr>,
+    pub steps: Vec<PipelineStep>,
+    pub span: Span,
 }

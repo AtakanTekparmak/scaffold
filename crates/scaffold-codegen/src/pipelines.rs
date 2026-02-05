@@ -5,7 +5,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use scaffold_ir::{
-    PipelineCallIR, PipelineIR, PipelineStepIR, PromptIR, ToolExprIR, ToolIR, TypeDefIR,
+    AgentIR, PipelineCallIR, PipelineIR, PipelineStepIR, PromptIR, ToolExprIR, ToolIR, TypeDefIR,
 };
 
 use crate::types::gen_type;
@@ -80,6 +80,7 @@ pub fn gen_pipeline_module(
     pipeline: &PipelineIR,
     tools_index: &std::collections::HashMap<String, ToolIR>,
     prompts_index: &std::collections::HashMap<String, PromptIR>,
+    agents_index: &std::collections::HashMap<String, AgentIR>,
     types_index: &std::collections::HashMap<String, TypeDefIR>,
 ) -> TokenStream {
     let pipeline_name = &pipeline.name;
@@ -115,6 +116,7 @@ pub fn gen_pipeline_module(
         &pipeline.output,
         tools_index,
         prompts_index,
+        agents_index,
         types_index,
     );
 
@@ -193,42 +195,18 @@ fn gen_pipeline_steps(
     output_type: &TypeIR,
     tools_index: &std::collections::HashMap<String, ToolIR>,
     prompts_index: &std::collections::HashMap<String, PromptIR>,
+    agents_index: &std::collections::HashMap<String, AgentIR>,
     types_index: &std::collections::HashMap<String, TypeDefIR>,
 ) -> TokenStream {
-    // Track local variables from step bindings
-    let mut local_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    let step_codes: Vec<_> = steps
-        .iter()
-        .enumerate()
-        .map(|(idx, step)| {
-            let call_code = gen_pipeline_call(
-                &step.call,
-                input_fields,
-                &local_vars,
-                tools_index,
-                prompts_index,
-            );
-
-            match &step.binding {
-                Some(name) => {
-                    let binding_ident = format_ident!("{}", name);
-                    local_vars.insert(name.clone());
-                    quote! {
-                        let #binding_ident = #call_code;
-                    }
-                }
-                None => {
-                    // If no binding, just execute and ignore result (unless last step)
-                    let temp_ident = format_ident!("__step_{}", idx);
-                    local_vars.insert(format!("__step_{}", idx));
-                    quote! {
-                        let #temp_ident = #call_code;
-                    }
-                }
-            }
-        })
-        .collect();
+    let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let (step_code, last_expr, local_vars) = gen_pipeline_steps_with_locals(
+        steps,
+        input_fields,
+        tools_index,
+        prompts_index,
+        agents_index,
+        &empty_locals,
+    );
 
     // The last step's result should be returned
     if steps.is_empty() {
@@ -253,20 +231,59 @@ fn gen_pipeline_steps(
                     })
                     .collect();
                 return quote! {
-                    #(#step_codes)*
+                    #step_code
                     let __output = Output { #(#field_inits),* };
                     Ok(__output)
                 };
             }
         }
         // Fallback: return last step result
-        let last_step = steps.last().unwrap();
-        let last_result = match &last_step.binding {
-            Some(name) => format_ident!("{}", name),
-            None => format_ident!("__step_{}", steps.len() - 1),
-        };
-        quote! { #(#step_codes)* Ok(#last_result) }
+        let fallback = last_expr.unwrap_or_else(|| quote! { Default::default() });
+        quote! { #step_code Ok(#fallback) }
     }
+}
+
+fn gen_pipeline_steps_with_locals(
+    steps: &[PipelineStepIR],
+    input_fields: &std::collections::HashSet<String>,
+    tools_index: &std::collections::HashMap<String, ToolIR>,
+    prompts_index: &std::collections::HashMap<String, PromptIR>,
+    agents_index: &std::collections::HashMap<String, AgentIR>,
+    initial_locals: &std::collections::HashSet<String>,
+) -> (
+    TokenStream,
+    Option<TokenStream>,
+    std::collections::HashSet<String>,
+) {
+    // Track local variables from step bindings
+    let mut local_vars: std::collections::HashSet<String> = initial_locals.clone();
+    let mut step_codes: Vec<TokenStream> = Vec::new();
+    let mut last_expr: Option<TokenStream> = None;
+
+    for (idx, step) in steps.iter().enumerate() {
+        let call_code = gen_pipeline_call(
+            &step.call,
+            input_fields,
+            &local_vars,
+            tools_index,
+            prompts_index,
+            agents_index,
+        );
+
+        let (binding_ident, binding_name) = match &step.binding {
+            Some(name) => (format_ident!("{}", name), name.clone()),
+            None => (format_ident!("__step_{}", idx), format!("__step_{}", idx)),
+        };
+
+        step_codes.push(quote! {
+            let #binding_ident = #call_code;
+        });
+
+        local_vars.insert(binding_name);
+        last_expr = Some(quote! { #binding_ident });
+    }
+
+    (quote! { #(#step_codes)* }, last_expr, local_vars)
 }
 
 /// Generate code for a pipeline call
@@ -276,6 +293,7 @@ fn gen_pipeline_call(
     local_vars: &std::collections::HashSet<String>,
     tools_index: &std::collections::HashMap<String, ToolIR>,
     prompts_index: &std::collections::HashMap<String, PromptIR>,
+    agents_index: &std::collections::HashMap<String, AgentIR>,
 ) -> TokenStream {
     match call {
         PipelineCallIR::Prompt { name, args } => {
@@ -390,10 +408,173 @@ fn gen_pipeline_call(
                 }
             }
         }
+        PipelineCallIR::Agent { name, args } => {
+            let agent_mod = format_ident!("{}", to_snake_case(name));
+            let agent_struct = format_ident!("{}Agent", to_pascal_case(name));
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_tool_expr(a, input_fields, local_vars))
+                .collect();
+
+            if let Some(agent_ir) = agents_index.get(name) {
+                match &agent_ir.input {
+                    TypeIR::Struct { fields } if !fields.is_empty() => {
+                        let field_inits: Vec<_> = fields
+                            .keys()
+                            .enumerate()
+                            .map(|(i, k)| {
+                                let fname = format_ident!("{}", to_ident(k));
+                                let val = arg_codes
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(quote! { Default::default() });
+                                quote! { #fname: #val }
+                            })
+                            .collect();
+                        quote! {
+                            {
+                                let __agent_input = crate::agents::#agent_mod::Input { #(#field_inits),* };
+                                crate::agents::#agent_struct::new().run_with(&client, model, __agent_input).await?
+                            }
+                        }
+                    }
+                    _ => {
+                        if args.is_empty() {
+                            quote! { crate::agents::#agent_struct::new().run_with(&client, model, ()).await? }
+                        } else if args.len() == 1 {
+                            let arg = &arg_codes[0];
+                            quote! { crate::agents::#agent_struct::new().run_with(&client, model, #arg).await? }
+                        } else {
+                            quote! { crate::agents::#agent_struct::new().run_with(&client, model, (#(#arg_codes),*)).await? }
+                        }
+                    }
+                }
+            } else if args.is_empty() {
+                quote! { crate::agents::#agent_struct::new().run_with(&client, model, ()).await? }
+            } else if args.len() == 1 {
+                let arg = &arg_codes[0];
+                quote! { crate::agents::#agent_struct::new().run_with(&client, model, #arg).await? }
+            } else {
+                quote! { crate::agents::#agent_struct::new().run_with(&client, model, (#(#arg_codes),*)).await? }
+            }
+        }
         PipelineCallIR::Expr { expr } => {
             // Generate code directly from the expression
             let code = gen_tool_expr(expr, input_fields, local_vars);
             quote! { #code }
+        }
+        PipelineCallIR::If {
+            condition,
+            then_steps,
+            else_steps,
+        } => {
+            let cond_code = gen_pipeline_expr(condition, input_fields, local_vars);
+            let (then_code, then_last, _) = gen_pipeline_steps_with_locals(
+                then_steps,
+                input_fields,
+                tools_index,
+                prompts_index,
+                agents_index,
+                local_vars,
+            );
+            let (else_code, else_last, _) = gen_pipeline_steps_with_locals(
+                else_steps,
+                input_fields,
+                tools_index,
+                prompts_index,
+                agents_index,
+                local_vars,
+            );
+            let then_tail = then_last.unwrap_or_else(|| quote! { Default::default() });
+            let else_tail = else_last.unwrap_or_else(|| quote! { Default::default() });
+            quote! {
+                {
+                    if #cond_code {
+                        #then_code
+                        #then_tail
+                    } else {
+                        #else_code
+                        #else_tail
+                    }
+                }
+            }
+        }
+        PipelineCallIR::Match { scrutinee, arms } => {
+            let scrut_code = gen_pipeline_expr(scrutinee, input_fields, local_vars);
+            if arms.is_empty() {
+                return quote! { Default::default() };
+            }
+            let mut clauses: Vec<TokenStream> = Vec::new();
+            for (idx, arm) in arms.iter().enumerate() {
+                let pat = gen_pipeline_expr(&arm.pattern, input_fields, local_vars);
+                let (arm_code, arm_last, _) = gen_pipeline_steps_with_locals(
+                    &arm.steps,
+                    input_fields,
+                    tools_index,
+                    prompts_index,
+                    agents_index,
+                    local_vars,
+                );
+                let arm_tail = arm_last.unwrap_or_else(|| quote! { Default::default() });
+                let clause = if idx == 0 {
+                    quote! {
+                        if #scrut_code == #pat {
+                            #arm_code
+                            #arm_tail
+                        }
+                    }
+                } else {
+                    quote! {
+                        else if #scrut_code == #pat {
+                            #arm_code
+                            #arm_tail
+                        }
+                    }
+                };
+                clauses.push(clause);
+            }
+            quote! {
+                {
+                    #(#clauses)*
+                    else {
+                        Default::default()
+                    }
+                }
+            }
+        }
+        PipelineCallIR::Parallel { branches } => {
+            if branches.is_empty() {
+                return quote! { () };
+            }
+            let mut branch_blocks: Vec<TokenStream> = Vec::new();
+            let mut branch_idents: Vec<proc_macro2::Ident> = Vec::new();
+
+            for (idx, branch) in branches.iter().enumerate() {
+                let (branch_code, _branch_last, _) = gen_pipeline_steps_with_locals(
+                    branch,
+                    input_fields,
+                    tools_index,
+                    prompts_index,
+                    agents_index,
+                    local_vars,
+                );
+                let ident = format_ident!("__branch_{}", idx);
+                branch_idents.push(ident);
+                branch_blocks.push(quote! {
+                    async {
+                        #branch_code
+                        Ok::<(), scaffold_runtime::Error>(())
+                    }
+                });
+            }
+
+            quote! {
+                {
+                    let (#(#branch_idents),*) = tokio::join!(#(#branch_blocks),*);
+                    #( #branch_idents?; )*
+                    ()
+                }
+            }
         }
     }
 }
@@ -460,6 +641,14 @@ fn gen_pipeline_expr(
             let left_code = gen_pipeline_expr(left, input_fields, local_vars);
             let right_code = gen_pipeline_expr(right, input_fields, local_vars);
             match op.as_str() {
+                "==" => quote! { (#left_code == #right_code) },
+                "!=" => quote! { (#left_code != #right_code) },
+                "<" => quote! { (#left_code < #right_code) },
+                "<=" => quote! { (#left_code <= #right_code) },
+                ">" => quote! { (#left_code > #right_code) },
+                ">=" => quote! { (#left_code >= #right_code) },
+                "&&" => quote! { (#left_code && #right_code) },
+                "||" => quote! { (#left_code || #right_code) },
                 "+" => quote! { (#left_code + #right_code) },
                 "-" => quote! { (#left_code - #right_code) },
                 "*" => quote! { (#left_code * #right_code) },
@@ -564,10 +753,18 @@ mod tests {
             std::collections::HashMap::new();
         let prompts_index: std::collections::HashMap<String, PromptIR> =
             std::collections::HashMap::new();
+        let agents_index: std::collections::HashMap<String, AgentIR> =
+            std::collections::HashMap::new();
         let types_index: std::collections::HashMap<String, TypeDefIR> =
             std::collections::HashMap::new();
-        let code =
-            gen_pipeline_module(&pipeline, &tools_index, &prompts_index, &types_index).to_string();
+        let code = gen_pipeline_module(
+            &pipeline,
+            &tools_index,
+            &prompts_index,
+            &agents_index,
+            &types_index,
+        )
+        .to_string();
         assert!(code.contains("AnalyzePipeline"));
         assert!(code.contains("execute"));
         assert!(code.contains("extracted"));

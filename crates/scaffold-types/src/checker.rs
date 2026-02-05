@@ -50,7 +50,7 @@ impl TypeChecker {
             }
         }
 
-        // Second pass: collect tool and prompt names
+        // Second pass: collect tool, prompt, and agent names
         for decl in &program.declarations {
             match decl {
                 Declaration::Tool(tool_decl) => {
@@ -58,6 +58,9 @@ impl TypeChecker {
                 }
                 Declaration::Prompt(prompt_decl) => {
                     self.env.define_prompt(prompt_decl.name.node.clone());
+                }
+                Declaration::Agent(agent_decl) => {
+                    self.env.define_agent(agent_decl.name.node.clone());
                 }
                 _ => {}
             }
@@ -169,30 +172,45 @@ impl TypeChecker {
         self.validate_type_expr(&pipeline_decl.input);
         self.validate_type_expr(&pipeline_decl.output);
 
-        // Validate step references exist
-        // Note: Parser currently treats all calls as PipelineCall::Tool,
-        // so we check if the name exists as either a tool OR a prompt
-        for step in &pipeline_decl.steps {
+        // Validate step references exist (recursively)
+        self.check_pipeline_steps(&pipeline_decl.steps, &pipeline_decl.name.node);
+
+        // Validate reward expression if present
+        if let Some(ref reward) = pipeline_decl.reward {
+            self.check_expr(reward);
+        }
+    }
+
+    fn check_pipeline_steps(&mut self, steps: &[PipelineStep], pipeline_name: &str) {
+        for step in steps {
             match &step.call {
                 scaffold_syntax::ast::PipelineCall::Prompt { name, .. } => {
                     if !self.env.has_prompt(name) {
                         self.errors.push(TypeError::new(
-                            format!(
-                                "undefined prompt '{}' in pipeline '{}'",
-                                name, pipeline_decl.name.node
-                            ),
+                            format!("undefined prompt '{}' in pipeline '{}'", name, pipeline_name),
                             step.span,
                         ));
                     }
                 }
                 scaffold_syntax::ast::PipelineCall::Tool { name, .. } => {
-                    // Check if it's a tool OR a prompt (parser doesn't distinguish)
-                    if !self.env.has_tool(name) && !self.env.has_prompt(name) {
+                    // Check if it's a tool OR a prompt OR an agent (parser doesn't distinguish)
+                    if !self.env.has_tool(name)
+                        && !self.env.has_prompt(name)
+                        && !self.env.has_agent(name)
+                    {
                         self.errors.push(TypeError::new(
                             format!(
-                                "undefined tool or prompt '{}' in pipeline '{}'",
-                                name, pipeline_decl.name.node
+                                "undefined tool, prompt, or agent '{}' in pipeline '{}'",
+                                name, pipeline_name
                             ),
+                            step.span,
+                        ));
+                    }
+                }
+                scaffold_syntax::ast::PipelineCall::Agent { name, .. } => {
+                    if !self.env.has_agent(name) {
+                        self.errors.push(TypeError::new(
+                            format!("undefined agent '{}' in pipeline '{}'", name, pipeline_name),
                             step.span,
                         ));
                     }
@@ -200,12 +218,37 @@ impl TypeChecker {
                 scaffold_syntax::ast::PipelineCall::Expr(_expr) => {
                     // General expressions are allowed in pipeline steps; no name to validate here.
                 }
+                scaffold_syntax::ast::PipelineCall::Parallel { branches } => {
+                    for branch in branches {
+                        self.check_pipeline_steps(branch, pipeline_name);
+                    }
+                }
+                scaffold_syntax::ast::PipelineCall::If {
+                    condition,
+                    then_steps,
+                    else_steps,
+                } => {
+                    let cond_ty = self.check_expr(condition);
+                    if !cond_ty.is_compatible_with(&Type::Bool) && !cond_ty.is_error() {
+                        self.errors.push(TypeError::new(
+                            format!("'if' condition must be bool, found {}", cond_ty),
+                            condition.span,
+                        ));
+                    }
+                    self.check_pipeline_steps(then_steps, pipeline_name);
+                    self.check_pipeline_steps(else_steps, pipeline_name);
+                }
+                scaffold_syntax::ast::PipelineCall::Match {
+                    scrutinee,
+                    arms,
+                } => {
+                    self.check_expr(scrutinee);
+                    for arm in arms {
+                        self.check_expr(&arm.pattern);
+                        self.check_pipeline_steps(&arm.steps, pipeline_name);
+                    }
+                }
             }
-        }
-
-        // Validate reward expression if present
-        if let Some(ref reward) = pipeline_decl.reward {
-            self.check_expr(reward);
         }
     }
 

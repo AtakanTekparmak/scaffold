@@ -169,6 +169,8 @@ pub struct TypeEnv {
     pub tools: std::collections::HashSet<String>,
     /// Declared prompt names
     pub prompts: std::collections::HashSet<String>,
+    /// Declared agent names
+    pub agents: std::collections::HashSet<String>,
 }
 
 impl TypeEnv {
@@ -178,6 +180,7 @@ impl TypeEnv {
             variables: HashMap::new(),
             tools: std::collections::HashSet::new(),
             prompts: std::collections::HashSet::new(),
+            agents: std::collections::HashSet::new(),
         }
     }
 
@@ -211,6 +214,14 @@ impl TypeEnv {
 
     pub fn has_prompt(&self, name: &str) -> bool {
         self.prompts.contains(name)
+    }
+
+    pub fn define_agent(&mut self, name: String) {
+        self.agents.insert(name);
+    }
+
+    pub fn has_agent(&self, name: &str) -> bool {
+        self.agents.contains(name)
     }
 
     /// Resolve a named type to its definition

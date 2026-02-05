@@ -99,13 +99,21 @@ pub async fn query_with_config(prompt: &str, llm_config: &LlmConfig) -> Result<S
         .model
         .as_deref()
         .unwrap_or(&config().default_model);
+
+    // If OpenRouter API key is available, use OpenRouter for all models
+    if std::env::var("OPENROUTER_API_KEY").is_ok() || config().get_api_key("openrouter").is_some() {
+        return query_openrouter(model, prompt, llm_config).await;
+    }
+
+    // Otherwise, route based on model prefix
     let (provider, model_name) = parse_model_id(model);
 
     match provider {
         "openai" => query_openai(model_name, prompt, llm_config).await,
         "anthropic" => query_anthropic(model_name, prompt, llm_config).await,
+        "openrouter" => query_openrouter(model_name, prompt, llm_config).await,
         other => Err(Error::ConfigError(format!(
-            "Unknown LLM provider: {}. Supported: openai, anthropic",
+            "Unknown LLM provider: {}. Supported: openai, anthropic, openrouter",
             other
         ))),
     }
@@ -200,6 +208,55 @@ async fn query_anthropic(model: &str, prompt: &str, llm_config: &LlmConfig) -> R
         .send()
         .await
         .map_err(|e| Error::Runtime(format!("Anthropic API error: {}", e)))?;
+
+    // Extract text from the first choice
+    Ok(extract_text(response.choice.first()))
+}
+
+/// Query via OpenRouter (unified API for all models)
+///
+/// OpenRouter provides access to OpenAI, Anthropic, and many other models
+/// through a single API endpoint using the OpenAI SDK format.
+async fn query_openrouter(model: &str, prompt: &str, llm_config: &LlmConfig) -> Result<String> {
+    let cfg = config();
+
+    // Get API key from env or config
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .ok()
+        .or_else(|| cfg.get_api_key("openrouter").map(|s| s.to_string()))
+        .ok_or_else(|| {
+            Error::ConfigError(
+                "OpenRouter API key not found. Set OPENROUTER_API_KEY env var or add to ~/.scaffold/config.toml"
+                    .to_string(),
+            )
+        })?;
+
+    // Set env vars for rig's OpenAI client to use OpenRouter
+    std::env::set_var("OPENAI_API_KEY", &api_key);
+    std::env::set_var("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+
+    let client: openai::Client = openai::Client::from_env();
+    let completion_model = client.completion_model(model);
+
+    // Build the completion request
+    let mut request = completion_model.completion_request(prompt);
+
+    if let Some(ref system) = llm_config.system_prompt {
+        request = request.preamble(system.clone());
+    }
+
+    if let Some(temp) = llm_config.temperature {
+        request = request.temperature(temp as f64);
+    }
+
+    if let Some(max_tokens) = llm_config.max_tokens {
+        request = request.max_tokens(max_tokens as u64);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| Error::Runtime(format!("OpenRouter API error: {}", e)))?;
 
     // Extract text from the first choice
     Ok(extract_text(response.choice.first()))

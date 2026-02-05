@@ -33,6 +33,8 @@ pub struct Lowerer {
     tool_names: std::collections::HashSet<String>,
     /// Known prompt names (for classifying pipeline calls)
     prompt_names: std::collections::HashSet<String>,
+    /// Known agent names (for classifying pipeline calls)
+    agent_names: std::collections::HashSet<String>,
 }
 
 impl Lowerer {
@@ -41,6 +43,7 @@ impl Lowerer {
             source_file: None,
             tool_names: std::collections::HashSet::new(),
             prompt_names: std::collections::HashSet::new(),
+            agent_names: std::collections::HashSet::new(),
         }
     }
 
@@ -51,9 +54,10 @@ impl Lowerer {
 
     /// Lower a complete program to IR
     pub fn lower(&self, program: &Program, _type_env: &TypeEnv) -> LowerResult<ScaffoldIR> {
-        // First pass: collect tool and prompt names for classifying pipeline calls
+        // First pass: collect tool, prompt, and agent names for classifying pipeline calls
         let mut tool_names = std::collections::HashSet::new();
         let mut prompt_names = std::collections::HashSet::new();
+        let mut agent_names = std::collections::HashSet::new();
 
         for decl in &program.declarations {
             match decl {
@@ -62,6 +66,9 @@ impl Lowerer {
                 }
                 Declaration::Prompt(prompt) => {
                     prompt_names.insert(prompt.name.node.clone());
+                }
+                Declaration::Agent(agent) => {
+                    agent_names.insert(agent.name.node.clone());
                 }
                 _ => {}
             }
@@ -72,6 +79,7 @@ impl Lowerer {
             source_file: self.source_file.clone(),
             tool_names,
             prompt_names,
+            agent_names,
         };
 
         // Second pass: lower all declarations
@@ -471,6 +479,7 @@ impl Lowerer {
             output: self.lower_type_expr(&decl.output.node)?,
             tools: decl.tools.iter().map(|t| t.node.clone()).collect(),
             system: self.lower_string_or_file(&decl.system),
+            model: decl.model.clone(),
             max_turns: decl.max_turns,
             reward,
             done,
@@ -492,10 +501,7 @@ impl Lowerer {
     }
 
     fn lower_pipeline(&self, decl: &PipelineDecl) -> LowerResult<PipelineIR> {
-        let mut steps = Vec::new();
-        for step in &decl.steps {
-            steps.push(self.lower_pipeline_step(step)?);
-        }
+        let steps = self.lower_pipeline_steps(&decl.steps)?;
 
         let reward = match &decl.reward {
             Some(expr) => Some(self.lower_expr(&expr.node)?),
@@ -509,6 +515,14 @@ impl Lowerer {
             steps,
             reward,
         })
+    }
+
+    fn lower_pipeline_steps(&self, steps: &[PipelineStep]) -> LowerResult<Vec<PipelineStepIR>> {
+        let mut out = Vec::new();
+        for step in steps {
+            out.push(self.lower_pipeline_step(step)?);
+        }
+        Ok(out)
     }
 
     fn lower_pipeline_step(&self, step: &PipelineStep) -> LowerResult<PipelineStepIR> {
@@ -534,6 +548,11 @@ impl Lowerer {
                         name: name.clone(),
                         args: ir_args,
                     }
+                } else if self.agent_names.contains(name) {
+                    PipelineCallIR::Agent {
+                        name: name.clone(),
+                        args: ir_args,
+                    }
                 } else {
                     PipelineCallIR::Tool {
                         name: name.clone(),
@@ -541,9 +560,53 @@ impl Lowerer {
                     }
                 }
             }
+            PipelineCall::Agent { name, args } => {
+                let mut ir_args = Vec::new();
+                for arg in args {
+                    ir_args.push(self.lower_tool_expr(&arg.node)?);
+                }
+                PipelineCallIR::Agent {
+                    name: name.clone(),
+                    args: ir_args,
+                }
+            }
             PipelineCall::Expr(expr) => {
                 let e = self.lower_tool_expr(&expr.node)?;
                 PipelineCallIR::Expr { expr: e }
+            }
+            PipelineCall::Parallel { branches } => {
+                let mut ir_branches = Vec::new();
+                for branch in branches {
+                    ir_branches.push(self.lower_pipeline_steps(branch)?);
+                }
+                PipelineCallIR::Parallel { branches: ir_branches }
+            }
+            PipelineCall::If {
+                condition,
+                then_steps,
+                else_steps,
+            } => {
+                let cond = self.lower_expr(&condition.node)?;
+                let then_ir = self.lower_pipeline_steps(then_steps)?;
+                let else_ir = self.lower_pipeline_steps(else_steps)?;
+                PipelineCallIR::If {
+                    condition: cond,
+                    then_steps: then_ir,
+                    else_steps: else_ir,
+                }
+            }
+            PipelineCall::Match { scrutinee, arms } => {
+                let scrut = self.lower_expr(&scrutinee.node)?;
+                let mut ir_arms = Vec::new();
+                for arm in arms {
+                    let pattern = self.lower_expr(&arm.pattern.node)?;
+                    let steps = self.lower_pipeline_steps(&arm.steps)?;
+                    ir_arms.push(PipelineMatchArmIR { pattern, steps });
+                }
+                PipelineCallIR::Match {
+                    scrutinee: scrut,
+                    arms: ir_arms,
+                }
             }
         };
 
