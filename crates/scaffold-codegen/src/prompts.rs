@@ -249,8 +249,28 @@ pub fn gen_prompt_module(prompt: &PromptIR) -> TokenStream {
             use scaffold_runtime::rig::client::ProviderClient;
 
             let prompt = #struct_name::new();
+            let model_id = scaffold_runtime::config().default_model.clone();
+            let (provider, model_name) = scaffold_runtime::config::parse_model_id(&model_id);
+            let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+                .ok()
+                .or_else(|| scaffold_runtime::config().get_api_key("openrouter").map(|s| s.to_string()));
+            let use_openrouter = openrouter_key.is_some() || provider == "openrouter";
+            if use_openrouter {
+                if let Some(key) = openrouter_key.as_deref() {
+                    std::env::set_var("OPENAI_API_KEY", key);
+                }
+                if let Some(base_url) = scaffold_runtime::config().get_base_url("openrouter") {
+                    std::env::set_var("OPENAI_BASE_URL", base_url);
+                } else {
+                    std::env::set_var("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+                }
+            }
             let client = openai::Client::from_env();
-            let model = &scaffold_runtime::config().default_model;
+            let model = if use_openrouter && provider != "openrouter" {
+                model_id.as_str()
+            } else {
+                model_name
+            };
             prompt.execute(&client, model, input).await
         }
     }

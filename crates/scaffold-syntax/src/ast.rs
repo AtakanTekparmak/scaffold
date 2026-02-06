@@ -391,8 +391,18 @@ pub enum ToolExpr {
     Continue,
     /// Literal value
     Literal(Literal),
+    /// Map/JSON literal: { key: value, ... }
+    MapLiteral { entries: Vec<MapEntry> },
     /// Wrapped general expression (for arithmetic, comparisons, etc.)
     Expr(Box<Spanned<Expr>>),
+}
+
+/// Entry in a map/json literal
+#[derive(Debug, Clone)]
+pub struct MapEntry {
+    pub key: String,
+    pub value: Spanned<ToolExpr>,
+    pub span: Span,
 }
 
 /// Statement in a tool sequence/parallel block

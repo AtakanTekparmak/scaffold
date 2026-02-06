@@ -7,7 +7,7 @@ Purpose
 -------
 - A tools‑first DSL and runtime for LLM‑authored automation that remains verifiable, analyzable, and safe to execute.
 - Guarantees that generation mistakes are caught at compile time via parsing, typing and verification — not at runtime.
-- Enables an interpreted inner loop for rapid iteration, with optional code generation for production binaries.
+- Enables fast execution through generated binaries with optional explicit code generation for production packaging.
 
 Why not “just Python”
 ---------------------
@@ -32,13 +32,13 @@ What Scaffold Guarantee
 - Parse‑time safety: The grammar only admits the constructs we support. No implicit execution of arbitrary host code.
 - Type‑time safety: A checker validates every declaration and expression with a global type environment.
 - Verify‑time checks: Optional static analyses (bounds, reachability/deadlock) reject ill‑formed orchestrations.
-- Runtime safety: Interpreter and generated code continue to check pre/postconditions and report structured errors.
+- Runtime safety: Generated binaries continue to check pre/postconditions and report structured errors.
 
 Workflow
 --------
 - Author: Write a `.scaffold` file using types, tools, prompts, agents, and pipelines.
 - Check: `scaffold check file.scaffold` — parse + type + verification errors are surfaced with spans.
-- Interpret (inner loop): `scaffold run file.scaffold --pipeline my_flow --input '{"..."}'` — no compilation required.
+- Run (inner loop): `scaffold run file.scaffold --pipeline my_flow --input '{"..."}'` — compiles and executes generated code.
 - Codegen (production): `scaffold codegen file.scaffold -o out_dir` — generates a Rust crate with CLI.
 - Build (one‑shot binary): `scaffold build file.scaffold -o out_dir [--release]` — codegen + cargo build.
 
@@ -52,22 +52,20 @@ Compile‑Time Constraints (Examples)
   - Field access must target declared fields of a struct‑typed value.
   - Pre/postconditions must be boolean; reward/done expressions must type‑check.
 
-Interpreter vs Codegen
-----------------------
-- Interpreter (development/hot reload):
-  - Executes IR directly with strong runtime checks.
-  - Enforces typed shell parsing (int/float/bool/string/bytes) and assembles declared struct outputs from bindings.
-  - Supports field access in pipeline assignments (e.g., `let words = result.count`).
-- Codegen (production):
-  - Emits a Rust crate that uses the same typed interfaces, native JSON schemas for LLM calls, and the same safety rails.
-  - Generated crates can be built and distributed without this repository.
+Run vs Build
+------------
+- Run (development):
+  - Uses generated Rust code and executes the selected tool/prompt/agent/pipeline.
+  - Keeps runtime behavior aligned with production binary semantics.
+- Build (production):
+  - Emits and compiles a Rust crate for distribution.
 
 CLI Cheatsheet
 --------------
 - `scaffold check FILE` — parse + type check + verify a scaffold file.
 - `scaffold parse FILE` — syntax only (for debugging).
 - `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
-- `scaffold run FILE [--tool T|--prompt P|--agent A|--pipeline X] --input JSON` — interpret and execute.
+- `scaffold run FILE [--tool T|--prompt P|--agent A|--pipeline X] --input JSON` — compile and execute.
 - `scaffold codegen FILE -o DIR [--format]` — generate a Rust crate.
 - `scaffold build FILE -o DIR [--release] [--runtime-path PATH|SCAFFOLD_RUNTIME_VERSION=x.y]` — generate and compile a binary.
 
@@ -77,7 +75,6 @@ Repository Layout
 - `crates/scaffold-types` — type checker and type environment.
 - `crates/scaffold-verify` — static analyses (bounds, reachability, deadlock).
 - `crates/scaffold-ir` — serializable IR: types, tools, prompts, agents, pipelines.
-- `crates/scaffold-interpreter` — interpreter for the IR (Loader/Executor/ForeignRegistry).
 - `crates/scaffold-runtime` — runtime utilities (shell, LLM, prompt manager, error, value, tracing).
 - `crates/scaffold-codegen` — Rust code generator for tools/prompts/agents/pipelines.
 - `crates/scaffold-cli` — command line interface providing `scaffold`.
@@ -91,11 +88,11 @@ Design Principles
 - Constrain the representation so an LLM can reliably produce correct scaffolds and failures are detectable early.
 - Keep semantics explicit and analyzable: typed I/O everywhere, named interfaces, finite control constructs.
 - Prefer clear, small, composable primitives (tools/prompts) over unconstrained general‑purpose code.
-- Separate development and production paths: interpreter for the inner loop, codegen for distribution.
+- Separate development and production paths: fast run for iteration, explicit build for distribution.
 
 Status
 ------
-- Parser, type checker, IR, interpreter, runtime, and CLI are complete and integrated.
+- Parser, type checker, IR, runtime, codegen, and CLI are complete and integrated.
 - Codegen covers tools/prompts/agents/pipelines; binary builds are supported.
 - Ongoing: deeper verification passes, more foreign module patterns, and expanded examples.
 

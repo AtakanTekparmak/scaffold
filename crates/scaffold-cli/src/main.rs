@@ -4,9 +4,10 @@
 //! - check: Parse and type check a scaffold file
 //! - compile: Compile to IR and output JSON
 //! - codegen: Generate Rust code from scaffold file
-//! - run: Execute a scaffold file directly (interpreter)
+//! - run: Build and execute a scaffold file via generated binary
 
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -14,9 +15,7 @@ use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand};
 
 use scaffold_codegen::CodeGenerator;
-use scaffold_interpreter::Interpreter;
 use scaffold_ir::{to_json, Lowerer};
-use scaffold_runtime::Value;
 use scaffold_syntax::parse;
 use scaffold_types::check;
 use scaffold_verify::{verify, Severity};
@@ -109,12 +108,16 @@ enum Commands {
         #[arg(long)]
         runtime_path: Option<String>,
 
+        /// Embed a scaffold config TOML into the generated binary
+        #[arg(long)]
+        embed_config: Option<PathBuf>,
+
         /// Build in release mode
         #[arg(long)]
         release: bool,
     },
 
-    /// Run a scaffold file directly (interpreter mode)
+    /// Build and run a scaffold file
     Run {
         /// Input file
         #[arg(value_name = "FILE")]
@@ -151,6 +154,14 @@ enum Commands {
         /// Enable verification checks
         #[arg(long)]
         verify: bool,
+
+        /// Config file to pass to the compiled binary
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Output directory for generated run crate
+        #[arg(long)]
+        build_dir: Option<PathBuf>,
     },
 }
 
@@ -178,6 +189,7 @@ fn main() -> ExitCode {
             format,
             strict,
             runtime_path,
+            embed_config,
             release,
         } => cmd_build(
             &file,
@@ -186,6 +198,7 @@ fn main() -> ExitCode {
             format,
             strict,
             runtime_path.as_deref(),
+            embed_config.as_deref(),
             release,
         ),
         Commands::Run {
@@ -198,21 +211,21 @@ fn main() -> ExitCode {
             input,
             verbose,
             verify,
-        } => {
-            // Run the async runtime
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(cmd_run(
-                &file,
-                task.as_deref(),
-                tool.as_deref(),
-                prompt.as_deref(),
-                agent.as_deref(),
-                pipeline.as_deref(),
-                &input,
-                verbose,
-                verify,
-            ))
-        }
+            config,
+            build_dir,
+        } => cmd_run(
+            &file,
+            task.as_deref(),
+            tool.as_deref(),
+            prompt.as_deref(),
+            agent.as_deref(),
+            pipeline.as_deref(),
+            &input,
+            verbose,
+            verify,
+            config.as_deref(),
+            build_dir.as_deref(),
+        ),
     }
 }
 
@@ -507,12 +520,44 @@ fn cmd_parse(file: &PathBuf) -> ExitCode {
 }
 
 /// Try to auto-detect scaffold-runtime path from the CLI executable location
-fn detect_runtime_path() -> Option<String> {
+fn detect_runtime_path(hint: Option<&Path>) -> Option<String> {
     // If env var is already set, use that
     if std::env::var("SCAFFOLD_RUNTIME_PATH").is_ok()
         || std::env::var("SCAFFOLD_RUNTIME_VERSION").is_ok()
     {
         return None;
+    }
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+
+    if let Some(hint_path) = hint {
+        let base = if hint_path.is_file() {
+            hint_path.parent().unwrap_or(hint_path).to_path_buf()
+        } else {
+            hint_path.to_path_buf()
+        };
+        roots.push(base);
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+
+    for root in roots {
+        let mut path = root;
+        for _ in 0..5 {
+            let runtime_path = path.join("crates/scaffold-runtime");
+            if runtime_path.join("Cargo.toml").exists() {
+                let abs = runtime_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| runtime_path);
+                return Some(abs.to_string_lossy().to_string());
+            }
+            path = match path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => break,
+            };
+        }
     }
 
     // Try to find scaffold-runtime relative to the current executable
@@ -526,7 +571,10 @@ fn detect_runtime_path() -> Option<String> {
             };
             let runtime_path = path.join("crates/scaffold-runtime");
             if runtime_path.join("Cargo.toml").exists() {
-                return Some(runtime_path.to_string_lossy().to_string());
+                let abs = runtime_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| runtime_path);
+                return Some(abs.to_string_lossy().to_string());
             }
         }
     }
@@ -536,7 +584,7 @@ fn detect_runtime_path() -> Option<String> {
 
 fn cmd_codegen(file: &PathBuf, output: &PathBuf, format: bool, strict: bool) -> ExitCode {
     // Auto-detect scaffold-runtime path
-    if let Some(runtime_path) = detect_runtime_path() {
+    if let Some(runtime_path) = detect_runtime_path(Some(file.as_path())) {
         std::env::set_var("SCAFFOLD_RUNTIME_PATH", runtime_path);
     }
     let source = match fs::read_to_string(file) {
@@ -664,6 +712,7 @@ fn cmd_build(
     format: bool,
     strict: bool,
     runtime_path: Option<&str>,
+    embed_config: Option<&Path>,
     release: bool,
 ) -> ExitCode {
     let source = match fs::read_to_string(file) {
@@ -745,14 +794,28 @@ fn cmd_build(
     // Configure runtime path env for codegen
     if let Some(path) = runtime_path {
         std::env::set_var("SCAFFOLD_RUNTIME_PATH", path);
-    } else if let Some(detected) = detect_runtime_path() {
+    } else if let Some(detected) = detect_runtime_path(Some(file.as_path())) {
         std::env::set_var("SCAFFOLD_RUNTIME_PATH", detected);
     }
+
+    // Optional embedded config for the generated binary
+    let embedded_config = if let Some(path) = embed_config {
+        match fs::read_to_string(path) {
+            Ok(contents) => Some(contents),
+            Err(e) => {
+                eprintln!("Error reading embed config {}: {}", path.display(), e);
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
 
     // Generate code
     let generator = CodeGenerator::new()
         .with_formatting(format)
-        .with_strict(strict);
+        .with_strict(strict)
+        .with_embedded_config(embedded_config);
     let generated = match generator.generate(&ir) {
         Ok(g) => g,
         Err(e) => {
@@ -823,7 +886,53 @@ fn cmd_build(
     }
 }
 
-async fn cmd_run(
+fn parse_run_input(input_str: &str) -> Result<String, ExitCode> {
+    let json_input = if input_str.starts_with('@') {
+        let input_path = &input_str[1..];
+        match fs::read_to_string(input_path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Error reading input file {}: {}", input_path, e);
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    } else {
+        input_str.to_string()
+    };
+
+    if let Err(e) = serde_json::from_str::<serde_json::Value>(&json_input) {
+        eprintln!("Error parsing input JSON: {}", e);
+        return Err(ExitCode::FAILURE);
+    }
+
+    Ok(json_input)
+}
+
+fn default_run_build_dir(file: &Path) -> PathBuf {
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("scaffold")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    file.to_string_lossy().hash(&mut hasher);
+    let hash = hasher.finish();
+
+    PathBuf::from("target")
+        .join("scaffold-run")
+        .join(format!("{}-{:x}", stem, hash))
+}
+
+fn cmd_run(
     file: &PathBuf,
     _task: Option<&str>, // Deprecated - tasks removed
     tool: Option<&str>,
@@ -832,101 +941,79 @@ async fn cmd_run(
     pipeline: Option<&str>,
     input_str: &str,
     verbose: bool,
-    _verify_enabled: bool,
+    verify_enabled: bool,
+    config: Option<&Path>,
+    build_dir: Option<&Path>,
 ) -> ExitCode {
-    // Parse input JSON
-    let input: Value = if input_str.starts_with('@') {
-        // Read from file
-        let input_path = &input_str[1..];
-        match fs::read_to_string(input_path) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Error parsing input JSON from {}: {}", input_path, e);
-                    return ExitCode::FAILURE;
-                }
-            },
-            Err(e) => {
-                eprintln!("Error reading input file {}: {}", input_path, e);
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        match serde_json::from_str(input_str) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Error parsing input JSON: {}", e);
-                return ExitCode::FAILURE;
-            }
-        }
+    let input_json = match parse_run_input(input_str) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
 
-    if verbose {
-        eprintln!("Loading: {}", file.display());
-    }
-
-    // Load the interpreter
-    let mut interpreter = match Interpreter::load(file) {
-        Ok(i) => i,
+    let source = match fs::read_to_string(file) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("Error loading scaffold file: {}", e);
+            eprintln!("Error reading file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let file_name = file.display().to_string();
+
+    let program = match parse(&source) {
+        Ok(p) => p,
+        Err(e) => {
+            Report::build(ReportKind::Error, &file_name, e.span.start)
+                .with_message("Parse error")
+                .with_label(
+                    Label::new((&file_name, e.span.start..e.span.end))
+                        .with_message(&e.message)
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint((&file_name, Source::from(&source)))
+                .unwrap();
             return ExitCode::FAILURE;
         }
     };
 
-    if verbose {
-        eprintln!("Available tools: {:?}", interpreter.tool_names());
-        eprintln!("Available prompts: {:?}", interpreter.prompt_names());
-        eprintln!("Available agents: {:?}", interpreter.agent_names());
-        eprintln!("Available pipelines: {:?}", interpreter.pipeline_names());
+    let mut tools: Vec<String> = Vec::new();
+    let mut prompts: Vec<String> = Vec::new();
+    let mut agents: Vec<String> = Vec::new();
+    let mut pipelines: Vec<String> = Vec::new();
+
+    for decl in &program.declarations {
+        match decl {
+            scaffold_syntax::Declaration::Tool(t) => tools.push(t.name.node.clone()),
+            scaffold_syntax::Declaration::Prompt(p) => prompts.push(p.name.node.clone()),
+            scaffold_syntax::Declaration::Agent(a) => agents.push(a.name.node.clone()),
+            scaffold_syntax::Declaration::Pipeline(p) => pipelines.push(p.name.node.clone()),
+            _ => {}
+        }
     }
 
-    // Execute based on what was requested
-    let result = if let Some(tool_name) = tool {
-        if verbose {
-            eprintln!("Running tool: {}", tool_name);
-        }
-        interpreter.run_tool(tool_name, input).await
-    } else if let Some(prompt_name) = prompt {
-        if verbose {
-            eprintln!("Running prompt: {}", prompt_name);
-        }
-        interpreter.run_prompt(prompt_name, input).await
-    } else if let Some(agent_name) = agent {
-        if verbose {
-            eprintln!("Running agent: {}", agent_name);
-        }
-        interpreter.run_agent(agent_name, input).await
-    } else if let Some(pipeline_name) = pipeline {
-        if verbose {
-            eprintln!("Running pipeline: {}", pipeline_name);
-        }
-        interpreter.run_pipeline(pipeline_name, input).await
+    let mut chosen: Vec<(&str, String)> = Vec::new();
+    if let Some(name) = tool {
+        chosen.push(("tool", name.to_string()));
+    }
+    if let Some(name) = prompt {
+        chosen.push(("prompt", name.to_string()));
+    }
+    if let Some(name) = agent {
+        chosen.push(("agent", name.to_string()));
+    }
+    if let Some(name) = pipeline {
+        chosen.push(("pipeline", name.to_string()));
+    }
+
+    if chosen.len() > 1 {
+        eprintln!("Specify only one of --tool, --prompt, --agent, or --pipeline.");
+        return ExitCode::FAILURE;
+    }
+
+    let (target_kind, target_name) = if let Some((k, n)) = chosen.into_iter().next() {
+        (k.to_string(), n)
     } else {
-        // Default: try to run first tool/agent/etc or list available
-        let tools: Vec<String> = interpreter
-            .tool_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let prompts: Vec<String> = interpreter
-            .prompt_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let agents: Vec<String> = interpreter
-            .agent_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let pipelines: Vec<String> = interpreter
-            .pipeline_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
         let total = tools.len() + prompts.len() + agents.len() + pipelines.len();
-
         if total == 0 {
             eprintln!(
                 "No tools, prompts, agents, or pipelines found in {}",
@@ -936,41 +1023,25 @@ async fn cmd_run(
         }
 
         if tools.len() == 1 && prompts.is_empty() && agents.is_empty() && pipelines.is_empty() {
-            let tool_name = &tools[0];
-            if verbose {
-                eprintln!("Running default tool: {}", tool_name);
-            }
-            interpreter.run_tool(tool_name, input).await
+            ("tool".to_string(), tools[0].clone())
         } else if prompts.len() == 1
             && tools.is_empty()
             && agents.is_empty()
             && pipelines.is_empty()
         {
-            let prompt_name = &prompts[0];
-            if verbose {
-                eprintln!("Running default prompt: {}", prompt_name);
-            }
-            interpreter.run_prompt(prompt_name, input).await
+            ("prompt".to_string(), prompts[0].clone())
         } else if agents.len() == 1
             && tools.is_empty()
             && prompts.is_empty()
             && pipelines.is_empty()
         {
-            let agent_name = &agents[0];
-            if verbose {
-                eprintln!("Running default agent: {}", agent_name);
-            }
-            interpreter.run_agent(agent_name, input).await
+            ("agent".to_string(), agents[0].clone())
         } else if pipelines.len() == 1
             && tools.is_empty()
             && prompts.is_empty()
             && agents.is_empty()
         {
-            let pipeline_name = &pipelines[0];
-            if verbose {
-                eprintln!("Running default pipeline: {}", pipeline_name);
-            }
-            interpreter.run_pipeline(pipeline_name, input).await
+            ("pipeline".to_string(), pipelines[0].clone())
         } else {
             eprintln!("Multiple items available. Please specify one:");
             if !tools.is_empty() {
@@ -990,16 +1061,162 @@ async fn cmd_run(
         }
     };
 
-    match result {
-        Ok(output) => {
-            // Output the result as JSON
-            let json =
-                serde_json::to_string_pretty(&output).unwrap_or_else(|_| format!("{:?}", output));
-            println!("{}", json);
-            ExitCode::SUCCESS
+    let target_exists = match target_kind.as_str() {
+        "tool" => tools.iter().any(|n| n == &target_name),
+        "prompt" => prompts.iter().any(|n| n == &target_name),
+        "agent" => agents.iter().any(|n| n == &target_name),
+        "pipeline" => pipelines.iter().any(|n| n == &target_name),
+        _ => false,
+    };
+    if !target_exists {
+        eprintln!("{} '{}' not found in {}", target_kind, target_name, file.display());
+        return ExitCode::FAILURE;
+    }
+
+    let type_env = match check(&program) {
+        Ok(env) => env,
+        Err(errors) => {
+            for error in &errors {
+                Report::build(ReportKind::Error, &file_name, error.span.start)
+                    .with_message("Type error")
+                    .with_label(
+                        Label::new((&file_name, error.span.start..error.span.end))
+                            .with_message(&error.message)
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+                    .eprint((&file_name, Source::from(&source)))
+                    .unwrap();
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if verify_enabled {
+        let verify_result = verify(&program, &type_env);
+        let mut has_errors = false;
+        for error in &verify_result.errors {
+            let kind = match error.severity {
+                Severity::Error => {
+                    has_errors = true;
+                    ReportKind::Error
+                }
+                Severity::Warning => ReportKind::Warning,
+            };
+            Report::build(kind, &file_name, error.span.start)
+                .with_message("Verification")
+                .with_label(
+                    Label::new((&file_name, error.span.start..error.span.end))
+                        .with_message(&error.message)
+                        .with_color(if has_errors {
+                            Color::Red
+                        } else {
+                            Color::Yellow
+                        }),
+                )
+                .finish()
+                .eprint((&file_name, Source::from(&source)))
+                .unwrap();
+        }
+        if has_errors {
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let lowerer = Lowerer::new().with_source_file(file_name.clone());
+    let ir = match lowerer.lower(&program, &type_env) {
+        Ok(ir) => ir,
+        Err(e) => {
+            Report::build(ReportKind::Error, &file_name, e.span.start)
+                .with_message("Lowering error")
+                .with_label(
+                    Label::new((&file_name, e.span.start..e.span.end))
+                        .with_message(&e.message)
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint((&file_name, Source::from(&source)))
+                .unwrap();
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let out_dir = build_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| default_run_build_dir(file));
+    if let Err(e) = fs::create_dir_all(&out_dir) {
+        eprintln!("Error creating output dir {}: {}", out_dir.display(), e);
+        return ExitCode::FAILURE;
+    }
+
+    if let Some(detected) = detect_runtime_path(Some(file.as_path())) {
+        std::env::set_var("SCAFFOLD_RUNTIME_PATH", detected);
+    }
+
+    if verbose {
+        eprintln!("Generating crate in {}", out_dir.display());
+    }
+    let generator = CodeGenerator::new()
+        .with_formatting(true)
+        .with_strict(false);
+    let generated = match generator.generate(&ir) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Code generation error: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = generated.write_to_dir(&out_dir) {
+        eprintln!("Error writing output: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    let pkg_name = ir
+        .pipelines
+        .first()
+        .map(|p| p.name.clone())
+        .or_else(|| ir.tools.first().map(|t| t.name.clone()))
+        .unwrap_or_else(|| "scaffold_generated".to_string());
+
+    if verbose {
+        eprintln!("Building generated binary...");
+    }
+    let mut build_cmd = std::process::Command::new("cargo");
+    build_cmd.arg("build").current_dir(&out_dir);
+    match build_cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("cargo build failed with status: {}", status);
+            return ExitCode::FAILURE;
         }
         Err(e) => {
-            eprintln!("Execution error: {}", e);
+            eprintln!("Failed to run cargo build: {}", e);
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let binary_path = out_dir.join("target").join("debug").join(pkg_name);
+    if verbose {
+        eprintln!("Running {} {}", target_kind, target_name);
+    }
+    let mut run_cmd = std::process::Command::new(&binary_path);
+    if let Some(config_path) = config {
+        run_cmd.arg("--config").arg(config_path);
+    }
+    run_cmd
+        .arg(&target_kind)
+        .arg(&target_name)
+        .arg("--input")
+        .arg(input_json);
+
+    match run_cmd.status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
+            eprintln!("Execution failed with status: {}", status);
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("Failed to run compiled binary: {}", e);
             ExitCode::FAILURE
         }
     }

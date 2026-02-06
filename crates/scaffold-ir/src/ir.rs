@@ -285,6 +285,8 @@ pub enum ToolExprIR {
     Continue,
     /// Literal value
     Literal { value: LiteralIR },
+    /// Map/JSON literal
+    MapLiteral { entries: Vec<MapEntryIR> },
     /// General expression (arithmetic, comparisons, etc.)
     Expr { expr: Box<ExprIR> },
 }
@@ -296,6 +298,13 @@ pub struct ToolStatementIR {
     pub binding: Option<String>,
     /// The expression
     pub expr: ToolExprIR,
+}
+
+/// Map/json literal entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MapEntryIR {
+    pub key: String,
+    pub value: ToolExprIR,
 }
 
 /// Match arm IR

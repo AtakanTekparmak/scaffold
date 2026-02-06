@@ -417,6 +417,16 @@ impl Lowerer {
             ToolExpr::Literal(lit) => Ok(ToolExprIR::Literal {
                 value: self.lower_literal(lit),
             }),
+            ToolExpr::MapLiteral { entries } => {
+                let mut ir_entries = Vec::new();
+                for entry in entries {
+                    ir_entries.push(MapEntryIR {
+                        key: entry.key.clone(),
+                        value: self.lower_tool_expr(&entry.value.node)?,
+                    });
+                }
+                Ok(ToolExprIR::MapLiteral { entries: ir_entries })
+            }
             ToolExpr::Expr(expr) => Ok(ToolExprIR::Expr {
                 expr: Box::new(self.lower_expr(&expr.node)?),
             }),

@@ -3,7 +3,7 @@
 //! Generates Rust implementations for scaffold tools.
 //! Tools implement the rig `Tool` trait for LLM tool calling.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use scaffold_ir::{
     LiteralIR, ToolExprIR, ToolIR, ToolImplIR, ToolSpecIR, ToolStatementIR, ToolVariantIR, TypeIR,
@@ -92,6 +92,14 @@ fn gen_expr_or_tool_call(
                         quote! {
                             {
                                 let __call_input = crate::tools::#tool_mod::Input { #(#field_inits),* };
+                                crate::tools::#tool_struct::new().execute(__call_input)?
+                            }
+                        }
+                    }
+                    TypeIR::Struct { fields } if fields.is_empty() => {
+                        quote! {
+                            {
+                                let __call_input = crate::tools::#tool_mod::Input {};
                                 crate::tools::#tool_struct::new().execute(__call_input)?
                             }
                         }
@@ -191,8 +199,13 @@ fn gen_io_type(ty: &TypeIR, type_name: &str) -> (TokenStream, TokenStream, bool)
             (struct_def, quote! { #struct_ident }, false)
         }
         TypeIR::Struct { fields } if fields.is_empty() => {
-            // Empty struct -> use unit type, need type alias
-            (quote! {}, quote! { () }, true)
+            // Empty struct -> generate an explicit empty struct (tool parameters must be object)
+            let struct_ident = format_ident!("{}", type_name);
+            let struct_def = quote! {
+                #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+                pub struct #struct_ident {}
+            };
+            (struct_def, quote! { #struct_ident }, false)
         }
         other => {
             // Use existing type directly, need type alias
@@ -332,7 +345,7 @@ pub fn gen_tool_module(
     let tool_description = format!("Execute the {} tool", tool_name);
 
     // Generate JSON schema for the input type (using schemars at compile time)
-    let input_schema_code = gen_input_schema_fn(&tool.input);
+    let input_schema_code = gen_input_schema_fn(&input_type);
 
     // Generate type aliases only when needed (when no struct was generated)
     let input_alias = if needs_input_alias {
@@ -768,6 +781,32 @@ fn gen_tool_expr_with_ctx(
             }
         }
         ToolExprIR::Literal { value } => gen_literal(value),
+        ToolExprIR::MapLiteral { entries } => {
+            let entry_tokens: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    let key_lit = Literal::string(&entry.key);
+                    let val_code = gen_tool_expr_with_ctx(
+                        &entry.value,
+                        None,
+                        tools_index,
+                        input_fields,
+                        local_vars,
+                    );
+                    quote! { #key_lit: #val_code }
+                })
+                .collect();
+            let json_expr = quote! { serde_json::json!({ #(#entry_tokens),* }) };
+            if expected.is_some() {
+                quote! {{
+                    let __val = #json_expr;
+                    serde_json::from_value::<Output>(__val)
+                        .map_err(|e| scaffold_runtime::Error::ParseError(e.to_string()))?
+                }}
+            } else {
+                json_expr
+            }
+        }
         ToolExprIR::For {
             variable,
             iterable,
@@ -973,13 +1012,12 @@ fn gen_variant_method(
 
 /// Generate code to create JSON schema for the input type
 /// Uses schemars to generate schema at runtime from types that derive JsonSchema
-fn gen_input_schema_fn(ty: &TypeIR) -> TokenStream {
+fn gen_input_schema_fn(input_type: &TokenStream) -> TokenStream {
     // For types that derive JsonSchema, we use schemars::schema_for!
-    // This works because our generated types now derive JsonSchema
-    let rust_type = gen_type(ty);
+    // Use the concrete Input type token to avoid inline struct collapsing to ()
     quote! {
         {
-            let schema = schemars::schema_for!(#rust_type);
+            let schema = schemars::schema_for!(#input_type);
             serde_json::to_value(schema).unwrap_or_default()
         }
     }

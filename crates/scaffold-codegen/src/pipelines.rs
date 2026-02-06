@@ -2,7 +2,7 @@
 //!
 //! Generates Rust implementations for scaffold pipelines (fixed sequences of prompts/tools).
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use scaffold_ir::{
     AgentIR, PipelineCallIR, PipelineIR, PipelineStepIR, PromptIR, ToolExprIR, ToolIR, TypeDefIR,
@@ -157,8 +157,28 @@ pub fn gen_pipeline_module(
             pub async fn execute(&self, input: Input) -> scaffold_runtime::Result<Output> {
                 use scaffold_runtime::rig::providers::openai;
                 use scaffold_runtime::rig::client::ProviderClient;
+                let model_id = scaffold_runtime::config().default_model.clone();
+                let (provider, model_name) = scaffold_runtime::config::parse_model_id(&model_id);
+                let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+                    .ok()
+                    .or_else(|| scaffold_runtime::config().get_api_key("openrouter").map(|s| s.to_string()));
+                let use_openrouter = openrouter_key.is_some() || provider == "openrouter";
+                if use_openrouter {
+                    if let Some(key) = openrouter_key.as_deref() {
+                        std::env::set_var("OPENAI_API_KEY", key);
+                    }
+                    if let Some(base_url) = scaffold_runtime::config().get_base_url("openrouter") {
+                        std::env::set_var("OPENAI_BASE_URL", base_url);
+                    } else {
+                        std::env::set_var("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+                    }
+                }
                 let client = openai::Client::from_env();
-                let model = &scaffold_runtime::config().default_model;
+                let model = if use_openrouter && provider != "openrouter" {
+                    model_id.as_str()
+                } else {
+                    model_name
+                };
                 #step_code
             }
         }
@@ -271,7 +291,7 @@ fn gen_pipeline_steps_with_locals(
         );
 
         let (binding_ident, binding_name) = match &step.binding {
-            Some(name) => (format_ident!("{}", name), name.clone()),
+            Some(name) => (format_ident!("{}", to_ident(name)), name.clone()),
             None => (format_ident!("__step_{}", idx), format!("__step_{}", idx)),
         };
 
@@ -380,6 +400,14 @@ fn gen_pipeline_call(
                         quote! {
                             {
                                 let __tool_input = crate::tools::#tool_mod::Input { #(#field_inits),* };
+                                crate::tools::#tool_struct::new().execute(__tool_input)?
+                            }
+                        }
+                    }
+                    TypeIR::Struct { fields } if fields.is_empty() => {
+                        quote! {
+                            {
+                                let __tool_input = crate::tools::#tool_mod::Input {};
                                 crate::tools::#tool_struct::new().execute(__tool_input)?
                             }
                         }
@@ -588,7 +616,7 @@ fn gen_tool_expr(
 ) -> TokenStream {
     match expr {
         ToolExprIR::Ident { name } => {
-            let ident = format_ident!("{}", name);
+            let ident = format_ident!("{}", to_ident(name));
             if local_vars.contains(name) {
                 // Local variable from previous step
                 quote! { #ident.clone() }
@@ -602,8 +630,19 @@ fn gen_tool_expr(
         }
         ToolExprIR::FieldAccess { base, field } => {
             let base_code = gen_tool_expr(base, input_fields, local_vars);
-            let field_ident = format_ident!("{}", field);
+            let field_ident = format_ident!("{}", to_ident(field));
             quote! { #base_code.#field_ident.clone() }
+        }
+        ToolExprIR::MapLiteral { entries } => {
+            let entry_tokens: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    let key_lit = Literal::string(&entry.key);
+                    let val_code = gen_tool_expr(&entry.value, input_fields, local_vars);
+                    quote! { #key_lit: #val_code }
+                })
+                .collect();
+            quote! { serde_json::json!({ #(#entry_tokens),* }) }
         }
         ToolExprIR::Literal { value } => gen_literal(value),
         ToolExprIR::Expr { expr } => gen_pipeline_expr(expr, input_fields, local_vars),
@@ -622,7 +661,7 @@ fn gen_pipeline_expr(
 ) -> TokenStream {
     match expr {
         scaffold_ir::ExprIR::Ident { name } => {
-            let ident = format_ident!("{}", name);
+            let ident = format_ident!("{}", to_ident(name));
             if local_vars.contains(name) {
                 quote! { #ident.clone() }
             } else if input_fields.contains(name) {
@@ -633,7 +672,7 @@ fn gen_pipeline_expr(
         }
         scaffold_ir::ExprIR::FieldAccess { base, field } => {
             let base_code = gen_pipeline_expr(base, input_fields, local_vars);
-            let field_ident = format_ident!("{}", field);
+            let field_ident = format_ident!("{}", to_ident(field));
             quote! { #base_code.#field_ident }
         }
         scaffold_ir::ExprIR::Literal { value } => gen_literal(value),

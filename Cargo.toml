@@ -7,7 +7,6 @@ members = [
     "crates/scaffold-ir",
     "crates/scaffold-runtime",
     "crates/scaffold-codegen",
-    "crates/scaffold-interpreter",
     "crates/scaffold-cli",
 ]
 
@@ -41,7 +40,6 @@ scaffold-verify = { path = "crates/scaffold-verify" }
 scaffold-ir = { path = "crates/scaffold-ir" }
 scaffold-runtime = { path = "crates/scaffold-runtime" }
 scaffold-codegen = { path = "crates/scaffold-codegen" }
-scaffold-interpreter = { path = "crates/scaffold-interpreter" }
 
 # Code generation
 proc-macro2 = "1.0"

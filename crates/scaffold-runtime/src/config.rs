@@ -15,6 +15,23 @@ use std::sync::OnceLock;
 /// Global config singleton
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
+/// Initialize global config from a specific file path.
+/// Must be called before any `config()` access.
+pub fn init_from_path(path: &std::path::Path) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    init_from_str(&content)
+}
+
+/// Initialize global config from a TOML string.
+/// Must be called before any `config()` access.
+pub fn init_from_str(toml_str: &str) -> Result<(), String> {
+    let mut config: Config = toml::from_str(toml_str).map_err(|e| e.to_string())?;
+    config.apply_env_overrides();
+    CONFIG
+        .set(config)
+        .map_err(|_| "Config already initialized".to_string())
+}
+
 /// Get the global config (loads on first access)
 pub fn config() -> &'static Config {
     CONFIG.get_or_init(Config::load)

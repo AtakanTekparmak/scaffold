@@ -153,6 +153,8 @@ pub enum Token {
     Map,
     #[token("option")]
     Option_,
+    #[token("json")]
+    Json,
 
     // Literals
     #[token("true")]
@@ -332,6 +334,7 @@ impl std::fmt::Display for Token {
             Token::List => write!(f, "list"),
             Token::Map => write!(f, "map"),
             Token::Option_ => write!(f, "option"),
+            Token::Json => write!(f, "json"),
             Token::True => write!(f, "true"),
             Token::False => write!(f, "false"),
             Token::Null => write!(f, "null"),

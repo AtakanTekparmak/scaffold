@@ -2,7 +2,7 @@
 
 tool word_counter {
     input: { text: string }
-    output: { count: int }
+    output: int
     impl: shell("echo '{text}' | wc -w")
 }
 

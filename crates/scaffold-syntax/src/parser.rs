@@ -524,6 +524,53 @@ impl<'source> Parser<'source> {
                 let end = self.expect(Token::RParen)?.span;
                 Ok(Spanned::new(ToolExpr::Shell(cmd), start.merge(end)))
             }
+            // JSON/map literal: json { key: value, ... } or map { ... }
+            Token::Json | Token::Map => {
+                let start = self.advance().span;
+                self.expect(Token::LBrace)?;
+                let mut entries = Vec::new();
+
+                while !self.check(&Token::RBrace) {
+                    // Parse key as string literal or field-like identifier
+                    let key_token = self.peek_token()?;
+                    let (key, key_span) = match &key_token.token {
+                        Token::StringLit(_) => {
+                            let span = self.advance().span;
+                            let key = match key_token.token {
+                                Token::StringLit(s) => s,
+                                _ => unreachable!(),
+                            };
+                            (key, span)
+                        }
+                        _ => {
+                            let key_ident = self.parse_field_name()?;
+                            (key_ident.node.clone(), key_ident.span)
+                        }
+                    };
+
+                    self.expect(Token::Colon)?;
+                    let value = self.parse_tool_expr()?;
+                    let entry_span = key_span.merge(value.span);
+                    entries.push(MapEntry {
+                        key,
+                        value,
+                        span: entry_span,
+                    });
+
+                    if self.check(&Token::Comma) {
+                        self.advance();
+                        if self.check(&Token::RBrace) {
+                            break;
+                        }
+                    }
+                }
+
+                let end = self.expect(Token::RBrace)?.span;
+                Ok(Spanned::new(
+                    ToolExpr::MapLiteral { entries },
+                    start.merge(end),
+                ))
+            }
             // If expression
             Token::If => {
                 let start = self.advance().span;

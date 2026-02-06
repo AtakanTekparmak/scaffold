@@ -30,6 +30,14 @@ tool word_counter {
     impl: shell("echo '{text}' | wc -w")
 }
 
+// Build structured output without shell JSON
+tool word_counter_struct {
+    input: { text: string }
+    output: { count: int }
+    impl: json { count: 42 }
+    // `map { ... }` is a synonym for `json { ... }`
+}
+
 // With pre/post conditions
 tool safe_divide {
     input: { a: int, b: int }

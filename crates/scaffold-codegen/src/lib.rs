@@ -91,6 +91,8 @@ pub struct CodeGenerator {
     format_code: bool,
     /// Whether to enforce strict validation (no unresolved idents/calls)
     strict_mode: bool,
+    /// Optional embedded scaffold config (TOML)
+    embedded_config: Option<String>,
 }
 
 impl CodeGenerator {
@@ -108,6 +110,12 @@ impl CodeGenerator {
     /// Enable strict validation for code generation
     pub fn with_strict(mut self, enabled: bool) -> Self {
         self.strict_mode = enabled;
+        self
+    }
+
+    /// Embed a scaffold config (TOML) into generated binaries
+    pub fn with_embedded_config(mut self, config: Option<String>) -> Self {
+        self.embedded_config = config;
         self
     }
 
@@ -532,17 +540,27 @@ tokio = {{ version = "1.0", features = ["full"] }}
             .collect::<Vec<_>>()
             .join("\n");
 
+        let embedded_config_literal = self
+            .embedded_config
+            .as_ref()
+            .map(|cfg| format!("Some({:?})", cfg))
+            .unwrap_or_else(|| "None".to_string());
+
         format!(
             r#"//! Generated CLI entrypoint
 //!
 //! Run with: cargo run -- --help
 
 use clap::{{Parser, Subcommand}};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "{crate_name}")]
 #[command(about = "Generated scaffold CLI", long_about = None)]
 struct Cli {{
+    /// Optional scaffold config path
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }}
@@ -585,9 +603,19 @@ enum Commands {{
     List,
 }}
 
+const EMBEDDED_CONFIG: Option<&'static str> = {embedded_config_literal};
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {{
     let cli = Cli::parse();
+
+    if let Some(path) = cli.config.as_deref() {{
+        scaffold_runtime::config::init_from_path(path)
+            .map_err(|e| format!("Failed to load config {{}}: {{}}", path.display(), e))?;
+    }} else if let Some(config_str) = EMBEDDED_CONFIG {{
+        scaffold_runtime::config::init_from_str(config_str)
+            .map_err(|e| format!("Failed to load embedded config: {{}}", e))?;
+    }}
 
     match cli.command {{
         Commands::Pipeline {{ name, input: input_json }} => {{

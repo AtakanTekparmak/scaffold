@@ -83,30 +83,8 @@ When done, respond: DONE: {\"content\": \"...\"}"
 }
 
 // ============================================
-// Orchestration Tools
+// Orchestration Utilities
 // ============================================
-
-// Tool that routes to the appropriate agent based on classification
-tool route_request {
-    input: { request: string, classification: TaskType }
-    output: TaskResult
-
-    impl: if classification.category == "research" {
-        if classification.complexity == "simple" {
-            // Use quick researcher for simple research
-            quick_researcher(request)
-        } else {
-            // Use deep researcher for complex research
-            deep_researcher(request)
-        }
-    } else {
-        if classification.category == "coding" {
-            coder(request)
-        } else {
-            writer(request)
-        }
-    }
-}
 
 // ============================================
 // Main Pipeline
@@ -121,8 +99,40 @@ pipeline smart_assistant {
         // First, classify the request
         let classification = classify_request(request)
 
-        // Then route to appropriate agent
-        let routing_result = route_request(request, classification)
+        // Route to the selected agent and normalize outputs into TaskResult fields
+        let response = if classification.category == "research" {
+            if classification.complexity == "simple" {
+                let quick_out = quick_researcher(request)
+                quick_out.answer
+            } else {
+                let deep_out = deep_researcher(request)
+                deep_out.answer
+            }
+        } else {
+            if classification.category == "coding" {
+                let code_out = coder(request)
+                code_out.explanation
+            } else {
+                let write_out = writer(request)
+                write_out.content
+            }
+        }
+
+        let agent_used = if classification.category == "research" {
+            if classification.complexity == "simple" {
+                "quick_researcher"
+            } else {
+                "deep_researcher"
+            }
+        } else {
+            if classification.category == "coding" {
+                "coder"
+            } else {
+                "writer"
+            }
+        }
+
+        let success = true
     }
 }
 
@@ -133,14 +143,13 @@ pipeline smart_assistant {
 // Tool with conditional logic for pipeline use
 tool conditional_processor {
     input: { mode: string, data: string }
-    output: string
+    output: { processed_data: string, mode: string }
 
     impl: if mode == "analyze" {
-        // Return classification result
-        "analyzed"
+        // Build a typed struct output directly via map/json literal
+        map { processed_data: "analyzed", mode: mode }
     } else {
-        // Return research result
-        "researched"
+        map { processed_data: "researched", mode: mode }
     }
 }
 
@@ -151,6 +160,7 @@ pipeline conditional_pipeline {
 
     steps {
         // Use tool with conditional logic
-        let processed_data = conditional_processor(mode, data)
+        let processed = conditional_processor(mode, data)
+        let processed_data = processed.processed_data
     }
 }

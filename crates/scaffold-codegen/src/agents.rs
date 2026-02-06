@@ -3,12 +3,12 @@
 //! Generates Rust implementations for scaffold agents (multi-turn LLM with tools).
 //! Agents use rig's agent builder with tool registration for native tool calling.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
-use scaffold_ir::{AgentIR, StringOrFileIR};
+use scaffold_ir::{AgentIR, StringOrFileIR, TypeIR};
 
 use crate::types::gen_type;
-use crate::util::{to_pascal_case, to_snake_case};
+use crate::util::{to_ident, to_pascal_case, to_snake_case};
 
 /// Generate the agents mod.rs
 pub fn gen_agents_mod(agent_names: &[&str]) -> TokenStream {
@@ -42,12 +42,43 @@ pub fn gen_agents_mod(agent_names: &[&str]) -> TokenStream {
     }
 }
 
+/// Generate input/output type for agents, handling inline structs
+fn gen_io_type(ty: &TypeIR, type_name: &str) -> (TokenStream, TokenStream) {
+    match ty {
+        TypeIR::Struct { fields } if !fields.is_empty() => {
+            let struct_ident = format_ident!("{}", type_name);
+            let field_defs: Vec<_> = fields
+                .iter()
+                .map(|(name, field_ty)| {
+                    let field_name = format_ident!("{}", to_ident(name));
+                    let field_type = gen_type(field_ty);
+                    quote! { pub #field_name: #field_type }
+                })
+                .collect();
+
+            let struct_def = quote! {
+                #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+                pub struct #struct_ident {
+                    #(#field_defs),*
+                }
+            };
+
+            (struct_def, quote! { #struct_ident })
+        }
+        TypeIR::Struct { fields } if fields.is_empty() => (quote! {}, quote! { () }),
+        other => {
+            let ty = gen_type(other);
+            (quote! {}, ty)
+        }
+    }
+}
+
 /// Generate an agent module
 pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
     let agent_name = &agent.name;
     let struct_name = format_ident!("{}Agent", to_pascal_case(agent_name));
-    let input_type = gen_type(&agent.input);
-    let output_type = gen_type(&agent.output);
+    let (input_struct_def, input_type) = gen_io_type(&agent.input, "Input");
+    let (output_struct_def, output_type) = gen_io_type(&agent.output, "Output");
 
     // Generate system prompt
     let system_str = gen_string_or_file(&agent.system);
@@ -56,7 +87,13 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
     let tool_names: Vec<_> = agent.tools.iter().collect();
 
     // Generate model (optional, falls back to config default)
-    let model_str = agent.model.as_deref();
+    let model_init = match agent.model.as_deref() {
+        Some(model) => {
+            let lit = Literal::string(model);
+            quote! { Some(#lit.to_string()) }
+        }
+        None => quote! { None },
+    };
 
     // Generate max_turns
     let max_turns = agent.max_turns.unwrap_or(10);
@@ -75,6 +112,27 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
 
     let doc = format!("Agent: {}", agent_name);
 
+    let input_needs_alias = input_struct_def.is_empty();
+    let output_needs_alias = output_struct_def.is_empty();
+
+    let input_type_decl = if input_needs_alias {
+        quote! {
+            /// Input type for this agent
+            pub type Input = #input_type;
+        }
+    } else {
+        quote! {}
+    };
+
+    let output_type_decl = if output_needs_alias {
+        quote! {
+            /// Output type for this agent
+            pub type Output = #output_type;
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         #![doc = #doc]
 
@@ -85,11 +143,13 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
         use scaffold_runtime::rig::client::CompletionClient;
         use schemars::JsonSchema;
 
-        /// Input type for this agent
-        pub type Input = #input_type;
+        #input_struct_def
 
-        /// Output type for this agent
-        pub type Output = #output_type;
+        #output_struct_def
+
+        #input_type_decl
+
+        #output_type_decl
 
         /// Agent implementation struct
         #[derive(Clone, Debug)]
@@ -104,7 +164,7 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
             pub fn new() -> Self {
                 Self {
                     system_prompt: #system_str.to_string(),
-                    model: #model_str.map(|s| s.to_string()),
+                    model: #model_init,
                     max_turns: #max_turns,
                 }
             }
@@ -255,8 +315,28 @@ pub fn gen_agent_module(agent: &AgentIR) -> TokenStream {
             use scaffold_runtime::rig::client::ProviderClient;
 
             let agent = #struct_name::new();
+            let model_id = agent.model().to_string();
+            let (provider, model_name) = scaffold_runtime::config::parse_model_id(&model_id);
+            let openrouter_key = std::env::var("OPENROUTER_API_KEY")
+                .ok()
+                .or_else(|| scaffold_runtime::config().get_api_key("openrouter").map(|s| s.to_string()));
+            let use_openrouter = openrouter_key.is_some() || provider == "openrouter";
+            if use_openrouter {
+                if let Some(key) = openrouter_key.as_deref() {
+                    std::env::set_var("OPENAI_API_KEY", key);
+                }
+                if let Some(base_url) = scaffold_runtime::config().get_base_url("openrouter") {
+                    std::env::set_var("OPENAI_BASE_URL", base_url);
+                } else {
+                    std::env::set_var("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+                }
+            }
             let client = openai::Client::from_env();
-            let model = agent.model();
+            let model = if use_openrouter && provider != "openrouter" {
+                model_id.as_str()
+            } else {
+                model_name
+            };
             agent.run_with(&client, model, input).await
         }
     }
