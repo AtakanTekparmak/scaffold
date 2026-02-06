@@ -2,3 +2,4 @@
 Cargo.lock
 target
 generated
+scaffold.toml

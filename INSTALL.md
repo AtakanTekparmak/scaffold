@@ -7,6 +7,7 @@ Install the Scaffold CLI globally using Cargo:
 ```bash
 # From the repository root
 cargo install --path crates/scaffold-cli
+cargo install --path crates/scaffold-cli --force
 
 # Or install all workspace binaries
 cargo install --path .
