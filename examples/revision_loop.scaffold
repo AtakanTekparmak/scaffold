@@ -37,7 +37,7 @@ task revise_answer {
     loop improve {
         max_iters: 3
         carry: [draft]
-        until: draft.score >= 0.85
+        while: draft.score < 0.85
 
         stage review using prompt review_answer {
             in: draft

@@ -610,20 +610,45 @@ impl<'a> ProgramVerifier<'a> {
             }
         }
 
-        let mut until_assigned = assigned.clone();
-        until_assigned.extend(carry.iter().cloned());
-        self.verify_artifact_reads(
-            &loop_decl.until,
-            &until_assigned,
-            &summary.artifacts,
-            "loop until condition",
-        );
-        let until_ty = self.infer_expr_type(&loop_decl.until, &summary.scope);
-        if !until_ty.is_compatible_with(&Type::Bool) && !until_ty.is_error() {
+        if loop_decl.while_condition.is_none() && loop_decl.until.is_none() {
             self.error(
-                format!("loop 'until' condition must be bool, found {}", until_ty),
-                loop_decl.until.span,
+                "loop requires at least one termination condition: 'while' or 'until'".to_string(),
+                loop_decl.span,
             );
+        }
+
+        let mut condition_assigned = assigned.clone();
+        condition_assigned.extend(carry.iter().cloned());
+        if let Some(while_condition) = &loop_decl.while_condition {
+            self.verify_artifact_reads(
+                while_condition,
+                &condition_assigned,
+                &summary.artifacts,
+                "loop while condition",
+            );
+            let while_ty = self.infer_expr_type(while_condition, &summary.scope);
+            if !while_ty.is_compatible_with(&Type::Bool) && !while_ty.is_error() {
+                self.error(
+                    format!("loop 'while' condition must be bool, found {}", while_ty),
+                    while_condition.span,
+                );
+            }
+        }
+
+        if let Some(until) = &loop_decl.until {
+            self.verify_artifact_reads(
+                until,
+                &condition_assigned,
+                &summary.artifacts,
+                "loop until condition",
+            );
+            let until_ty = self.infer_expr_type(until, &summary.scope);
+            if !until_ty.is_compatible_with(&Type::Bool) && !until_ty.is_error() {
+                self.error(
+                    format!("loop 'until' condition must be bool, found {}", until_ty),
+                    until.span,
+                );
+            }
         }
 
         assigned.clone()
@@ -1285,28 +1310,118 @@ impl<'a> ProgramVerifier<'a> {
             "output".to_string(),
             "rollout".to_string(),
         ]);
-        let mut metric_names = HashSet::new();
+        let mut signal_scope = HashMap::from([
+            ("input".to_string(), Type::Any),
+            ("expected".to_string(), Type::Any),
+            ("output".to_string(), Type::Any),
+            ("rollout".to_string(), Type::Any),
+        ]);
+        let mut signal_names = HashSet::new();
+        let mut score_roots = base_roots.clone();
+        for constraint in &objective.constraints {
+            self.verify_objective_signal(
+                objective,
+                constraint,
+                &score_roots,
+                &signal_scope,
+                &mut signal_names,
+                "constraint",
+                true,
+            );
+            score_roots.insert(constraint.name.node.clone());
+            signal_scope.insert(constraint.name.node.clone(), Type::Any);
+        }
+        for checker in &objective.checkers {
+            self.verify_objective_signal(
+                objective,
+                checker,
+                &score_roots,
+                &signal_scope,
+                &mut signal_names,
+                "checker",
+                false,
+            );
+            score_roots.insert(checker.name.node.clone());
+            signal_scope.insert(checker.name.node.clone(), Type::Any);
+        }
+        for judge in &objective.judges {
+            self.verify_objective_signal(
+                objective,
+                judge,
+                &score_roots,
+                &signal_scope,
+                &mut signal_names,
+                "judge",
+                false,
+            );
+            score_roots.insert(judge.name.node.clone());
+            signal_scope.insert(judge.name.node.clone(), Type::Any);
+        }
         for metric in &objective.metrics {
-            if !metric_names.insert(metric.name.node.clone()) {
-                self.error(
-                    format!(
-                        "objective '{}' declares metric '{}' more than once",
-                        objective.name.node, metric.name.node
-                    ),
-                    metric.name.span,
-                );
-            }
-            self.verify_allowed_roots(&metric.expr, &base_roots, "metric expression");
+            self.verify_objective_signal(
+                objective,
+                metric,
+                &score_roots,
+                &signal_scope,
+                &mut signal_names,
+                "metric",
+                false,
+            );
+            score_roots.insert(metric.name.node.clone());
+            signal_scope.insert(metric.name.node.clone(), Type::Any);
         }
 
-        let mut score_roots = base_roots.clone();
-        score_roots.extend(metric_names);
         self.verify_allowed_roots(&objective.score, &score_roots, "score expression");
         if let Some(select) = &objective.select {
             self.verify_allowed_roots(&select.primary, &score_roots, "select primary expression");
             for expr in &select.tie_breakers {
                 self.verify_allowed_roots(expr, &score_roots, "select tie_breaker expression");
             }
+        }
+    }
+
+    fn verify_objective_signal(
+        &mut self,
+        objective: &ObjectiveDecl,
+        decl: &MetricDecl,
+        allowed_roots: &HashSet<String>,
+        scope: &HashMap<String, Type>,
+        seen_names: &mut HashSet<String>,
+        label: &str,
+        require_bool: bool,
+    ) {
+        if !seen_names.insert(decl.name.node.clone()) {
+            self.error(
+                format!(
+                    "objective '{}' declares {} '{}' more than once",
+                    objective.name.node, label, decl.name.node
+                ),
+                decl.name.span,
+            );
+        }
+
+        self.verify_allowed_roots(&decl.expr, allowed_roots, &format!("{} expression", label));
+
+        let ty = self.infer_expr_type(&decl.expr, scope);
+        let resolved = self.type_env.resolve_type(&ty);
+        if require_bool {
+            if !matches!(resolved, Type::Bool) && !ty.is_error() {
+                self.error(
+                    format!(
+                        "{} '{}' must evaluate to bool, found {}",
+                        label, decl.name.node, ty
+                    ),
+                    decl.expr.span,
+                );
+            }
+        } else if !matches!(resolved, Type::Bool | Type::Int | Type::Float) && !ty.is_error() {
+            self.error(
+                format!(
+                    "{} '{}' must evaluate to bool or numeric, found {}",
+                    label, decl.name.node, ty
+                ),
+                decl.expr.span,
+            );
         }
     }
 
@@ -1415,7 +1530,17 @@ impl<'a> ProgramVerifier<'a> {
                             Type::Int
                         }
                     }
-                    _ => Type::Any,
+                    _ => {
+                        if let Some(sig) = self.tool_sigs.get(name) {
+                            sig.output.clone()
+                        } else if let Some(sig) = self.prompt_sigs.get(name) {
+                            sig.output.clone()
+                        } else if let Some(sig) = self.agent_sigs.get(name) {
+                            sig.output.clone()
+                        } else {
+                            Type::Any
+                        }
+                    }
                 }
             }
             Expr::ForeignCall { .. } => Type::Any,

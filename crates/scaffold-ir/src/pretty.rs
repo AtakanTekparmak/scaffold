@@ -660,8 +660,14 @@ fn pp_loop(out: &mut String, loop_ir: &LoopIR, indent: usize) {
     out.push_str(&format!("max_iters: {}\n", pp_expr(&loop_ir.max_iters)));
     pp_indent(out, indent + 1);
     out.push_str(&format!("carry: [{}]\n", loop_ir.carry.join(", ")));
-    pp_indent(out, indent + 1);
-    out.push_str(&format!("until: {}\n", pp_expr(&loop_ir.until)));
+    if let Some(while_condition) = &loop_ir.while_condition {
+        pp_indent(out, indent + 1);
+        out.push_str(&format!("while: {}\n", pp_expr(while_condition)));
+    }
+    if let Some(until) = &loop_ir.until {
+        pp_indent(out, indent + 1);
+        out.push_str(&format!("until: {}\n", pp_expr(until)));
+    }
     for node in &loop_ir.body {
         pp_task_node(out, node, indent + 1);
     }
@@ -744,6 +750,27 @@ fn pp_objective(out: &mut String, objective: &ObjectiveIR) {
     out.push_str(&format!("    harness: {}\n", objective.harness));
     if let Some(repeats) = objective.repeats {
         out.push_str(&format!("    repeats: {}\n", repeats));
+    }
+    for constraint in &objective.constraints {
+        out.push_str(&format!(
+            "    constraint {} = {}\n",
+            constraint.name,
+            pp_expr(&constraint.expr)
+        ));
+    }
+    for checker in &objective.checkers {
+        out.push_str(&format!(
+            "    checker {} = {}\n",
+            checker.name,
+            pp_expr(&checker.expr)
+        ));
+    }
+    for judge in &objective.judges {
+        out.push_str(&format!(
+            "    judge {} = {}\n",
+            judge.name,
+            pp_expr(&judge.expr)
+        ));
     }
     for metric in &objective.metrics {
         out.push_str(&format!(
@@ -1190,6 +1217,24 @@ mod tests {
                     path: "dataset.jsonl".into(),
                 },
                 repeats: Some(2),
+                constraints: vec![MetricIR {
+                    name: "has_output".into(),
+                    expr: ExprIR::Literal {
+                        value: LiteralIR::Bool { value: true },
+                    },
+                }],
+                checkers: vec![MetricIR {
+                    name: "exact_match".into(),
+                    expr: ExprIR::Literal {
+                        value: LiteralIR::Bool { value: true },
+                    },
+                }],
+                judges: vec![MetricIR {
+                    name: "preference".into(),
+                    expr: ExprIR::Literal {
+                        value: LiteralIR::Float { value: 1.0 },
+                    },
+                }],
                 metrics: vec![MetricIR {
                     name: "accuracy".into(),
                     expr: ExprIR::Ident {
@@ -1224,5 +1269,8 @@ mod tests {
         assert!(out.contains("stage draft using prompt writer"));
         assert!(out.contains("harness baseline for task answer_question"));
         assert!(out.contains("objective quality for task answer_question"));
+        assert!(out.contains("constraint has_output = true"));
+        assert!(out.contains("checker exact_match = true"));
+        assert!(out.contains("judge preference = 1"));
     }
 }

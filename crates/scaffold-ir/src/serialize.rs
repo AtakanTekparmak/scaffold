@@ -725,7 +725,16 @@ impl Lowerer {
                 .iter()
                 .map(|ident| ident.node.clone())
                 .collect(),
-            until: self.lower_expr(&loop_decl.until.node)?,
+            while_condition: loop_decl
+                .while_condition
+                .as_ref()
+                .map(|expr| self.lower_expr(&expr.node))
+                .transpose()?,
+            until: loop_decl
+                .until
+                .as_ref()
+                .map(|expr| self.lower_expr(&expr.node))
+                .transpose()?,
             body,
         })
     }
@@ -827,21 +836,16 @@ impl Lowerer {
     }
 
     fn lower_objective(&self, decl: &ObjectiveDecl) -> LowerResult<ObjectiveIR> {
-        let mut metrics = Vec::with_capacity(decl.metrics.len());
-        for metric in &decl.metrics {
-            metrics.push(MetricIR {
-                name: metric.name.node.clone(),
-                expr: self.lower_expr(&metric.expr.node)?,
-            });
-        }
-
         Ok(ObjectiveIR {
             name: decl.name.node.clone(),
             task: decl.task.node.clone(),
             harness: decl.harness.node.clone(),
             dataset: self.lower_dataset_spec(&decl.dataset)?,
             repeats: decl.repeats,
-            metrics,
+            constraints: self.lower_metric_list(&decl.constraints)?,
+            checkers: self.lower_metric_list(&decl.checkers)?,
+            judges: self.lower_metric_list(&decl.judges)?,
+            metrics: self.lower_metric_list(&decl.metrics)?,
             score: self.lower_expr(&decl.score.node)?,
             split: decl.split.as_ref().map(|split| SplitIR {
                 train: split.train,
@@ -863,6 +867,17 @@ impl Lowerer {
                 })
                 .transpose()?,
         })
+    }
+
+    fn lower_metric_list(&self, metrics: &[MetricDecl]) -> LowerResult<Vec<MetricIR>> {
+        let mut out = Vec::with_capacity(metrics.len());
+        for metric in metrics {
+            out.push(MetricIR {
+                name: metric.name.node.clone(),
+                expr: self.lower_expr(&metric.expr.node)?,
+            });
+        }
+        Ok(out)
     }
 
     fn lower_dataset_spec(&self, dataset: &DatasetSpec) -> LowerResult<DatasetSpecIR> {

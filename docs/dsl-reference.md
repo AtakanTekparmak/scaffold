@@ -186,5 +186,7 @@ api_key = "sk-ant-..."
 ```
 
 Or use environment variables:
+
+- Scaffold also loads a local `.env` file from the current working directory before reading provider env vars.
 - `OPENAI_API_KEY`
 - `ANTHROPIC_API_KEY`

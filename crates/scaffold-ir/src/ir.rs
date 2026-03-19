@@ -603,7 +603,8 @@ pub struct LoopIR {
     pub name: String,
     pub max_iters: ExprIR,
     pub carry: Vec<String>,
-    pub until: ExprIR,
+    pub while_condition: Option<ExprIR>,
+    pub until: Option<ExprIR>,
     pub body: Vec<TaskNodeIR>,
 }
 
@@ -684,6 +685,9 @@ pub struct ObjectiveIR {
     pub harness: String,
     pub dataset: DatasetSpecIR,
     pub repeats: Option<u64>,
+    pub constraints: Vec<MetricIR>,
+    pub checkers: Vec<MetricIR>,
+    pub judges: Vec<MetricIR>,
     pub metrics: Vec<MetricIR>,
     pub score: ExprIR,
     pub split: Option<SplitIR>,

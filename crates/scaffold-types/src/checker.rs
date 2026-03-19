@@ -878,12 +878,32 @@ impl TypeChecker {
                     ));
                 }
 
-                let until_ty = self.check_expr_with_scope(&loop_decl.until, scope);
-                if !until_ty.is_compatible_with(&Type::Bool) && !until_ty.is_error() {
+                if loop_decl.while_condition.is_none() && loop_decl.until.is_none() {
                     self.errors.push(TypeError::new(
-                        format!("loop 'until' condition must be bool, found {}", until_ty),
-                        loop_decl.until.span,
+                        "loop requires at least one termination condition: 'while' or 'until'"
+                            .to_string(),
+                        loop_decl.span,
                     ));
+                }
+
+                if let Some(while_condition) = &loop_decl.while_condition {
+                    let while_ty = self.check_expr_with_scope(while_condition, scope);
+                    if !while_ty.is_compatible_with(&Type::Bool) && !while_ty.is_error() {
+                        self.errors.push(TypeError::new(
+                            format!("loop 'while' condition must be bool, found {}", while_ty),
+                            while_condition.span,
+                        ));
+                    }
+                }
+
+                if let Some(until) = &loop_decl.until {
+                    let until_ty = self.check_expr_with_scope(until, scope);
+                    if !until_ty.is_compatible_with(&Type::Bool) && !until_ty.is_error() {
+                        self.errors.push(TypeError::new(
+                            format!("loop 'until' condition must be bool, found {}", until_ty),
+                            until.span,
+                        ));
+                    }
                 }
 
                 for node in &loop_decl.nodes {
@@ -944,6 +964,21 @@ impl TypeChecker {
         scope.insert("expected".to_string(), Type::Any);
         scope.insert("output".to_string(), Type::Any);
         scope.insert("rollout".to_string(), Type::Any);
+
+        for constraint in &objective_decl.constraints {
+            self.check_expr_with_scope(&constraint.expr, &scope);
+            scope.insert(constraint.name.node.clone(), Type::Any);
+        }
+
+        for checker in &objective_decl.checkers {
+            self.check_expr_with_scope(&checker.expr, &scope);
+            scope.insert(checker.name.node.clone(), Type::Any);
+        }
+
+        for judge in &objective_decl.judges {
+            self.check_expr_with_scope(&judge.expr, &scope);
+            scope.insert(judge.name.node.clone(), Type::Any);
+        }
 
         for metric in &objective_decl.metrics {
             self.check_expr_with_scope(&metric.expr, &scope);
@@ -1170,6 +1205,34 @@ impl TypeChecker {
                 }
 
                 if let Some(sig) = self.tool_sigs.get(name).cloned() {
+                    let arg_names = args
+                        .iter()
+                        .map(|a| match &a.node {
+                            Expr::Ident(n) => Some(n.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    self.check_call_against_input_type(
+                        name, &sig.input, &arg_tys, &arg_names, expr.span,
+                    );
+                    return sig.output;
+                }
+
+                if let Some(sig) = self.prompt_sigs.get(name).cloned() {
+                    let arg_names = args
+                        .iter()
+                        .map(|a| match &a.node {
+                            Expr::Ident(n) => Some(n.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    self.check_call_against_input_type(
+                        name, &sig.input, &arg_tys, &arg_names, expr.span,
+                    );
+                    return sig.output;
+                }
+
+                if let Some(sig) = self.agent_sigs.get(name).cloned() {
                     let arg_names = args
                         .iter()
                         .map(|a| match &a.node {

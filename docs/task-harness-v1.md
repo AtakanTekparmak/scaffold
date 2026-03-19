@@ -247,14 +247,17 @@ objective answer_quality for task answer_question {
 
     repeats: 3
 
-    metric exact = exact(output.answer, expected.answer)
-    metric source_recall = set_recall(output.sources, expected.sources)
+    constraint non_empty = len(output.answer) > 0
+    checker exact = exact(output.answer, expected.answer)
+    checker source_recall = set_recall(output.sources, expected.sources)
+    judge groundedness = judge_grounded(output.answer, output.sources)
     metric latency = rollout.duration_ms
     metric token_cost = rollout.token_cost
 
     score =
         1.0 * exact +
         0.25 * source_recall -
+        0.1 * groundedness -
         0.0001 * latency -
         0.00001 * token_cost
 
@@ -307,7 +310,7 @@ A loop must declare:
 
 - `max_iters`
 - `carry` artifact slots that may be reassigned across iterations
-- `until` termination condition
+- at least one termination condition: `while` for pre-checks, `until` for post-checks, or both
 
 This makes optimization and verification tractable.
 
@@ -340,9 +343,25 @@ It defines:
 
 - dataset and splits
 - evaluation repeats for stochastic runs
-- metrics over task output, intermediate traces, and rollout metadata
+- hard `constraint` signals
+- executable `checker` signals
+- soft `judge` signals
+- derived `metric` signals over task output, intermediate traces, and rollout metadata
 - a scalar score expression
 - selection rules
+
+This split is deliberate:
+
+- `constraint` means hard pass/fail and should act as a gate
+- `checker` means executable, replayable scoring logic
+- `judge` means subjective or stochastic evaluation
+- `metric` means a derived scalar built from the previous lanes plus rollout data
+
+In V1, these declarations are still expressions, but those expressions may call existing `tool`, `prompt`, and `agent` components. That gives the language a practical bridge:
+
+- complex programmatic verification can live in `tool` implementations and be invoked from `checker`
+- LLM-backed evaluation can live in dedicated `prompt` or `agent` components and be invoked from `judge`
+- the surface stays unified instead of introducing a second evaluator DSL too early
 
 ## What The Compiler Should Guarantee
 
@@ -355,12 +374,14 @@ The compiler should reject a program if any of the following are invalid:
 - an artifact is used before it is produced
 - multiple stages write the same artifact outside a declared loop region
 - a loop carries an artifact that is not declared in `carry`
-- a loop has no `max_iters` or no `until`
+- a loop has no `max_iters` or no termination condition
 - a harness binds an unknown task, stage, or field
 - a `tune` entry points at a non-mutable field
 - a `tune` domain is empty or not finite for V1
-- an objective references unknown metrics, unknown rollout fields, or unknown task outputs
+- an objective references unknown constraints, checkers, judges, metrics, rollout fields, or task outputs
 - an objective targets a harness that is incompatible with the task
+- a `constraint` does not evaluate to bool
+- a `checker`, `judge`, or `metric` does not evaluate to bool or numeric
 
 These checks are structural. They make "miswired harnesses do not compile" true in a meaningful, enforceable sense.
 
@@ -372,6 +393,8 @@ The compiler cannot prove:
 - that prompts are semantically effective
 - that textual critique actually improves the task
 - that a high score on one dataset generalizes
+
+It also cannot turn a `judge` into a proof. Judge-based signals are useful, but they remain evaluation signals, not compile-time guarantees.
 
 Those are optimization and evaluation questions, not type questions.
 
@@ -404,7 +427,7 @@ Core semantics:
 - seed harness = base candidate
 - mutation space = only the fields declared under `tune`
 - evaluation = repeated rollouts over train split
-- selection = rank by objective score
+- selection = reject failed constraints first, then rank by objective score
 - validation = periodic holdout check on val split
 - final report = best train candidate plus val/test scores, lineage, and traces
 
@@ -469,6 +492,9 @@ pub struct ObjectiveIR {
     pub harness: String,
     pub dataset: DatasetSpecIR,
     pub repeats: u32,
+    pub constraints: Vec<MetricIR>,
+    pub checkers: Vec<MetricIR>,
+    pub judges: Vec<MetricIR>,
     pub metrics: Vec<MetricIR>,
     pub score: ExprIR,
     pub split: SplitIR,

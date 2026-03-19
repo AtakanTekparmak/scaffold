@@ -243,7 +243,8 @@ pub struct TaskLoopDecl {
     pub name: Ident,
     pub max_iters: Spanned<Expr>,
     pub carry: Vec<Ident>,
-    pub until: Spanned<Expr>,
+    pub while_condition: Option<Spanned<Expr>>,
+    pub until: Option<Spanned<Expr>>,
     pub nodes: Vec<TaskNode>,
     pub span: Span,
 }
@@ -330,6 +331,9 @@ pub struct ObjectiveDecl {
     pub dataset: DatasetSpec,
     pub harness: Ident,
     pub repeats: Option<u64>,
+    pub constraints: Vec<MetricDecl>,
+    pub checkers: Vec<MetricDecl>,
+    pub judges: Vec<MetricDecl>,
     pub metrics: Vec<MetricDecl>,
     pub score: Spanned<Expr>,
     pub split: Option<ObjectiveSplit>,
@@ -353,7 +357,7 @@ pub struct InlineDatasetCase {
     pub span: Span,
 }
 
-/// Metric declaration inside an objective
+/// Named evaluation declaration inside an objective
 #[derive(Debug, Clone)]
 pub struct MetricDecl {
     pub name: Ident,

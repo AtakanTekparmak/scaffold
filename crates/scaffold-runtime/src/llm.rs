@@ -36,6 +36,13 @@ use crate::error::{Error, Result};
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::{AssistantContent, CompletionModel};
 use rig::providers::{anthropic, openai};
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+
+fn structured_mock_queue() -> &'static Mutex<VecDeque<serde_json::Value>> {
+    static QUEUE: OnceLock<Mutex<VecDeque<serde_json::Value>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
 
 /// Configuration for LLM calls
 #[derive(Debug, Clone, Default)]
@@ -120,10 +127,30 @@ pub async fn query_with_config(prompt: &str, llm_config: &LlmConfig) -> Result<S
 }
 
 /// Extract text from AssistantContent
-fn extract_text(content: AssistantContent) -> String {
-    match content {
-        AssistantContent::Text(text) => text.text,
-        _ => String::new(),
+fn extract_text<'a, I>(content: I) -> String
+where
+    I: IntoIterator<Item = &'a AssistantContent>,
+{
+    content
+        .into_iter()
+        .filter_map(|item| match item {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>()
+}
+
+fn extract_text_or_error<'a, I>(content: I) -> Result<String>
+where
+    I: IntoIterator<Item = &'a AssistantContent>,
+{
+    let text = extract_text(content);
+    if text.trim().is_empty() {
+        Err(Error::Runtime(
+            "LLM response did not contain any text content".to_string(),
+        ))
+    } else {
+        Ok(text)
     }
 }
 
@@ -167,7 +194,7 @@ async fn query_openai(model: &str, prompt: &str, llm_config: &LlmConfig) -> Resu
         .map_err(|e| Error::Runtime(format!("OpenAI API error: {}", e)))?;
 
     // Extract text from the first choice
-    Ok(extract_text(response.choice.first()))
+    extract_text_or_error(response.choice.iter())
 }
 
 /// Query Anthropic models
@@ -210,7 +237,7 @@ async fn query_anthropic(model: &str, prompt: &str, llm_config: &LlmConfig) -> R
         .map_err(|e| Error::Runtime(format!("Anthropic API error: {}", e)))?;
 
     // Extract text from the first choice
-    Ok(extract_text(response.choice.first()))
+    extract_text_or_error(response.choice.iter())
 }
 
 /// Query via OpenRouter (unified API for all models)
@@ -259,7 +286,7 @@ async fn query_openrouter(model: &str, prompt: &str, llm_config: &LlmConfig) -> 
         .map_err(|e| Error::Runtime(format!("OpenRouter API error: {}", e)))?;
 
     // Extract text from the first choice
-    Ok(extract_text(response.choice.first()))
+    extract_text_or_error(response.choice.iter())
 }
 
 /// Query and parse response as JSON (typed)
@@ -288,6 +315,14 @@ pub async fn query_structured_with_config(
     schema: &str,
     llm_config: &LlmConfig,
 ) -> Result<crate::Value> {
+    if let Some(mock_value) = structured_mock_queue()
+        .lock()
+        .map_err(|_| Error::Runtime("failed to lock structured LLM mock queue".to_string()))?
+        .pop_front()
+    {
+        return Ok(json_to_value(mock_value));
+    }
+
     if let Ok(mock_json) = std::env::var("SCAFFOLD_LLM_MOCK_JSON") {
         let json_value: serde_json::Value = serde_json::from_str(&mock_json).map_err(|e| {
             Error::Runtime(format!(
@@ -318,6 +353,21 @@ pub async fn query_structured_with_config(
 
     // Convert to our Value type
     Ok(json_to_value(json_value))
+}
+
+#[cfg(test)]
+pub(crate) fn set_mock_structured_sequence(values: Vec<serde_json::Value>) {
+    *structured_mock_queue()
+        .lock()
+        .expect("structured mock queue lock poisoned") = values.into();
+}
+
+#[cfg(test)]
+pub(crate) fn clear_mock_structured_sequence() {
+    structured_mock_queue()
+        .lock()
+        .expect("structured mock queue lock poisoned")
+        .clear();
 }
 
 /// Extract JSON from a response that might be wrapped in markdown code blocks
@@ -483,6 +533,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig::completion::message::{Reasoning, Text};
 
     #[tokio::test]
     async fn test_mock_query() {
@@ -514,5 +565,30 @@ mod tests {
         assert_eq!(config.model, Some("claude-3-sonnet".to_string()));
         assert_eq!(config.temperature, Some(0.5));
         assert_eq!(config.max_tokens, Some(2000));
+    }
+
+    #[test]
+    fn extract_text_collects_all_text_segments() {
+        let content = vec![
+            AssistantContent::Reasoning(Reasoning::new("thinking")),
+            AssistantContent::Text(Text {
+                text: "{\"answer\":".to_string(),
+            }),
+            AssistantContent::Text(Text {
+                text: "\"Paris\"}".to_string(),
+            }),
+        ];
+
+        assert_eq!(extract_text(content.iter()), "{\"answer\":\"Paris\"}");
+    }
+
+    #[test]
+    fn extract_text_or_error_rejects_non_text_responses() {
+        let content = vec![AssistantContent::Reasoning(Reasoning::new("thinking"))];
+
+        let error = extract_text_or_error(content.iter()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("LLM response did not contain any text content"));
     }
 }

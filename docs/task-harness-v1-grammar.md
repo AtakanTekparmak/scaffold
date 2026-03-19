@@ -179,7 +179,8 @@ loop_decl
     = "loop" IDENT "{"
         loop_max_iters_decl
         loop_carry_decl
-        loop_until_decl
+        [ loop_while_decl ]
+        [ loop_until_decl ]
         task_node { task_node }
       "}" ;
 
@@ -188,6 +189,9 @@ loop_max_iters_decl
 
 loop_carry_decl
     = "carry" ":" "[" [ IDENT { "," IDENT } [ "," ] ] "]" ;
+
+loop_while_decl
+    = "while" ":" expr ;
 
 loop_until_decl
     = "until" ":" expr ;
@@ -291,7 +295,7 @@ objective_decl
         objective_dataset_decl
         objective_harness_decl
         [ objective_repeats_decl ]
-        objective_metric_decl { objective_metric_decl }
+        objective_eval_decl { objective_eval_decl }
         objective_score_decl
         [ objective_split_decl ]
         [ objective_select_decl ]
@@ -323,8 +327,29 @@ objective_harness_decl
 objective_repeats_decl
     = "repeats" ":" INT ;
 
+objective_eval_decl
+    = objective_constraint_decl
+    | objective_checker_decl
+    | objective_judge_decl
+    | objective_metric_decl ;
+
+objective_constraint_decl
+    = "constraint" IDENT "=" expr ;
+
+objective_checker_decl
+    = "checker" IDENT "=" expr ;
+
+objective_judge_decl
+    = "judge" IDENT "=" expr ;
+
 objective_metric_decl
     = "metric" IDENT "=" expr ;
+
+The `expr` grammar remains shared. This means a `constraint`, `checker`, `judge`, or `metric` may call existing named components where supported by semantics:
+
+- tool calls for executable checkers
+- prompt calls for lightweight model judges
+- agent calls for richer multi-turn judges
 
 objective_score_decl
     = "score" "=" expr ;
@@ -435,6 +460,9 @@ The following structural keywords should be reserved for V1 grammar support:
 - `tune`
 - `objective`
 - `dataset`
+- `constraint`
+- `checker`
+- `judge`
 - `metric`
 - `score`
 - `split`
@@ -477,8 +505,10 @@ These rules are not purely syntactic, but V1 relies on them:
 
 - the objective target task must exist
 - the objective harness must target the same task
-- at least one metric must be declared
-- `score` may reference only declared metrics plus approved namespaces such as `output`, `expected`, and `rollout`
+- at least one objective evaluation declaration must be present
+- `constraint` declarations must evaluate to bool
+- `checker`, `judge`, and `metric` declarations must evaluate to bool or numeric
+- `score` may reference only declared constraints, checkers, judges, metrics, plus approved namespaces such as `output`, `expected`, and `rollout`
 - split weights must be valid and sum to 1.0
 
 ## Deliberate Constraints In V1

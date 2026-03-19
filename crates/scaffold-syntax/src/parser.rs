@@ -1543,9 +1543,31 @@ impl<'source> Parser<'source> {
         }
         self.expect(Token::RBracket)?;
 
-        self.expect(Token::Until)?;
-        self.expect(Token::Colon)?;
-        let until = self.parse_expr()?;
+        let mut while_condition = None;
+        let mut until = None;
+        while self.check(&Token::While) || self.check(&Token::Until) {
+            if self.check(&Token::While) {
+                let token = self.advance();
+                self.expect(Token::Colon)?;
+                if while_condition.is_some() {
+                    return Err(ParseError::new(
+                        "duplicate loop 'while' condition",
+                        token.span,
+                    ));
+                }
+                while_condition = Some(self.parse_expr()?);
+            } else {
+                let token = self.advance();
+                self.expect(Token::Colon)?;
+                if until.is_some() {
+                    return Err(ParseError::new(
+                        "duplicate loop 'until' condition",
+                        token.span,
+                    ));
+                }
+                until = Some(self.parse_expr()?);
+            }
+        }
 
         let nodes = self.parse_task_nodes_block()?;
         let end = self.expect(Token::RBrace)?.span;
@@ -1554,6 +1576,7 @@ impl<'source> Parser<'source> {
             name,
             max_iters,
             carry,
+            while_condition,
             until,
             nodes,
             span: start.merge(end),
@@ -1774,14 +1797,28 @@ impl<'source> Parser<'source> {
             None
         };
 
+        let mut constraints = Vec::new();
+        let mut checkers = Vec::new();
+        let mut judges = Vec::new();
         let mut metrics = Vec::new();
-        while self.check(&Token::Metric) {
-            metrics.push(self.parse_metric_decl()?);
+        loop {
+            if self.check(&Token::Constraint) {
+                constraints.push(self.parse_objective_eval_decl(Token::Constraint)?);
+            } else if self.check(&Token::Checker) {
+                checkers.push(self.parse_objective_eval_decl(Token::Checker)?);
+            } else if self.check(&Token::Judge) {
+                judges.push(self.parse_objective_eval_decl(Token::Judge)?);
+            } else if self.check(&Token::Metric) {
+                metrics.push(self.parse_objective_eval_decl(Token::Metric)?);
+            } else {
+                break;
+            }
         }
-        if metrics.is_empty() {
+        if constraints.is_empty() && checkers.is_empty() && judges.is_empty() && metrics.is_empty()
+        {
             let token = self.peek_token()?;
             return Err(ParseError::new(
-                "objective requires at least one metric",
+                "objective requires at least one constraint, checker, judge, or metric",
                 token.span,
             ));
         }
@@ -1810,6 +1847,9 @@ impl<'source> Parser<'source> {
             dataset,
             harness,
             repeats,
+            constraints,
+            checkers,
+            judges,
             metrics,
             score,
             split,
@@ -1898,8 +1938,8 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn parse_metric_decl(&mut self) -> ParseResult<MetricDecl> {
-        let start = self.expect(Token::Metric)?.span;
+    fn parse_objective_eval_decl(&mut self, token: Token) -> ParseResult<MetricDecl> {
+        let start = self.expect(token)?.span;
         let name = self.parse_ident()?;
         self.expect(Token::Eq)?;
         let expr = self.parse_expr()?;
@@ -2247,6 +2287,9 @@ impl<'source> Parser<'source> {
             Token::Tune => "tune".to_string(),
             Token::Objective => "objective".to_string(),
             Token::Dataset => "dataset".to_string(),
+            Token::Constraint => "constraint".to_string(),
+            Token::Checker => "checker".to_string(),
+            Token::Judge => "judge".to_string(),
             Token::Metric => "metric".to_string(),
             Token::Score => "score".to_string(),
             Token::Split => "split".to_string(),
@@ -2531,6 +2574,9 @@ objective quality for task summarize {
     ]
     harness: baseline
     repeats: 2
+    constraint output_present = len(output.summary) > 0
+    checker exact_match = output.summary == expected.summary
+    judge preference = exact_match
     metric accuracy = output.summary == expected.summary
     score = accuracy
     split {
@@ -2576,11 +2622,51 @@ objective quality for task summarize {
         match &program.declarations[3] {
             Declaration::Objective(objective) => {
                 assert_eq!(objective.name.node, "quality");
+                assert_eq!(objective.constraints.len(), 1);
+                assert_eq!(objective.checkers.len(), 1);
+                assert_eq!(objective.judges.len(), 1);
                 assert_eq!(objective.metrics.len(), 1);
                 assert!(objective.split.is_some());
                 assert!(objective.select.is_some());
             }
             _ => panic!("expected objective declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_task_loop_with_precheck_while() {
+        let source = r#"
+task revise {
+    input: string
+    output: { text: string }
+    artifacts {
+        draft: string
+    }
+    loop refine {
+        max_iters: 2
+        carry: [draft]
+        while: len(draft) < 10
+        stage grow using tool writer {
+            in: input
+            out: draft
+        }
+    }
+    emit {
+        text: draft
+    }
+}
+"#;
+
+        let program = parse(source).unwrap();
+        match &program.declarations[0] {
+            Declaration::Task(task) => match &task.nodes[0] {
+                TaskNode::Loop(loop_decl) => {
+                    assert!(loop_decl.while_condition.is_some());
+                    assert!(loop_decl.until.is_none());
+                }
+                _ => panic!("expected loop node"),
+            },
+            _ => panic!("expected task declaration"),
         }
     }
 

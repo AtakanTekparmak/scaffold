@@ -112,6 +112,7 @@ pub struct ProviderConfig {
 impl Config {
     /// Load configuration from all sources
     pub fn load() -> Self {
+        let _ = dotenvy::dotenv();
         let mut config = Config::default();
 
         // Load from ~/.scaffold/config.toml
