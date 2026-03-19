@@ -279,12 +279,31 @@ pub async fn query_json<T: serde::de::DeserializeOwned>(prompt: &str) -> Result<
 /// { "answer": "string", "confidence": "high|medium|low", "reasoning": "string" }
 /// ```
 pub async fn query_structured(prompt: &str, schema: &str) -> Result<crate::Value> {
+    query_structured_with_config(prompt, schema, &LlmConfig::default()).await
+}
+
+/// Query with structured JSON output and explicit LLM configuration.
+pub async fn query_structured_with_config(
+    prompt: &str,
+    schema: &str,
+    llm_config: &LlmConfig,
+) -> Result<crate::Value> {
+    if let Ok(mock_json) = std::env::var("SCAFFOLD_LLM_MOCK_JSON") {
+        let json_value: serde_json::Value = serde_json::from_str(&mock_json).map_err(|e| {
+            Error::Runtime(format!(
+                "Failed to parse SCAFFOLD_LLM_MOCK_JSON as JSON: {}",
+                e
+            ))
+        })?;
+        return Ok(json_to_value(json_value));
+    }
+
     let structured_prompt = format!(
         "{}\n\nRespond with ONLY valid JSON matching this schema (no markdown, no explanation):\n{}",
         prompt, schema
     );
 
-    let response = query(&structured_prompt).await?;
+    let response = query_with_config(&structured_prompt, llm_config).await?;
 
     // Try to extract JSON if wrapped in markdown code blocks
     let json_str = extract_json(&response);

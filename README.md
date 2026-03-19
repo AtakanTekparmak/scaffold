@@ -7,7 +7,7 @@ Purpose
 -------
 - A tools‑first DSL and runtime for LLM‑authored automation that remains verifiable, analyzable, and safe to execute.
 - Guarantees that generation mistakes are caught at compile time via parsing, typing and verification — not at runtime.
-- Enables fast execution through generated binaries with optional explicit code generation for production packaging.
+- Executes verified tasks directly from IR, with harness configuration layered on top of the task graph.
 
 Why not “just Python”
 ---------------------
@@ -22,25 +22,26 @@ Why not “just Python”
 Core Concepts
 -------------
 - Types: Primitive, struct, list, map, option, result, and named aliases. Used everywhere for I/O and validation.
-- Tools: Deterministic, typed building blocks. Implementations are restricted expressions/blocks (shell, foreign calls, control flow) with optional spec (pre/post, pure).
-- Prompts: Single LLM calls with typed I/O; templates interpolate input values. Output schema is enforced.
-- Agents: Multi‑turn LLM controllers with an explicit tool list, system prompt, reward/done/timeout policies.
-- Pipelines: Fixed sequences of tool/prompt/evaluable expressions with typed input and output.
+- Artifacts: Typed task-flow slots that make intermediate state explicit and verifiable.
+- Tasks: The execution unit. A task wires stages, loops, branches, and emits a typed final output.
+- Harnesses: Typed overlays on tasks that bind or tune execution fields like model, temperature, and loop bounds.
+- Objectives: Evaluation contracts for future optimization/search over harness space.
+- Tools, prompts, and agents: Reusable typed components that tasks invoke as stages.
 
 What Scaffold Guarantee
 -----------------
 - Parse‑time safety: The grammar only admits the constructs we support. No implicit execution of arbitrary host code.
 - Type‑time safety: A checker validates every declaration and expression with a global type environment.
 - Verify‑time checks: Optional static analyses (bounds, reachability/deadlock) reject ill‑formed orchestrations.
-- Runtime safety: Generated binaries continue to check pre/postconditions and report structured errors.
+- Runtime safety: The interpreter continues to validate inputs, outputs, and stage wiring at execution time.
 
 Workflow
 --------
-- Author: Write a `.scaffold` file using types, tools, prompts, agents, and pipelines.
+- Author: Write a `.scaffold` file using typed components plus first-class tasks and harnesses.
 - Check: `scaffold check file.scaffold` — parse + type + verification errors are surfaced with spans.
-- Run (inner loop): `scaffold run file.scaffold --pipeline my_flow --input '{"..."}'` — compiles and executes generated code.
-- Codegen (production): `scaffold codegen file.scaffold -o out_dir` — generates a Rust crate with CLI.
-- Build (one‑shot binary): `scaffold build file.scaffold -o out_dir [--release]` — codegen + cargo build.
+- Compile: `scaffold compile file.scaffold -o output.json` — lower the verified program to serializable IR.
+- Run: `scaffold run file.scaffold --task answer_question --input '{"..."}'` — execute a task directly from IR.
+- Harnessed run: `scaffold run file.scaffold --task answer_question --harness baseline --input '{"..."}'` — execute the same task with a typed harness overlay.
 
 Compile‑Time Constraints (Examples)
 -----------------------------------
@@ -52,31 +53,28 @@ Compile‑Time Constraints (Examples)
   - Field access must target declared fields of a struct‑typed value.
   - Pre/postconditions must be boolean; reward/done expressions must type‑check.
 
-Run vs Build
-------------
-- Run (development):
-  - Uses generated Rust code and executes the selected tool/prompt/agent/pipeline.
-  - Keeps runtime behavior aligned with production binary semantics.
-- Build (production):
-  - Emits and compiles a Rust crate for distribution.
+Execution Model
+---------------
+- `scaffold run` is interpreter-first and task-centric.
+- The runtime executes verified `task` IR directly instead of generating a temporary crate for inner-loop runs.
+- Harnesses are applied as typed runtime overlays on top of a task.
+- Objective-driven optimization remains part of the language direction, but the CLI optimizer is under redesign and is not exposed in the current command surface.
 
 CLI Cheatsheet
 --------------
 - `scaffold check FILE` — parse + type check + verify a scaffold file.
 - `scaffold parse FILE` — syntax only (for debugging).
 - `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
-- `scaffold run FILE [--tool T|--prompt P|--agent A|--pipeline X] --input JSON` — compile and execute.
-- `scaffold codegen FILE -o DIR [--format]` — generate a Rust crate.
-- `scaffold build FILE -o DIR [--release] [--runtime-path PATH|SCAFFOLD_RUNTIME_VERSION=x.y]` — generate and compile a binary.
+- `scaffold run FILE --task TASK [--harness H] --input JSON` — execute a task directly from IR.
 
 Repository Layout
 -----------------
 - `crates/scaffold-syntax` — lexer/parser for the DSL.
 - `crates/scaffold-types` — type checker and type environment.
 - `crates/scaffold-verify` — static analyses (bounds, reachability, deadlock).
-- `crates/scaffold-ir` — serializable IR: types, tools, prompts, agents, pipelines.
-- `crates/scaffold-runtime` — runtime utilities (shell, LLM, prompt manager, error, value, tracing).
-- `crates/scaffold-codegen` — Rust code generator for tools/prompts/agents/pipelines.
+- `crates/scaffold-ir` — serializable IR for types, components, tasks, harnesses, and objectives.
+- `crates/scaffold-runtime` — interpreter/runtime utilities (LLM, prompt manager, task execution, error, value, tracing).
+- `crates/scaffold-codegen` — retained for future export/deployment work, not the primary execution path.
 - `crates/scaffold-cli` — command line interface providing `scaffold`.
 
 For LLMs
@@ -88,13 +86,13 @@ Design Principles
 - Constrain the representation so an LLM can reliably produce correct scaffolds and failures are detectable early.
 - Keep semantics explicit and analyzable: typed I/O everywhere, named interfaces, finite control constructs.
 - Prefer clear, small, composable primitives (tools/prompts) over unconstrained general‑purpose code.
-- Separate development and production paths: fast run for iteration, explicit build for distribution.
+- Make execution semantics interpreter-first so the language meaning is not defined by generated code.
 
 Status
 ------
-- Parser, type checker, IR, runtime, codegen, and CLI are complete and integrated.
-- Codegen covers tools/prompts/agents/pipelines; binary builds are supported.
-- Ongoing: deeper verification passes, more foreign module patterns, and expanded examples.
+- Parser, type checker, verifier, IR, runtime interpreter, and task-centric CLI are integrated.
+- Task/harness/objective syntax is present and task execution now runs directly from IR.
+- Ongoing: migrate more examples to tasks, expand interpreter coverage for tool-backed stages, and rebuild optimizer/codegen on the new architecture.
 
 Contributing
 ------------

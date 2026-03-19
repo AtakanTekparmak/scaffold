@@ -55,6 +55,24 @@ pub fn pretty_print(ir: &ScaffoldIR) -> String {
         out.push('\n');
     }
 
+    // Tasks
+    for task in &ir.tasks {
+        pp_task(&mut out, task);
+        out.push('\n');
+    }
+
+    // Harnesses
+    for harness in &ir.harnesses {
+        pp_harness(&mut out, harness);
+        out.push('\n');
+    }
+
+    // Objectives
+    for objective in &ir.objectives {
+        pp_objective(&mut out, objective);
+        out.push('\n');
+    }
+
     out
 }
 
@@ -96,9 +114,13 @@ fn pp_type_ir(ty: &TypeIR) -> String {
 
 fn pp_type_def(out: &mut String, td: &TypeDefIR) {
     out.push_str(&format!(
-        "type {} = {}\n",
+        "{} {} = {}\n",
+        match td.kind {
+            TypeDefKindIR::Type => "type",
+            TypeDefKindIR::Artifact => "artifact",
+        },
         td.name,
-        pp_type_ir(&td.definition)
+        pp_type_ir(&td.definition),
     ));
 }
 
@@ -568,6 +590,238 @@ fn pp_pipeline_call(out: &mut String, call: &PipelineCallIR, indent: usize) {
     }
 }
 
+// ─── Tasks / Harnesses / Objectives ─────────────────────────────────────────
+
+fn pp_task(out: &mut String, task: &TaskIR) {
+    out.push_str(&format!("task {} {{\n", task.name));
+    out.push_str(&format!("    input: {}\n", pp_type_ir(&task.input)));
+    out.push_str(&format!("    output: {}\n", pp_type_ir(&task.output)));
+
+    if !task.artifacts.is_empty() {
+        out.push_str("    artifacts {\n");
+        for artifact in &task.artifacts {
+            out.push_str(&format!(
+                "        {}: {}\n",
+                artifact.name,
+                pp_type_ir(&artifact.ty)
+            ));
+        }
+        out.push_str("    }\n");
+    }
+
+    for node in &task.body {
+        pp_task_node(out, node, 1);
+    }
+
+    out.push_str("    emit {\n");
+    for field in &task.emit {
+        out.push_str(&format!(
+            "        {}: {}\n",
+            field.name,
+            pp_expr(&field.value)
+        ));
+    }
+    out.push_str("    }\n");
+    out.push_str("}\n");
+}
+
+fn pp_task_node(out: &mut String, node: &TaskNodeIR, indent: usize) {
+    match node {
+        TaskNodeIR::Stage(stage) => pp_stage(out, stage, indent),
+        TaskNodeIR::Loop(loop_ir) => pp_loop(out, loop_ir, indent),
+        TaskNodeIR::Branch(branch) => pp_branch(out, branch, indent),
+    }
+}
+
+fn pp_stage(out: &mut String, stage: &StageIR, indent: usize) {
+    pp_indent(out, indent);
+    out.push_str(&format!(
+        "stage {} using {} {} {{\n",
+        stage.name,
+        pp_stage_kind(stage.stage_kind),
+        stage.component
+    ));
+    pp_indent(out, indent + 1);
+    out.push_str(&format!("in: {}\n", pp_expr(&stage.input)));
+    pp_indent(out, indent + 1);
+    out.push_str(&format!("out: {}\n", stage.output));
+    if let Some(when) = &stage.when {
+        pp_indent(out, indent + 1);
+        out.push_str(&format!("when: {}\n", pp_expr(when)));
+    }
+    pp_indent(out, indent);
+    out.push_str("}\n");
+}
+
+fn pp_loop(out: &mut String, loop_ir: &LoopIR, indent: usize) {
+    pp_indent(out, indent);
+    out.push_str(&format!("loop {} {{\n", loop_ir.name));
+    pp_indent(out, indent + 1);
+    out.push_str(&format!("max_iters: {}\n", pp_expr(&loop_ir.max_iters)));
+    pp_indent(out, indent + 1);
+    out.push_str(&format!("carry: [{}]\n", loop_ir.carry.join(", ")));
+    pp_indent(out, indent + 1);
+    out.push_str(&format!("until: {}\n", pp_expr(&loop_ir.until)));
+    for node in &loop_ir.body {
+        pp_task_node(out, node, indent + 1);
+    }
+    pp_indent(out, indent);
+    out.push_str("}\n");
+}
+
+fn pp_branch(out: &mut String, branch: &BranchIR, indent: usize) {
+    pp_indent(out, indent);
+    out.push_str(&format!("if {} {{\n", pp_expr(&branch.condition)));
+    for node in &branch.then_body {
+        pp_task_node(out, node, indent + 1);
+    }
+    pp_indent(out, indent);
+    out.push('}');
+    if !branch.else_body.is_empty() {
+        out.push_str(" else {\n");
+        for node in &branch.else_body {
+            pp_task_node(out, node, indent + 1);
+        }
+        pp_indent(out, indent);
+        out.push('}');
+    }
+    out.push('\n');
+}
+
+fn pp_harness(out: &mut String, harness: &HarnessIR) {
+    out.push_str(&format!(
+        "harness {} for task {} {{\n",
+        harness.name, harness.task
+    ));
+    if !harness.defaults.is_empty() {
+        out.push_str("    defaults {\n");
+        for binding in &harness.defaults {
+            out.push_str(&format!(
+                "        {}: {}\n",
+                pp_binding_path(&binding.key),
+                pp_expr(&binding.value)
+            ));
+        }
+        out.push_str("    }\n");
+    }
+
+    for binding in &harness.bindings {
+        out.push_str(&format!("    bind {} {{\n", binding.target));
+        for item in &binding.bindings {
+            out.push_str(&format!(
+                "        {}: {}\n",
+                pp_binding_path(&item.key),
+                pp_expr(&item.value)
+            ));
+        }
+        out.push_str("    }\n");
+    }
+
+    if !harness.tunables.is_empty() {
+        out.push_str("    tune {\n");
+        for tunable in &harness.tunables {
+            out.push_str(&format!(
+                "        {} {} {}\n",
+                pp_binding_path(&tunable.path),
+                pp_tune_operator(tunable.operator),
+                pp_finite_domain(&tunable.domain)
+            ));
+        }
+        out.push_str("    }\n");
+    }
+    out.push_str("}\n");
+}
+
+fn pp_objective(out: &mut String, objective: &ObjectiveIR) {
+    out.push_str(&format!(
+        "objective {} for task {} {{\n",
+        objective.name, objective.task
+    ));
+    out.push_str(&format!(
+        "    dataset: {}\n",
+        pp_dataset_spec(&objective.dataset)
+    ));
+    out.push_str(&format!("    harness: {}\n", objective.harness));
+    if let Some(repeats) = objective.repeats {
+        out.push_str(&format!("    repeats: {}\n", repeats));
+    }
+    for metric in &objective.metrics {
+        out.push_str(&format!(
+            "    metric {} = {}\n",
+            metric.name,
+            pp_expr(&metric.expr)
+        ));
+    }
+    out.push_str(&format!("    score = {}\n", pp_expr(&objective.score)));
+    if let Some(split) = &objective.split {
+        out.push_str("    split {\n");
+        out.push_str(&format!("        train: {}\n", split.train));
+        out.push_str(&format!("        val: {}\n", split.val));
+        out.push_str(&format!("        test: {}\n", split.test));
+        out.push_str("    }\n");
+    }
+    if let Some(select) = &objective.select {
+        out.push_str("    select {\n");
+        out.push_str(&format!("        primary: {}\n", pp_expr(&select.primary)));
+        if !select.tie_breakers.is_empty() {
+            let ties: Vec<String> = select.tie_breakers.iter().map(pp_expr).collect();
+            out.push_str(&format!("        tie_breakers: [{}]\n", ties.join(", ")));
+        }
+        out.push_str("    }\n");
+    }
+    out.push_str("}\n");
+}
+
+fn pp_stage_kind(kind: StageKindIR) -> &'static str {
+    match kind {
+        StageKindIR::Tool => "tool",
+        StageKindIR::Prompt => "prompt",
+        StageKindIR::Agent => "agent",
+    }
+}
+
+fn pp_binding_path(path: &BindingPathIR) -> String {
+    path.segments.join(".")
+}
+
+fn pp_tune_operator(op: TuneOperatorIR) -> &'static str {
+    match op {
+        TuneOperatorIR::In => "in",
+        TuneOperatorIR::SubsetOf => "subset_of",
+    }
+}
+
+fn pp_finite_domain(domain: &FiniteDomainIR) -> String {
+    match domain {
+        FiniteDomainIR::List { values } => {
+            let items: Vec<String> = values.iter().map(pp_expr).collect();
+            format!("[{}]", items.join(", "))
+        }
+        FiniteDomainIR::Variants { name } => format!("variants(\"{}\")", escape_str(name)),
+    }
+}
+
+fn pp_dataset_spec(dataset: &DatasetSpecIR) -> String {
+    match dataset {
+        DatasetSpecIR::File { path } => format!("file(\"{}\")", escape_str(path)),
+        DatasetSpecIR::Inline { cases } => {
+            let cases: Vec<String> = cases.iter().map(pp_inline_dataset_case).collect();
+            format!("[{}]", cases.join(", "))
+        }
+    }
+}
+
+fn pp_inline_dataset_case(case: &InlineDatasetCaseIR) -> String {
+    let mut parts = vec![format!("input: {}", pp_expr(&case.input))];
+    if let Some(expected) = &case.expected {
+        parts.push(format!("expected: {}", pp_expr(expected)));
+    }
+    if let Some(id) = &case.id {
+        parts.push(format!("id: \"{}\"", escape_str(id)));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn pp_indent(out: &mut String, level: usize) {
@@ -592,6 +846,7 @@ mod tests {
     #[test]
     fn test_round_trip_type_def() {
         let td = TypeDefIR {
+            kind: TypeDefKindIR::Type,
             name: "SearchPayload".into(),
             definition: TypeIR::Struct {
                 fields: {
@@ -767,6 +1022,7 @@ mod tests {
         let ir = ScaffoldIR {
             version: "0.1.0".into(),
             types: vec![TypeDefIR {
+                kind: TypeDefKindIR::Type,
                 name: "Output".into(),
                 definition: TypeIR::Struct {
                     fields: {
@@ -799,10 +1055,174 @@ mod tests {
             prompts: vec![],
             agents: vec![],
             pipelines: vec![],
+            tasks: vec![],
+            harnesses: vec![],
+            objectives: vec![],
         };
         let out = pretty_print(&ir);
         assert!(out.contains("type Output ="));
         assert!(out.contains("tool search"));
         assert!(out.contains("shell(\"echo {query}\")"));
+    }
+
+    #[test]
+    fn test_round_trip_artifact_task_and_harness() {
+        let ir = ScaffoldIR {
+            version: "0.1.0".into(),
+            types: vec![TypeDefIR {
+                kind: TypeDefKindIR::Artifact,
+                name: "ResearchNotes".into(),
+                definition: TypeIR::Struct {
+                    fields: {
+                        let mut f = HashMap::new();
+                        f.insert("summary".into(), TypeIR::String);
+                        f.insert("score".into(), TypeIR::Float);
+                        f
+                    },
+                },
+            }],
+            extern_crates: vec![],
+            foreign_modules: vec![],
+            tools: vec![],
+            prompts: vec![],
+            agents: vec![],
+            pipelines: vec![],
+            tasks: vec![TaskIR {
+                name: "answer_question".into(),
+                input: TypeIR::Struct {
+                    fields: {
+                        let mut f = HashMap::new();
+                        f.insert("question".into(), TypeIR::String);
+                        f
+                    },
+                },
+                output: TypeIR::Struct {
+                    fields: {
+                        let mut f = HashMap::new();
+                        f.insert("answer".into(), TypeIR::String);
+                        f
+                    },
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "notes".into(),
+                    ty: TypeIR::Named {
+                        name: "ResearchNotes".into(),
+                    },
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "draft".into(),
+                    stage_kind: StageKindIR::Prompt,
+                    component: "writer".into(),
+                    input: ExprIR::Record {
+                        fields: vec![ExprFieldIR {
+                            key: "question".into(),
+                            value: ExprIR::FieldAccess {
+                                base: Box::new(ExprIR::Ident {
+                                    name: "input".into(),
+                                }),
+                                field: "question".into(),
+                            },
+                        }],
+                    },
+                    output: "notes".into(),
+                    when: None,
+                })],
+                emit: vec![EmitFieldIR {
+                    name: "answer".into(),
+                    value: ExprIR::FieldAccess {
+                        base: Box::new(ExprIR::Ident {
+                            name: "notes".into(),
+                        }),
+                        field: "summary".into(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "baseline".into(),
+                task: "answer_question".into(),
+                defaults: vec![BindingIR {
+                    key: BindingPathIR {
+                        segments: vec!["model".into()],
+                    },
+                    value: ExprIR::Literal {
+                        value: LiteralIR::String {
+                            value: "gpt-5".into(),
+                        },
+                    },
+                }],
+                bindings: vec![TargetBindingIR {
+                    target: "draft".into(),
+                    bindings: vec![BindingIR {
+                        key: BindingPathIR {
+                            segments: vec!["temperature".into()],
+                        },
+                        value: ExprIR::Literal {
+                            value: LiteralIR::Float { value: 0.2 },
+                        },
+                    }],
+                }],
+                tunables: vec![TunableIR {
+                    path: BindingPathIR {
+                        segments: vec!["draft".into(), "model".into()],
+                    },
+                    operator: TuneOperatorIR::In,
+                    domain: FiniteDomainIR::List {
+                        values: vec![
+                            ExprIR::Literal {
+                                value: LiteralIR::String {
+                                    value: "gpt-5-mini".into(),
+                                },
+                            },
+                            ExprIR::Literal {
+                                value: LiteralIR::String {
+                                    value: "gpt-5".into(),
+                                },
+                            },
+                        ],
+                    },
+                }],
+            }],
+            objectives: vec![ObjectiveIR {
+                name: "quality".into(),
+                task: "answer_question".into(),
+                harness: "baseline".into(),
+                dataset: DatasetSpecIR::File {
+                    path: "dataset.jsonl".into(),
+                },
+                repeats: Some(2),
+                metrics: vec![MetricIR {
+                    name: "accuracy".into(),
+                    expr: ExprIR::Ident {
+                        name: "output".into(),
+                    },
+                }],
+                score: ExprIR::Ident {
+                    name: "accuracy".into(),
+                },
+                split: Some(SplitIR {
+                    train: 0.7,
+                    val: 0.2,
+                    test: 0.1,
+                }),
+                select: Some(SelectIR {
+                    primary: ExprIR::Ident {
+                        name: "accuracy".into(),
+                    },
+                    tie_breakers: vec![ExprIR::FieldAccess {
+                        base: Box::new(ExprIR::Ident {
+                            name: "rollout".into(),
+                        }),
+                        field: "cost".into(),
+                    }],
+                }),
+            }],
+        };
+
+        let out = pretty_print(&ir);
+        assert!(out.contains("artifact ResearchNotes ="));
+        assert!(out.contains("task answer_question"));
+        assert!(out.contains("stage draft using prompt writer"));
+        assert!(out.contains("harness baseline for task answer_question"));
+        assert!(out.contains("objective quality for task answer_question"));
     }
 }

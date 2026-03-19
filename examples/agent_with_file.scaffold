@@ -1,8 +1,9 @@
 // Agent Example with External System Prompt
 // Demonstrates using file() to load system prompt from external file
 //
-// Run:
-//   scaffold run examples/agent_with_file.scaffold --agent researcher --input '{"question": "What is the capital of France?"}'
+// Legacy pre-task example:
+//   this file still uses the older agent-only execution model and needs a task wrapper
+//   before it can run through the current CLI surface.
 
 type Answer = {
     answer: string,

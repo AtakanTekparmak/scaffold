@@ -264,6 +264,73 @@ impl fmt::Display for Value {
     }
 }
 
+impl From<serde_json::Value> for Value {
+    fn from(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::Float(f)
+                } else {
+                    Value::Null
+                }
+            }
+            serde_json::Value::String(s) => Value::String(s),
+            serde_json::Value::Array(items) => {
+                Value::List(items.into_iter().map(Value::from).collect())
+            }
+            serde_json::Value::Object(map) => Value::Map(
+                map.into_iter()
+                    .map(|(key, value)| (key, Value::from(value)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<Value> for serde_json::Value {
+    fn from(value: Value) -> Self {
+        match value {
+            Value::Null => serde_json::Value::Null,
+            Value::Bool(b) => serde_json::Value::Bool(b),
+            Value::Int(i) => serde_json::Value::Number(i.into()),
+            Value::Float(f) => serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Value::String(s) => serde_json::Value::String(s),
+            Value::Bytes(bytes) => serde_json::Value::Array(
+                bytes
+                    .into_iter()
+                    .map(|byte| serde_json::Value::Number(byte.into()))
+                    .collect(),
+            ),
+            Value::List(items) => {
+                serde_json::Value::Array(items.into_iter().map(serde_json::Value::from).collect())
+            }
+            Value::Map(map) => serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, serde_json::Value::from(value)))
+                    .collect(),
+            ),
+            Value::Struct { fields, .. } => serde_json::Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (key, serde_json::Value::from(value)))
+                    .collect(),
+            ),
+            Value::Result(result) => match *result {
+                ResultValue::Ok(value) => serde_json::Value::from(value),
+                ResultValue::Err(value) => serde_json::json!({
+                    "err": serde_json::Value::from(value),
+                }),
+            },
+        }
+    }
+}
+
 impl Default for Value {
     fn default() -> Self {
         Value::Null

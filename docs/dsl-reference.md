@@ -164,17 +164,11 @@ scaffold parse example.scaffold
 # Compile to IR (JSON)
 scaffold compile example.scaffold -o output.json
 
-# Run a tool
-scaffold run example.scaffold --tool my_tool --input '{"text": "hello"}'
+# Run a task
+scaffold run example.scaffold --task answer_question --input '{"question": "..."}'
 
-# Run an agent
-scaffold run example.scaffold --agent my_agent --input '{"question": "..."}'
-
-# Run a pipeline
-scaffold run example.scaffold --pipeline my_pipeline --input '{"data": "..."}'
-
-# Generate Rust code
-scaffold codegen example.scaffold -o generated/
+# Run a task with a harness override
+scaffold run example.scaffold --task answer_question --harness answer_default --input '{"question": "..."}'
 ```
 
 ## Configuration

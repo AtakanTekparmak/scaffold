@@ -12,7 +12,7 @@ scaffold-syntax.workspace = true
 scaffold-types.workspace = true
 scaffold-verify.workspace = true
 scaffold-ir.workspace = true
-scaffold-codegen.workspace = true
+scaffold-runtime.workspace = true
 
 clap.workspace = true
 ariadne.workspace = true

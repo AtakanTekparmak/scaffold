@@ -1,10 +1,8 @@
 // File info scaffold - demonstrates shell tool usage (no API keys needed)
 //
-// Test individual tools:
-//   scaffold run examples/file_info.scaffold --tool get_size --input '{"path": "Cargo.toml"}'
-//   scaffold run examples/file_info.scaffold --tool count_lines --input '{"path": "Cargo.toml"}'
-//   scaffold run examples/file_info.scaffold --tool get_type --input '{"path": "Cargo.toml"}'
-//   scaffold run examples/file_info.scaffold --tool file_summary --input '{"path": "Cargo.toml"}'
+// Legacy pre-task example:
+//   this file still exposes standalone tools and needs a task wrapper
+//   before it can run through the current CLI surface.
 
 type FileInput = { path: string }
 

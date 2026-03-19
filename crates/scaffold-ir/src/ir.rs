@@ -17,19 +17,35 @@ pub struct ScaffoldIR {
     /// IR version for compatibility checking
     pub version: String,
     /// Type definitions
+    #[serde(default)]
     pub types: Vec<TypeDefIR>,
     /// External crate declarations
+    #[serde(default)]
     pub extern_crates: Vec<ExternCrateIR>,
     /// Foreign module declarations
+    #[serde(default)]
     pub foreign_modules: Vec<ForeignModuleIR>,
     /// Tool definitions (deterministic code)
+    #[serde(default)]
     pub tools: Vec<ToolIR>,
     /// Prompt definitions (single LLM calls)
+    #[serde(default)]
     pub prompts: Vec<PromptIR>,
     /// Agent definitions (multi-turn LLM with tools)
+    #[serde(default)]
     pub agents: Vec<AgentIR>,
     /// Pipeline definitions (fixed sequences)
+    #[serde(default)]
     pub pipelines: Vec<PipelineIR>,
+    /// Task definitions (typed orchestration units)
+    #[serde(default)]
+    pub tasks: Vec<TaskIR>,
+    /// Harness definitions (typed execution overlays)
+    #[serde(default)]
+    pub harnesses: Vec<HarnessIR>,
+    /// Objective definitions (evaluation and optimization contracts)
+    #[serde(default)]
+    pub objectives: Vec<ObjectiveIR>,
 }
 
 impl ScaffoldIR {
@@ -43,6 +59,9 @@ impl ScaffoldIR {
             prompts: Vec::new(),
             agents: Vec::new(),
             pipelines: Vec::new(),
+            tasks: Vec::new(),
+            harnesses: Vec::new(),
+            objectives: Vec::new(),
         }
     }
 }
@@ -56,10 +75,22 @@ impl Default for ScaffoldIR {
 /// Type definition IR
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeDefIR {
+    /// Whether this is a general type or a task-flow artifact
+    #[serde(default)]
+    pub kind: TypeDefKindIR,
     /// Type name
     pub name: String,
     /// Type structure
     pub definition: TypeIR,
+}
+
+/// Distinguishes plain types from artifacts in IR
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeDefKindIR {
+    #[default]
+    Type,
+    Artifact,
 }
 
 /// Type IR
@@ -513,4 +544,186 @@ pub enum PipelineCallIR {
 pub struct PipelineMatchArmIR {
     pub pattern: ExprIR,
     pub steps: Vec<PipelineStepIR>,
+}
+
+// ============================================
+// Task / Harness / Objective IR
+// ============================================
+
+/// Declared task artifact slot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactSlotIR {
+    pub name: String,
+    pub ty: TypeIR,
+}
+
+/// Task definition IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskIR {
+    pub name: String,
+    pub input: TypeIR,
+    pub output: TypeIR,
+    pub artifacts: Vec<ArtifactSlotIR>,
+    pub body: Vec<TaskNodeIR>,
+    pub emit: Vec<EmitFieldIR>,
+}
+
+/// Task body node IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum TaskNodeIR {
+    Stage(StageIR),
+    Loop(LoopIR),
+    Branch(BranchIR),
+}
+
+/// Stage kind in a task
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StageKindIR {
+    Tool,
+    Prompt,
+    Agent,
+}
+
+/// Task stage IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageIR {
+    pub name: String,
+    pub stage_kind: StageKindIR,
+    pub component: String,
+    pub input: ExprIR,
+    pub output: String,
+    pub when: Option<ExprIR>,
+}
+
+/// Explicit loop IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopIR {
+    pub name: String,
+    pub max_iters: ExprIR,
+    pub carry: Vec<String>,
+    pub until: ExprIR,
+    pub body: Vec<TaskNodeIR>,
+}
+
+/// Structured branch IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchIR {
+    pub condition: ExprIR,
+    pub then_body: Vec<TaskNodeIR>,
+    pub else_body: Vec<TaskNodeIR>,
+}
+
+/// Final task output mapping
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmitFieldIR {
+    pub name: String,
+    pub value: ExprIR,
+}
+
+/// Harness definition IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessIR {
+    pub name: String,
+    pub task: String,
+    pub defaults: Vec<BindingIR>,
+    pub bindings: Vec<TargetBindingIR>,
+    pub tunables: Vec<TunableIR>,
+}
+
+/// Binding block for a named task target
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetBindingIR {
+    pub target: String,
+    pub bindings: Vec<BindingIR>,
+}
+
+/// Bound configurable value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingIR {
+    pub key: BindingPathIR,
+    pub value: ExprIR,
+}
+
+/// Dot-separated configurable field path
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingPathIR {
+    pub segments: Vec<String>,
+}
+
+/// Tunable field declaration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunableIR {
+    pub path: BindingPathIR,
+    pub operator: TuneOperatorIR,
+    pub domain: FiniteDomainIR,
+}
+
+/// Tune operator IR
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TuneOperatorIR {
+    In,
+    SubsetOf,
+}
+
+/// Finite search domain IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum FiniteDomainIR {
+    List { values: Vec<ExprIR> },
+    Variants { name: String },
+}
+
+/// Objective definition IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectiveIR {
+    pub name: String,
+    pub task: String,
+    pub harness: String,
+    pub dataset: DatasetSpecIR,
+    pub repeats: Option<u64>,
+    pub metrics: Vec<MetricIR>,
+    pub score: ExprIR,
+    pub split: Option<SplitIR>,
+    pub select: Option<SelectIR>,
+}
+
+/// Dataset specification IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum DatasetSpecIR {
+    File { path: String },
+    Inline { cases: Vec<InlineDatasetCaseIR> },
+}
+
+/// Inline dataset case IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineDatasetCaseIR {
+    pub input: ExprIR,
+    pub expected: Option<ExprIR>,
+    pub id: Option<String>,
+}
+
+/// Metric IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricIR {
+    pub name: String,
+    pub expr: ExprIR,
+}
+
+/// Split weights IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitIR {
+    pub train: f64,
+    pub val: f64,
+    pub test: f64,
+}
+
+/// Objective selection IR
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectIR {
+    pub primary: ExprIR,
+    pub tie_breakers: Vec<ExprIR>,
 }

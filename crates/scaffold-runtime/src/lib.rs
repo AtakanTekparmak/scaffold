@@ -26,8 +26,11 @@
 //! let response = scaffold_runtime::llm_query("What is 2+2?").await?;
 //! ```
 
+pub mod agent_convos;
+pub mod builtins;
 pub mod config;
 pub mod error;
+pub mod interpreter;
 pub mod llm;
 pub mod parse;
 pub mod prompt;
@@ -39,11 +42,13 @@ pub mod trace;
 pub mod value;
 
 // Re-exports for convenience
+pub use agent_convos::maybe_log_agent_conversation;
 pub use config::{config, Config};
 pub use error::{Error, Result};
+pub use interpreter::execute_task;
 pub use llm::{
-    query as llm_query, query_structured, query_with_config, query_with_model, Agent, AgentBuilder,
-    LlmBackend, LlmConfig,
+    query as llm_query, query_structured, query_structured_with_config, query_with_config,
+    query_with_model, Agent, AgentBuilder, LlmBackend, LlmConfig,
 };
 pub use prompt::PromptManager;
 pub use rig::completion::request::ToolDefinition;

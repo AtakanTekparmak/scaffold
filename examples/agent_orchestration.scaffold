@@ -1,5 +1,8 @@
 // Agent Orchestration Example
 // Demonstrates combining multiple agents with conditionals
+// Legacy pre-task example:
+// this file still uses the older optimize flow and needs migration
+// into first-class task/harness/objective constructs.
 
 // ============================================
 // Types
