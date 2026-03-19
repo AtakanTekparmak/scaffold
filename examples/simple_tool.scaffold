@@ -1,8 +1,0 @@
-// Simple tool test for interpreter
-type Input = { message: string }
-
-tool echo {
-    input: { message: string }
-    output: string
-    impl: shell("echo {message}")
-}

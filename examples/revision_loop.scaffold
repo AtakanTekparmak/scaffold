@@ -1,0 +1,82 @@
+artifact RevisionDraft = {
+    answer: string,
+    score: float,
+    critique: string,
+}
+
+type RevisionOutput = {
+    answer: string,
+    score: float,
+}
+
+prompt draft_answer {
+    input: { question: string, critique: string }
+    output: RevisionDraft
+    template: "Answer the question below. Return a draft answer, a confidence score between 0.0 and 1.0, and a short critique.\n\nQuestion: {question}\nCritique to address: {critique}"
+}
+
+prompt review_answer {
+    input: RevisionDraft
+    output: RevisionDraft
+    template: "Improve this draft. Return a revised answer, an updated score between 0.0 and 1.0, and the next critique.\n\nAnswer: {answer}\nScore: {score}\nCritique: {critique}"
+}
+
+task revise_answer {
+    input: { question: string }
+    output: RevisionOutput
+
+    artifacts {
+        draft: RevisionDraft
+    }
+
+    stage initial using prompt draft_answer {
+        in: { question: input.question, critique: "" }
+        out: draft
+    }
+
+    loop improve {
+        max_iters: 3
+        carry: [draft]
+        until: draft.score >= 0.85
+
+        stage review using prompt review_answer {
+            in: draft
+            out: draft
+        }
+    }
+
+    emit {
+        answer: draft.answer
+        score: draft.score
+    }
+}
+
+harness baseline for task revise_answer {
+    defaults {
+        model: "gpt-5-mini"
+    }
+
+    bind initial {
+        temperature: 0.4
+    }
+
+    bind review {
+        temperature: 0.2
+    }
+}
+
+objective revision_quality for task revise_answer {
+    dataset: [
+        { id: "hello", input: { question: "What is a friendly way to greet someone?" } },
+        { id: "rust", input: { question: "What is Rust best known for?" } },
+    ]
+    harness: baseline
+    repeats: 1
+    metric non_empty = len(output.answer) > 0
+    metric score_floor = output.score >= 0.7
+    score = score_floor
+    select {
+        primary: score_floor
+        tie_breakers: [non_empty]
+    }
+}

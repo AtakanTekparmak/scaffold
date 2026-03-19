@@ -92,7 +92,8 @@ Status
 ------
 - Parser, type checker, verifier, IR, runtime interpreter, and task-centric CLI are integrated.
 - Task/harness/objective syntax is present and task execution now runs directly from IR.
-- Ongoing: migrate more examples to tasks, expand interpreter coverage for tool-backed stages, and rebuild optimizer/codegen on the new architecture.
+- `examples/` now contains a small task-first starter set: tool stages, prompt+harness usage, and a bounded revision loop with an objective.
+- Ongoing: expand interpreter coverage for tool-backed agent stages, and rebuild optimizer/codegen on the new architecture.
 
 Contributing
 ------------

@@ -3,10 +3,12 @@
 use crate::error::{Error, Result};
 use crate::llm::{query_structured_with_config, LlmConfig};
 use crate::prompt::PromptManager;
+use crate::{builtins, shell};
 use crate::value::{ResultValue, Value};
 use scaffold_ir::{
     types_to_json_schema_document, AgentIR, ExprIR, LiteralIR, PromptIR, ScaffoldIR, StageIR,
-    StageKindIR, StringOrFileIR, TaskIR, TaskNodeIR, TypeIR,
+    StageKindIR, StringOrFileIR, TaskIR, TaskNodeIR, ToolExprIR, ToolIR, ToolImplIR,
+    ToolStatementIR, TypeIR,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -144,12 +146,7 @@ impl<'a> TaskInterpreter<'a> {
                 self.execute_agent_stage(stage, stage_input, harness)
                     .await?
             }
-            StageKindIR::Tool => {
-                return Err(Error::Runtime(format!(
-                    "task interpreter does not yet support tool stage '{}' (component '{}'); use codegen for tool-backed execution for now",
-                    stage.name, stage.component
-                )));
-            }
+            StageKindIR::Tool => self.execute_tool_stage(stage, stage_input, harness)?,
         };
         ctx.artifacts.insert(stage.output.clone(), output);
         Ok(())
@@ -227,6 +224,763 @@ impl<'a> TaskInterpreter<'a> {
         let user_prompt = format!("Input:\n{}", input_json);
         let output = query_structured_with_config(&user_prompt, &schema, &config).await?;
         self.validate_value(output, &agent.output)
+    }
+
+    fn execute_tool_stage(
+        &self,
+        stage: &StageIR,
+        input: Value,
+        harness: &ResolvedHarness,
+    ) -> Result<Value> {
+        self.ensure_supported_fields(&stage.name, harness, &["timeout_secs", "retries", "variant"])?;
+        let tool = self.find_tool(&stage.component)?;
+        let input = self.validate_value(input, &tool.input)?;
+        let retries = self.harness_u64(harness, &stage.name, "retries")?.unwrap_or(0);
+        let timeout_secs = self.harness_u64(harness, &stage.name, "timeout_secs")?;
+        let variant = self.harness_string(harness, &stage.name, "variant")?;
+
+        let mut last_error = None;
+        for _ in 0..=retries {
+            match self.execute_tool(tool, input.clone(), variant.as_deref(), timeout_secs) {
+                Ok(output) => return Ok(output),
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            Error::Runtime(format!(
+                "tool stage '{}' failed without returning an error",
+                stage.name
+            ))
+        }))
+    }
+
+    fn execute_tool(
+        &self,
+        tool: &ToolIR,
+        input: Value,
+        variant: Option<&str>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value> {
+        let input = self.validate_value(input, &tool.input)?;
+        let empty_locals = HashMap::new();
+        if let Some(spec) = &tool.spec {
+            for condition in &spec.preconditions {
+                if !self.eval_tool_bool_expr(condition, &input, &empty_locals, timeout_secs)? {
+                    return Err(Error::PreconditionFailed(format!("{:?}", condition)));
+                }
+            }
+        }
+
+        let implementation = self.select_tool_implementation(tool, variant)?;
+        let mut locals = HashMap::new();
+        let output = self.execute_tool_impl(
+            implementation,
+            Some(&tool.output),
+            &input,
+            &mut locals,
+            timeout_secs,
+        )?;
+        let output = self.validate_value(output, &tool.output)?;
+
+        if let Some(spec) = &tool.spec {
+            let mut post_locals = HashMap::new();
+            post_locals.insert("output".to_string(), output.clone());
+            for condition in &spec.postconditions {
+                if !self.eval_tool_bool_expr(condition, &input, &post_locals, timeout_secs)? {
+                    return Err(Error::PostconditionFailed(format!("{:?}", condition)));
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn select_tool_implementation<'b>(
+        &self,
+        tool: &'b ToolIR,
+        variant: Option<&str>,
+    ) -> Result<&'b ToolImplIR> {
+        if let Some(variant) = variant {
+            let selected = variant.rsplit("::").next().unwrap_or(variant);
+            return tool
+                .variants
+                .iter()
+                .find(|candidate| candidate.name == selected)
+                .map(|candidate| &candidate.implementation)
+                .ok_or_else(|| {
+                    Error::Runtime(format!(
+                        "tool '{}' does not define variant '{}'",
+                        tool.name, variant
+                    ))
+                });
+        }
+
+        tool.implementation.as_ref().ok_or_else(|| {
+            Error::Runtime(format!(
+                "tool '{}' does not define a default implementation",
+                tool.name
+            ))
+        })
+    }
+
+    fn execute_tool_impl(
+        &self,
+        implementation: &ToolImplIR,
+        expected: Option<&TypeIR>,
+        input: &Value,
+        locals: &mut HashMap<String, Value>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value> {
+        match implementation {
+            ToolImplIR::Expr { expr } => self.eval_tool_expr(expr, expected, input, locals, timeout_secs),
+            ToolImplIR::Sequence { statements } | ToolImplIR::Parallel { statements } => {
+                self.execute_tool_block(statements, expected, input, locals, timeout_secs)
+            }
+        }
+    }
+
+    fn execute_tool_block(
+        &self,
+        statements: &[ToolStatementIR],
+        expected: Option<&TypeIR>,
+        input: &Value,
+        locals: &mut HashMap<String, Value>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value> {
+        let binding_names = statements
+            .iter()
+            .filter_map(|stmt| stmt.binding.as_deref())
+            .collect::<BTreeSet<_>>();
+        let mut last_value = None;
+        let mut last_binding = None;
+
+        for statement in statements {
+            let value = self.eval_tool_expr(&statement.expr, None, input, locals, timeout_secs)?;
+            if let Some(binding) = &statement.binding {
+                locals.insert(binding.clone(), value.clone());
+                last_binding = Some(binding.clone());
+            }
+            last_value = Some(value);
+        }
+
+        if let Some(expected_ty) = expected {
+            if let Some(fields) = self.struct_fields_for_type(expected_ty)? {
+                if !fields.is_empty()
+                    && fields
+                        .keys()
+                        .all(|field| binding_names.contains(field.as_str()))
+                {
+                    let mut out = HashMap::new();
+                    for field in fields.keys() {
+                        if let Some(value) = locals.get(field) {
+                            out.insert(field.clone(), value.clone());
+                        }
+                    }
+                    return Ok(Value::Map(out));
+                }
+            }
+        }
+
+        if let Some(binding) = last_binding {
+            if let Some(value) = locals.get(&binding) {
+                return Ok(value.clone());
+            }
+        }
+
+        if let Some(value) = last_value {
+            return Ok(value);
+        }
+
+        self.default_value_for_type(expected)
+    }
+
+    fn eval_tool_expr(
+        &self,
+        expr: &ToolExprIR,
+        expected: Option<&TypeIR>,
+        input: &Value,
+        locals: &HashMap<String, Value>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value> {
+        match expr {
+            ToolExprIR::Ident { name } => self.lookup_tool_value(name, input, locals),
+            ToolExprIR::FieldAccess { base, field } => {
+                let base = self.eval_tool_expr(base, None, input, locals, timeout_secs)?;
+                base.field(field).cloned().ok_or_else(|| {
+                    Error::Runtime(format!(
+                        "field '{}' not found on {}",
+                        field,
+                        self.type_label_from_value(&base)
+                    ))
+                })
+            }
+            ToolExprIR::ForeignCall {
+                module, function, ..
+            } => Err(Error::Runtime(format!(
+                "task interpreter does not support foreign call '{}::{}'",
+                module, function
+            ))),
+            ToolExprIR::ToolCall { tool, args } => {
+                let values = args
+                    .iter()
+                    .map(|arg| self.eval_tool_expr(arg, None, input, locals, timeout_secs))
+                    .collect::<Result<Vec<_>>>()?;
+
+                if builtins::BUILTIN_NAMES.contains(&tool.as_str()) {
+                    self.eval_builtin_call(tool, &values)
+                } else {
+                    let callee = self.find_tool(tool)?;
+                    let call_input = self.prepare_tool_call_input_from_tool_args(callee, args, &values)?;
+                    self.execute_tool(callee, call_input, None, timeout_secs)
+                }
+            }
+            ToolExprIR::Shell { command } => self.execute_shell_tool_expr(command, expected, input, locals, timeout_secs),
+            ToolExprIR::Pipe { .. } => Err(Error::Runtime(
+                "task interpreter does not yet support tool pipe expressions".to_string(),
+            )),
+            ToolExprIR::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                if self.eval_tool_bool_expr(condition, input, locals, timeout_secs)? {
+                    let mut branch_locals = locals.clone();
+                    self.execute_tool_impl(then_branch, expected, input, &mut branch_locals, timeout_secs)
+                } else if let Some(branch) = else_branch {
+                    let mut branch_locals = locals.clone();
+                    self.execute_tool_impl(branch, expected, input, &mut branch_locals, timeout_secs)
+                } else {
+                    self.default_value_for_type(expected)
+                }
+            }
+            ToolExprIR::Match { scrutinee, arms } => {
+                let value = self.eval_tool_expr(scrutinee, None, input, locals, timeout_secs)?;
+                for arm in arms {
+                    let pattern = self.eval_tool_logic_expr(&arm.pattern, input, locals, timeout_secs)?;
+                    if value == pattern {
+                        let mut arm_locals = locals.clone();
+                        return self.execute_tool_impl(&arm.body, expected, input, &mut arm_locals, timeout_secs);
+                    }
+                }
+                self.default_value_for_type(expected)
+            }
+            ToolExprIR::For {
+                variable,
+                iterable,
+                body,
+            } => {
+                let iterable = self.eval_tool_expr(iterable, None, input, locals, timeout_secs)?;
+                let items = iterable.as_list().cloned().ok_or_else(|| Error::TypeError {
+                    expected: "list".to_string(),
+                    actual: iterable.type_name().to_string(),
+                })?;
+                let mut result = self.default_value_for_type(None)?;
+                for item in items {
+                    let mut body_locals = locals.clone();
+                    body_locals.insert(variable.clone(), item);
+                    match self.execute_tool_impl(body, None, input, &mut body_locals, timeout_secs) {
+                        Ok(value) => result = value,
+                        Err(Error::LoopBreak) => break,
+                        Err(Error::LoopContinue) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(result)
+            }
+            ToolExprIR::While { condition, body } => {
+                let mut result = self.default_value_for_type(None)?;
+                while self.eval_tool_bool_expr(condition, input, locals, timeout_secs)? {
+                    let mut body_locals = locals.clone();
+                    match self.execute_tool_impl(body, None, input, &mut body_locals, timeout_secs) {
+                        Ok(value) => result = value,
+                        Err(Error::LoopBreak) => break,
+                        Err(Error::LoopContinue) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(result)
+            }
+            ToolExprIR::Loop { body } => {
+                let mut result = self.default_value_for_type(None)?;
+                loop {
+                    let mut body_locals = locals.clone();
+                    match self.execute_tool_impl(body, None, input, &mut body_locals, timeout_secs) {
+                        Ok(value) => result = value,
+                        Err(Error::LoopBreak) => break,
+                        Err(Error::LoopContinue) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(result)
+            }
+            ToolExprIR::Break => Err(Error::LoopBreak),
+            ToolExprIR::Continue => Err(Error::LoopContinue),
+            ToolExprIR::Literal { value } => Ok(self.literal_to_value(value)),
+            ToolExprIR::MapLiteral { entries } => {
+                let mut out = HashMap::new();
+                for entry in entries {
+                    out.insert(
+                        entry.key.clone(),
+                        self.eval_tool_expr(&entry.value, None, input, locals, timeout_secs)?,
+                    );
+                }
+                Ok(Value::Map(out))
+            }
+            ToolExprIR::Expr { expr } => self.eval_tool_logic_expr(expr, input, locals, timeout_secs),
+        }
+    }
+
+    fn eval_tool_logic_expr(
+        &self,
+        expr: &ExprIR,
+        input: &Value,
+        locals: &HashMap<String, Value>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value> {
+        match expr {
+            ExprIR::Literal { value } => Ok(self.literal_to_value(value)),
+            ExprIR::Ident { name } => self.lookup_tool_value(name, input, locals),
+            ExprIR::FieldAccess { base, field } => {
+                let base = self.eval_tool_logic_expr(base, input, locals, timeout_secs)?;
+                base.field(field).cloned().ok_or_else(|| {
+                    Error::Runtime(format!(
+                        "field '{}' not found on {}",
+                        field,
+                        self.type_label_from_value(&base)
+                    ))
+                })
+            }
+            ExprIR::Binary { left, op, right } => {
+                let left = self.eval_tool_logic_expr(left, input, locals, timeout_secs)?;
+                let right = self.eval_tool_logic_expr(right, input, locals, timeout_secs)?;
+                self.eval_binary(&left, op, &right)
+            }
+            ExprIR::Call { function, args } => {
+                let values = args
+                    .iter()
+                    .map(|arg| self.eval_tool_logic_expr(arg, input, locals, timeout_secs))
+                    .collect::<Result<Vec<_>>>()?;
+
+                if builtins::BUILTIN_NAMES.contains(&function.as_str()) {
+                    self.eval_builtin_call(function, &values)
+                } else if self.ir.tools.iter().any(|tool| tool.name == *function) {
+                    let callee = self.find_tool(function)?;
+                    let call_input =
+                        self.prepare_tool_call_input_from_expr_args(callee, args, &values)?;
+                    self.execute_tool(callee, call_input, None, timeout_secs)
+                } else {
+                    self.eval_call(function, &values)
+                }
+            }
+            ExprIR::ForeignCall {
+                module, function, ..
+            } => Err(Error::Runtime(format!(
+                "task interpreter does not support foreign call '{}::{}'",
+                module, function
+            ))),
+            ExprIR::List { elements } => Ok(Value::List(
+                elements
+                    .iter()
+                    .map(|element| self.eval_tool_logic_expr(element, input, locals, timeout_secs))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            ExprIR::Record { fields } => {
+                let mut out = HashMap::new();
+                for field in fields {
+                    out.insert(
+                        field.key.clone(),
+                        self.eval_tool_logic_expr(&field.value, input, locals, timeout_secs)?,
+                    );
+                }
+                Ok(Value::Map(out))
+            }
+        }
+    }
+
+    fn eval_tool_bool_expr(
+        &self,
+        expr: &ExprIR,
+        input: &Value,
+        locals: &HashMap<String, Value>,
+        timeout_secs: Option<u64>,
+    ) -> Result<bool> {
+        match self.eval_tool_logic_expr(expr, input, locals, timeout_secs)? {
+            Value::Bool(value) => Ok(value),
+            other => Err(Error::TypeError {
+                expected: "bool".to_string(),
+                actual: other.type_name().to_string(),
+            }),
+        }
+    }
+
+    fn lookup_tool_value(
+        &self,
+        name: &str,
+        input: &Value,
+        locals: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        if name == "input" {
+            return Ok(input.clone());
+        }
+        if let Some(value) = locals.get(name) {
+            return Ok(value.clone());
+        }
+        if let Some(value) = input.field(name) {
+            return Ok(value.clone());
+        }
+        Err(Error::Runtime(format!("unknown identifier '{}'", name)))
+    }
+
+    fn prepare_tool_call_input_from_tool_args(
+        &self,
+        tool: &ToolIR,
+        args: &[ToolExprIR],
+        values: &[Value],
+    ) -> Result<Value> {
+        let named_positions = args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| match arg {
+                ToolExprIR::Ident { name } => Ok((name.clone(), idx)),
+                _ => Err(()),
+            })
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .ok();
+        self.prepare_tool_call_input(tool, values, named_positions.as_ref())
+    }
+
+    fn prepare_tool_call_input_from_expr_args(
+        &self,
+        tool: &ToolIR,
+        args: &[ExprIR],
+        values: &[Value],
+    ) -> Result<Value> {
+        let named_positions = args
+            .iter()
+            .enumerate()
+            .map(|(idx, arg)| match arg {
+                ExprIR::Ident { name } => Ok((name.clone(), idx)),
+                _ => Err(()),
+            })
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .ok();
+        self.prepare_tool_call_input(tool, values, named_positions.as_ref())
+    }
+
+    fn prepare_tool_call_input(
+        &self,
+        tool: &ToolIR,
+        values: &[Value],
+        named_positions: Option<&HashMap<String, usize>>,
+    ) -> Result<Value> {
+        if let Some(fields) = self.struct_fields_for_type(&tool.input)? {
+            let use_named_mapping = named_positions
+                .map(|positions| fields.keys().all(|field| positions.contains_key(field)))
+                .unwrap_or(false);
+            let mut out = HashMap::new();
+            for (index, (field, field_ty)) in fields.iter().enumerate() {
+                let value = if use_named_mapping {
+                    named_positions
+                        .and_then(|positions| positions.get(field))
+                        .and_then(|position| values.get(*position))
+                        .cloned()
+                } else {
+                    values.get(index).cloned()
+                }
+                .unwrap_or(self.default_value_for_type(Some(field_ty))?);
+                out.insert(field.clone(), value);
+            }
+            return self.validate_value(Value::Map(out), &tool.input);
+        }
+
+        match values {
+            [] => self.validate_value(Value::Null, &tool.input),
+            [value] => self.validate_value(value.clone(), &tool.input),
+            many => self.validate_value(Value::List(many.to_vec()), &tool.input),
+        }
+    }
+
+    fn struct_fields_for_type<'b>(
+        &'b self,
+        ty: &'b TypeIR,
+    ) -> Result<Option<&'b HashMap<String, TypeIR>>> {
+        match ty {
+            TypeIR::Struct { fields } => Ok(Some(fields)),
+            TypeIR::Named { name } => match self.resolve_named_type(name)? {
+                TypeIR::Struct { fields } => Ok(Some(fields)),
+                other => self.struct_fields_for_type(other),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn execute_shell_tool_expr(
+        &self,
+        command: &str,
+        expected: Option<&TypeIR>,
+        input: &Value,
+        locals: &HashMap<String, Value>,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value> {
+        let command = self.interpolate_shell_command(command, input, locals)?;
+        let output = match expected {
+            Some(TypeIR::Bytes) => Value::Bytes(shell::execute_bytes(&command)?),
+            _ => {
+                let stdout = if let Some(timeout_secs) = timeout_secs {
+                    shell::execute_with_timeout(&command, timeout_secs * 1000)?
+                } else {
+                    shell::execute(&command)?
+                };
+                self.parse_shell_output(stdout, expected)?
+            }
+        };
+        Ok(output)
+    }
+
+    fn interpolate_shell_command(
+        &self,
+        command: &str,
+        input: &Value,
+        locals: &HashMap<String, Value>,
+    ) -> Result<String> {
+        let mut rendered = String::with_capacity(command.len());
+        let chars = command.chars().collect::<Vec<_>>();
+        let mut index = 0usize;
+
+        while index < chars.len() {
+            if chars[index] == '{' {
+                let start = index + 1;
+                let mut end = start;
+                while end < chars.len()
+                    && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
+                    end += 1;
+                }
+                if end > start && end < chars.len() && chars[end] == '}' {
+                    let name = chars[start..end].iter().collect::<String>();
+                    let value = self.lookup_tool_value(&name, input, locals)?;
+                    rendered.push_str(&value.to_string());
+                    index = end + 1;
+                    continue;
+                }
+            }
+            rendered.push(chars[index]);
+            index += 1;
+        }
+
+        Ok(rendered)
+    }
+
+    fn parse_shell_output(&self, stdout: String, expected: Option<&TypeIR>) -> Result<Value> {
+        let trimmed = stdout.trim().to_string();
+        match expected {
+            Some(TypeIR::String) => Ok(Value::String(trimmed)),
+            Some(TypeIR::Int) => Ok(Value::Int(crate::parse::parse_i64(&trimmed)?)),
+            Some(TypeIR::Float) => Ok(Value::Float(crate::parse::parse_f64(&trimmed)?)),
+            Some(TypeIR::Bool) => Ok(Value::Bool(crate::parse::parse_bool(&trimmed)?)),
+            Some(TypeIR::Any) | None => Ok(Value::String(stdout)),
+            _ => {
+                let json = serde_json::from_str::<serde_json::Value>(&trimmed)
+                    .map_err(|e| Error::ParseError(e.to_string()))?;
+                Ok(Value::from(json))
+            }
+        }
+    }
+
+    fn eval_builtin_call(&self, function: &str, args: &[Value]) -> Result<Value> {
+        match function {
+            "http_get" => {
+                let url = self.expect_string(self.expect_arity(function, args, 1)?)?;
+                Ok(Value::String(builtins::http_get(url)?))
+            }
+            "http_get_with_headers" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::String(builtins::http_get_with_headers(
+                    self.expect_string(&args[0])?,
+                    self.expect_string(&args[1])?,
+                )?))
+            }
+            "http_post" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::String(builtins::http_post(
+                    self.expect_string(&args[0])?,
+                    self.expect_string(&args[1])?,
+                )?))
+            }
+            "json_parse" => {
+                let text = self.expect_string(self.expect_arity(function, args, 1)?)?;
+                Ok(Value::from(builtins::json_parse(text)?))
+            }
+            "json_get" => {
+                self.expect_arity(function, args, 2)?;
+                let json = serde_json::Value::from(args[0].clone());
+                Ok(Value::String(builtins::json_get(
+                    &json,
+                    self.expect_string(&args[1])?,
+                )?))
+            }
+            "json_stringify" => {
+                let value = self.expect_arity(function, args, 1)?;
+                Ok(Value::String(builtins::json_stringify(
+                    &serde_json::Value::from(value.clone()),
+                )))
+            }
+            "regex_extract" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::String(builtins::regex_extract(
+                    self.expect_string(&args[0])?,
+                    self.expect_string(&args[1])?,
+                )?))
+            }
+            "regex_extract_all" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::List(
+                    builtins::regex_extract_all(
+                        self.expect_string(&args[0])?,
+                        self.expect_string(&args[1])?,
+                    )?
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+                ))
+            }
+            "regex_matches" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::Bool(builtins::regex_matches(
+                    self.expect_string(&args[0])?,
+                    self.expect_string(&args[1])?,
+                )?))
+            }
+            "regex_replace" => {
+                self.expect_arity(function, args, 3)?;
+                Ok(Value::String(builtins::regex_replace(
+                    self.expect_string(&args[0])?,
+                    self.expect_string(&args[1])?,
+                    self.expect_string(&args[2])?,
+                )?))
+            }
+            "text_split" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::List(
+                    builtins::text_split(
+                        self.expect_string(&args[0])?,
+                        self.expect_string(&args[1])?,
+                    )
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+                ))
+            }
+            "text_join" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::String(builtins::text_join(
+                    &self.expect_string_list(&args[0])?,
+                    self.expect_string(&args[1])?,
+                )))
+            }
+            "text_truncate" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::String(builtins::text_truncate(
+                    self.expect_string(&args[0])?,
+                    self.expect_i64(&args[1])?,
+                )))
+            }
+            "html_strip" => {
+                let text = self.expect_string(self.expect_arity(function, args, 1)?)?;
+                Ok(Value::String(builtins::html_strip(text)))
+            }
+            "text_count" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::Int(builtins::text_count(
+                    self.expect_string(&args[0])?,
+                    self.expect_string(&args[1])?,
+                )))
+            }
+            "text_contains_ci" => {
+                self.expect_arity(function, args, 2)?;
+                Ok(Value::Bool(builtins::text_contains_ci(
+                    self.expect_string(&args[0])?,
+                    self.expect_string(&args[1])?,
+                )))
+            }
+            "url_encode" => {
+                let text = self.expect_string(self.expect_arity(function, args, 1)?)?;
+                Ok(Value::String(builtins::url_encode(text)))
+            }
+            "url_decode" => {
+                let text = self.expect_string(self.expect_arity(function, args, 1)?)?;
+                Ok(Value::String(builtins::url_decode(text)))
+            }
+            other => Err(Error::Runtime(format!(
+                "task interpreter does not support builtin '{}'",
+                other
+            ))),
+        }
+    }
+
+    fn expect_string_list(&self, value: &Value) -> Result<Vec<String>> {
+        let values = value.as_list().ok_or_else(|| Error::TypeError {
+            expected: "list".to_string(),
+            actual: value.type_name().to_string(),
+        })?;
+        values
+            .iter()
+            .map(|value| self.expect_string(value).map(str::to_string))
+            .collect()
+    }
+
+    fn expect_i64(&self, value: &Value) -> Result<i64> {
+        value.as_int().ok_or_else(|| Error::TypeError {
+            expected: "int".to_string(),
+            actual: value.type_name().to_string(),
+        })
+    }
+
+    fn default_value_for_type(&self, ty: Option<&TypeIR>) -> Result<Value> {
+        match ty {
+            None => Ok(Value::Null),
+            Some(TypeIR::Any) => Ok(Value::Null),
+            Some(TypeIR::Bool) => Ok(Value::Bool(false)),
+            Some(TypeIR::Int) => Ok(Value::Int(0)),
+            Some(TypeIR::Float) => Ok(Value::Float(0.0)),
+            Some(TypeIR::String) => Ok(Value::String(String::new())),
+            Some(TypeIR::Bytes) => Ok(Value::Bytes(Vec::new())),
+            Some(TypeIR::Option { .. }) => Ok(Value::Null),
+            Some(TypeIR::List { .. }) => Ok(Value::List(Vec::new())),
+            Some(TypeIR::Map { .. }) => Ok(Value::Map(HashMap::new())),
+            Some(TypeIR::Struct { fields }) => {
+                let mut out = HashMap::new();
+                for (name, field_ty) in fields {
+                    out.insert(name.clone(), self.default_value_for_type(Some(field_ty))?);
+                }
+                Ok(Value::Map(out))
+            }
+            Some(TypeIR::Named { name }) => {
+                let definition = self.resolve_named_type(name)?;
+                let value = self.default_value_for_type(Some(definition))?;
+                match value {
+                    Value::Map(fields) if matches!(definition, TypeIR::Struct { .. }) => Ok(Value::Struct {
+                        type_name: name.clone(),
+                        fields,
+                    }),
+                    other => Ok(other),
+                }
+            }
+            Some(TypeIR::Result { ok, .. }) => Ok(Value::Result(Box::new(ResultValue::Ok(
+                self.default_value_for_type(Some(ok))?,
+            )))),
+        }
+    }
+
+    fn literal_to_value(&self, literal: &LiteralIR) -> Value {
+        match literal {
+            LiteralIR::Int { value } => Value::Int(*value),
+            LiteralIR::Float { value } => Value::Float(*value),
+            LiteralIR::String { value } => Value::String(value.clone()),
+            LiteralIR::Bool { value } => Value::Bool(*value),
+            LiteralIR::Null => Value::Null,
+        }
     }
 
     fn render_prompt(&self, prompt: &PromptIR, input: &Value) -> Result<String> {
@@ -332,6 +1086,22 @@ impl<'a> TaskInterpreter<'a> {
             Some(Value::Int(value)) => Ok(Some(*value as f64)),
             Some(value) => Err(Error::TypeError {
                 expected: "float".to_string(),
+                actual: value.type_name().to_string(),
+            }),
+            None => Ok(None),
+        }
+    }
+
+    fn harness_u64(
+        &self,
+        harness: &ResolvedHarness,
+        target: &str,
+        field: &str,
+    ) -> Result<Option<u64>> {
+        match harness.field_value(target, field) {
+            Some(Value::Int(value)) if *value >= 0 => Ok(Some(*value as u64)),
+            Some(value) => Err(Error::TypeError {
+                expected: "non-negative int".to_string(),
                 actual: value.type_name().to_string(),
             }),
             None => Ok(None),
@@ -918,6 +1688,14 @@ impl<'a> TaskInterpreter<'a> {
             .ok_or_else(|| Error::Runtime(format!("agent '{}' not found", name)))
     }
 
+    fn find_tool(&self, name: &str) -> Result<&ToolIR> {
+        self.ir
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .ok_or_else(|| Error::Runtime(format!("tool '{}' not found", name)))
+    }
+
     fn type_label_from_value(&self, value: &Value) -> String {
         match value {
             Value::Struct { type_name, .. } => format!("struct {}", type_name),
@@ -931,7 +1709,8 @@ mod tests {
     use super::*;
     use scaffold_ir::{
         ArtifactSlotIR, BindingIR, BindingPathIR, EmitFieldIR, HarnessIR, MetricIR, StageIR,
-        TypeDefIR, TypeDefKindIR,
+        ToolExprIR, ToolIR, ToolImplIR, ToolStatementIR, ToolVariantIR, TypeDefIR,
+        TypeDefKindIR,
     };
 
     fn string_type() -> TypeIR {
@@ -944,9 +1723,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn eval_expr_supports_field_access_and_builtins() {
-        let empty_ir = ScaffoldIR {
+    fn empty_ir() -> ScaffoldIR {
+        ScaffoldIR {
             version: scaffold_ir::IR_VERSION.to_string(),
             extern_crates: Vec::new(),
             foreign_modules: Vec::new(),
@@ -958,7 +1736,12 @@ mod tests {
             tasks: Vec::new(),
             harnesses: Vec::new(),
             objectives: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn eval_expr_supports_field_access_and_builtins() {
+        let empty_ir = empty_ir();
         let interpreter = TaskInterpreter::new(&empty_ir, Path::new("."));
         let ctx = ExecutionContext {
             input: Value::Map(HashMap::from([(
@@ -990,6 +1773,249 @@ mod tests {
         };
         let result = interpreter.eval_expr(&expr, &ctx).unwrap();
         assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn execute_task_runs_tool_stage_with_variant_override() {
+        let ir = ScaffoldIR {
+            tools: vec![ToolIR {
+                name: "formatter".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), string_type())]),
+                },
+                output: TypeIR::String,
+                implementation: Some(ToolImplIR::Expr {
+                    expr: ToolExprIR::Ident {
+                        name: "text".to_string(),
+                    },
+                }),
+                spec: None,
+                variants: vec![ToolVariantIR {
+                    name: "shout".to_string(),
+                    implementation: ToolImplIR::Expr {
+                        expr: ToolExprIR::Shell {
+                            command: "printf '{text}' | tr '[:lower:]' '[:upper:]'".to_string(),
+                        },
+                    },
+                }],
+            }],
+            types: vec![TypeDefIR {
+                name: "TaskOutput".to_string(),
+                kind: TypeDefKindIR::Type,
+                definition: TypeIR::Struct {
+                    fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                },
+            }],
+            tasks: vec![TaskIR {
+                name: "format_text".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), string_type())]),
+                },
+                output: TypeIR::Named {
+                    name: "TaskOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "formatted".to_string(),
+                    ty: TypeIR::String,
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "format".to_string(),
+                    stage_kind: StageKindIR::Tool,
+                    component: "formatter".to_string(),
+                    input: ExprIR::Ident {
+                        name: "input".to_string(),
+                    },
+                    output: "formatted".to_string(),
+                    when: None,
+                })],
+                emit: vec![EmitFieldIR {
+                    name: "answer".to_string(),
+                    value: ExprIR::Ident {
+                        name: "formatted".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "shouty".to_string(),
+                task: "format_text".to_string(),
+                defaults: Vec::new(),
+                bindings: vec![scaffold_ir::TargetBindingIR {
+                    target: "format".to_string(),
+                    bindings: vec![BindingIR {
+                        key: BindingPathIR {
+                            segments: vec!["variant".to_string()],
+                        },
+                        value: ExprIR::Literal {
+                            value: LiteralIR::String {
+                                value: "formatter::shout".to_string(),
+                            },
+                        },
+                    }],
+                }],
+                tunables: Vec::new(),
+            }],
+            ..empty_ir()
+        };
+
+        let output = execute_task(
+            &ir,
+            "format_text",
+            Some("shouty"),
+            Value::Map(HashMap::from([(
+                "text".to_string(),
+                Value::String("hello".to_string()),
+            )])),
+            Path::new("."),
+        )
+        .unwrap();
+
+        match output {
+            Value::Struct { type_name, fields } => {
+                assert_eq!(type_name, "TaskOutput");
+                assert_eq!(fields.get("answer"), Some(&Value::String("HELLO".into())));
+            }
+            other => panic!("expected struct output, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_task_runs_nested_tool_sequence() {
+        let analysis_type = TypeIR::Struct {
+            fields: HashMap::from([
+                ("words".to_string(), TypeIR::Int),
+                ("original".to_string(), TypeIR::String),
+            ]),
+        };
+        let ir = ScaffoldIR {
+            types: vec![
+                TypeDefIR {
+                    name: "Analysis".to_string(),
+                    kind: TypeDefKindIR::Artifact,
+                    definition: analysis_type.clone(),
+                },
+                TypeDefIR {
+                    name: "TaskOutput".to_string(),
+                    kind: TypeDefKindIR::Type,
+                    definition: analysis_type.clone(),
+                },
+            ],
+            tools: vec![
+                ToolIR {
+                    name: "count_words".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("text".to_string(), string_type())]),
+                    },
+                    output: TypeIR::Int,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Shell {
+                            command: "echo '{text}' | wc -w | tr -d ' '".to_string(),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+                ToolIR {
+                    name: "analyze_text".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("text".to_string(), string_type())]),
+                    },
+                    output: TypeIR::Named {
+                        name: "Analysis".to_string(),
+                    },
+                    implementation: Some(ToolImplIR::Sequence {
+                        statements: vec![
+                            ToolStatementIR {
+                                binding: Some("words".to_string()),
+                                expr: ToolExprIR::ToolCall {
+                                    tool: "count_words".to_string(),
+                                    args: vec![ToolExprIR::Ident {
+                                        name: "text".to_string(),
+                                    }],
+                                },
+                            },
+                            ToolStatementIR {
+                                binding: Some("original".to_string()),
+                                expr: ToolExprIR::Ident {
+                                    name: "text".to_string(),
+                                },
+                            },
+                        ],
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+            ],
+            tasks: vec![TaskIR {
+                name: "analyze".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), string_type())]),
+                },
+                output: TypeIR::Named {
+                    name: "TaskOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "analysis".to_string(),
+                    ty: TypeIR::Named {
+                        name: "Analysis".to_string(),
+                    },
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "analyze_text".to_string(),
+                    stage_kind: StageKindIR::Tool,
+                    component: "analyze_text".to_string(),
+                    input: ExprIR::Ident {
+                        name: "input".to_string(),
+                    },
+                    output: "analysis".to_string(),
+                    when: None,
+                })],
+                emit: vec![
+                    EmitFieldIR {
+                        name: "words".to_string(),
+                        value: ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "analysis".to_string(),
+                            }),
+                            field: "words".to_string(),
+                        },
+                    },
+                    EmitFieldIR {
+                        name: "original".to_string(),
+                        value: ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "analysis".to_string(),
+                            }),
+                            field: "original".to_string(),
+                        },
+                    },
+                ],
+            }],
+            ..empty_ir()
+        };
+
+        let output = execute_task(
+            &ir,
+            "analyze",
+            None,
+            Value::Map(HashMap::from([(
+                "text".to_string(),
+                Value::String("two words".to_string()),
+            )])),
+            Path::new("."),
+        )
+        .unwrap();
+
+        match output {
+            Value::Struct { type_name, fields } => {
+                assert_eq!(type_name, "TaskOutput");
+                assert_eq!(fields.get("words"), Some(&Value::Int(2)));
+                assert_eq!(
+                    fields.get("original"),
+                    Some(&Value::String("two words".into()))
+                );
+            }
+            other => panic!("expected struct output, got {:?}", other),
+        }
     }
 
     #[test]
