@@ -3,7 +3,7 @@
 use crate::util::{escape_string, to_ident};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use scaffold_ir::{ExprIR, LiteralIR};
+use scaffold_ir::{ExprFieldIR, ExprIR, LiteralIR};
 
 /// Generate Rust expression from ExprIR
 pub fn gen_expr(expr: &ExprIR) -> TokenStream {
@@ -18,7 +18,19 @@ pub fn gen_expr(expr: &ExprIR) -> TokenStream {
             function,
             args,
         } => gen_foreign_call(module, function, args),
+        ExprIR::List { elements } => gen_list(elements),
+        ExprIR::Record { fields } => gen_record(fields),
     }
+}
+
+fn gen_list(elements: &[ExprIR]) -> TokenStream {
+    let element_exprs: Vec<_> = elements.iter().map(gen_expr).collect();
+    quote! { vec![#(#element_exprs),*] }
+}
+
+fn gen_record(_fields: &[ExprFieldIR]) -> TokenStream {
+    let message = "record literals are not yet supported in Rust code generation";
+    quote! { compile_error!(#message) }
 }
 
 /// Generate foreign function call
@@ -251,6 +263,14 @@ fn gen_expr_with_field_prefixing(
                 quote! { #module_ident::#func_ident(#(#arg_exprs),*) }
             }
         }
+        ExprIR::List { elements } => {
+            let element_exprs: Vec<_> = elements
+                .iter()
+                .map(|e| gen_expr_with_field_prefixing(e, input_fields, state_fields))
+                .collect();
+            quote! { vec![#(#element_exprs),*] }
+        }
+        ExprIR::Record { fields } => gen_record(fields),
     }
 }
 
@@ -339,6 +359,14 @@ fn gen_expr_with_input_prefix(
                 quote! { #module_ident::#func_ident(#(#arg_exprs),*) }
             }
         }
+        ExprIR::List { elements } => {
+            let element_exprs: Vec<_> = elements
+                .iter()
+                .map(|e| gen_expr_with_input_prefix(e, prefix_all, input_fields))
+                .collect();
+            quote! { vec![#(#element_exprs),*] }
+        }
+        ExprIR::Record { fields } => gen_record(fields),
     }
 }
 
@@ -552,6 +580,14 @@ fn rewrite_expr(expr: &ExprIR, input_name: &str) -> TokenStream {
             let func_ident = format_ident!("{}", to_ident(function));
             quote! { #module_ident::#func_ident(#(#rewritten_args),*) }
         }
+        ExprIR::List { elements } => {
+            let rewritten_elements: Vec<_> = elements
+                .iter()
+                .map(|e| rewrite_expr(e, input_name))
+                .collect();
+            quote! { vec![#(#rewritten_elements),*] }
+        }
+        ExprIR::Record { fields } => gen_record(fields),
         _ => gen_expr(expr),
     }
 }

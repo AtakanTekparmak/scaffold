@@ -48,6 +48,8 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub enum Declaration {
     Type(TypeDecl),
+    /// artifact name = type_expr - typed declaration with task-flow semantics
+    Artifact(ArtifactDecl),
     /// extern crate name = "version"
     ExternCrate(ExternCrateDecl),
     /// foreign rust name { ... }
@@ -60,6 +62,12 @@ pub enum Declaration {
     Agent(AgentDecl),
     /// pipeline name { ... } - fixed sequence of prompts/tools
     Pipeline(PipelineDecl),
+    /// task name { ... } - typed orchestration unit
+    Task(TaskDecl),
+    /// harness name for task target { ... } - typed optimization overlay
+    Harness(HarnessDecl),
+    /// objective name for task target { ... } - evaluation and search contract
+    Objective(ObjectiveDecl),
 }
 
 /// Duration value (kept for potential future use)
@@ -120,6 +128,14 @@ pub struct TypeDecl {
     pub span: Span,
 }
 
+/// Artifact declaration
+#[derive(Debug, Clone)]
+pub struct ArtifactDecl {
+    pub name: Ident,
+    pub ty: Spanned<TypeExpr>,
+    pub span: Span,
+}
+
 /// Type expression
 #[derive(Debug, Clone)]
 pub enum TypeExpr {
@@ -169,6 +185,199 @@ pub struct FieldDecl {
     pub ty: Spanned<TypeExpr>,
 }
 
+// ============================================
+// Task / Harness / Objective Definitions
+// ============================================
+
+/// Artifact slot declaration inside a task
+#[derive(Debug, Clone)]
+pub struct ArtifactSlotDecl {
+    pub name: Ident,
+    pub ty: Spanned<TypeExpr>,
+    pub span: Span,
+}
+
+/// Task declaration - typed orchestration unit
+#[derive(Debug, Clone)]
+pub struct TaskDecl {
+    pub name: Ident,
+    pub input: Spanned<TypeExpr>,
+    pub output: Spanned<TypeExpr>,
+    pub artifacts: Vec<ArtifactSlotDecl>,
+    pub nodes: Vec<TaskNode>,
+    pub emit: Vec<EmitField>,
+    pub span: Span,
+}
+
+/// Node inside a task body
+#[derive(Debug, Clone)]
+pub enum TaskNode {
+    Stage(StageDecl),
+    Loop(TaskLoopDecl),
+    Branch(TaskBranchDecl),
+}
+
+/// Stage kind inside a task
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageKind {
+    Tool,
+    Prompt,
+    Agent,
+}
+
+/// Stage declaration
+#[derive(Debug, Clone)]
+pub struct StageDecl {
+    pub name: Ident,
+    pub kind: StageKind,
+    pub component: Ident,
+    pub input: Spanned<Expr>,
+    pub output: Ident,
+    pub when: Option<Spanned<Expr>>,
+    pub span: Span,
+}
+
+/// Explicit loop in a task
+#[derive(Debug, Clone)]
+pub struct TaskLoopDecl {
+    pub name: Ident,
+    pub max_iters: Spanned<Expr>,
+    pub carry: Vec<Ident>,
+    pub until: Spanned<Expr>,
+    pub nodes: Vec<TaskNode>,
+    pub span: Span,
+}
+
+/// Structured branch in a task
+#[derive(Debug, Clone)]
+pub struct TaskBranchDecl {
+    pub condition: Spanned<Expr>,
+    pub then_nodes: Vec<TaskNode>,
+    pub else_nodes: Vec<TaskNode>,
+    pub span: Span,
+}
+
+/// Output mapping from task-local artifacts to task output
+#[derive(Debug, Clone)]
+pub struct EmitField {
+    pub name: Ident,
+    pub value: Spanned<Expr>,
+    pub span: Span,
+}
+
+/// Harness declaration - typed overlay on a task
+#[derive(Debug, Clone)]
+pub struct HarnessDecl {
+    pub name: Ident,
+    pub task: Ident,
+    pub defaults: Vec<BindingStmt>,
+    pub binds: Vec<HarnessBindDecl>,
+    pub tune: Vec<TuneStmt>,
+    pub span: Span,
+}
+
+/// Targeted binding block for a specific stage or loop
+#[derive(Debug, Clone)]
+pub struct HarnessBindDecl {
+    pub target: Ident,
+    pub bindings: Vec<BindingStmt>,
+    pub span: Span,
+}
+
+/// Individual binding inside a harness block
+#[derive(Debug, Clone)]
+pub struct BindingStmt {
+    pub key: BindingPath,
+    pub value: Spanned<Expr>,
+    pub span: Span,
+}
+
+/// Dot-separated configurable path in a harness
+#[derive(Debug, Clone)]
+pub struct BindingPath {
+    pub segments: Vec<Ident>,
+    pub span: Span,
+}
+
+/// Tunable field declaration
+#[derive(Debug, Clone)]
+pub struct TuneStmt {
+    pub path: BindingPath,
+    pub operator: TuneOperator,
+    pub domain: FiniteDomain,
+    pub span: Span,
+}
+
+/// Tuning operator
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuneOperator {
+    In,
+    SubsetOf,
+}
+
+/// Finite search domain
+#[derive(Debug, Clone)]
+pub enum FiniteDomain {
+    List(Vec<Spanned<Expr>>),
+    Variants(String),
+}
+
+/// Objective declaration - evaluation and optimization contract
+#[derive(Debug, Clone)]
+pub struct ObjectiveDecl {
+    pub name: Ident,
+    pub task: Ident,
+    pub dataset: DatasetSpec,
+    pub harness: Ident,
+    pub repeats: Option<u64>,
+    pub metrics: Vec<MetricDecl>,
+    pub score: Spanned<Expr>,
+    pub split: Option<ObjectiveSplit>,
+    pub select: Option<ObjectiveSelect>,
+    pub span: Span,
+}
+
+/// Dataset source for an objective
+#[derive(Debug, Clone)]
+pub enum DatasetSpec {
+    File(String),
+    Inline(Vec<InlineDatasetCase>),
+}
+
+/// Inline dataset case
+#[derive(Debug, Clone)]
+pub struct InlineDatasetCase {
+    pub input: Spanned<Expr>,
+    pub expected: Option<Spanned<Expr>>,
+    pub id: Option<String>,
+    pub span: Span,
+}
+
+/// Metric declaration inside an objective
+#[derive(Debug, Clone)]
+pub struct MetricDecl {
+    pub name: Ident,
+    pub expr: Spanned<Expr>,
+    pub span: Span,
+}
+
+/// Dataset split declaration
+#[derive(Debug, Clone)]
+pub struct ObjectiveSplit {
+    pub train: f64,
+    pub val: f64,
+    pub test: f64,
+    pub span: Span,
+}
+
+/// Selection policy declaration
+#[derive(Debug, Clone)]
+pub struct ObjectiveSelect {
+    pub primary: Spanned<Expr>,
+    pub tie_breakers: Vec<Spanned<Expr>>,
+    pub span: Span,
+}
+
 /// Expression
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -188,8 +397,19 @@ pub enum Expr {
         function: String,
         args: Vec<Spanned<Expr>>,
     },
+    /// List literal: [expr, ...]
+    ListLiteral(Vec<Spanned<Expr>>),
+    /// Record literal: { field: expr, ... }
+    RecordLiteral(Vec<ExprField>),
     /// Parenthesized expression
     Paren(Box<Spanned<Expr>>),
+}
+
+/// Record field in an expression literal
+#[derive(Debug, Clone)]
+pub struct ExprField {
+    pub key: Ident,
+    pub value: Spanned<Expr>,
 }
 
 /// Literal values
@@ -561,9 +781,7 @@ pub enum PipelineCall {
     /// Evaluate an expression: e.g., field access or literal/identifier
     Expr(Spanned<ToolExpr>),
     /// Parallel branches: parallel { { ... } { ... } }
-    Parallel {
-        branches: Vec<Vec<PipelineStep>>,
-    },
+    Parallel { branches: Vec<Vec<PipelineStep>> },
     /// Conditional branch: if cond { ... } else { ... }
     If {
         condition: Spanned<Expr>,

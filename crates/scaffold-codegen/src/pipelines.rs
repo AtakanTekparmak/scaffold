@@ -5,7 +5,8 @@
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use scaffold_ir::{
-    AgentIR, PipelineCallIR, PipelineIR, PipelineStepIR, PromptIR, ToolExprIR, ToolIR, TypeDefIR,
+    AgentIR, ExprIR, PipelineCallIR, PipelineIR, PipelineStepIR, PromptIR, ToolExprIR, ToolIR,
+    TypeDefIR,
 };
 
 use crate::types::gen_type;
@@ -109,11 +110,13 @@ pub fn gen_pipeline_module(
         _ => std::collections::HashSet::new(),
     };
 
-    // Generate step code
+    // Generate step code (including reward evaluation if present)
     let step_code = gen_pipeline_steps(
+        pipeline_name,
         &pipeline.steps,
         &input_fields,
         &pipeline.output,
+        &pipeline.reward,
         tools_index,
         prompts_index,
         agents_index,
@@ -208,11 +211,59 @@ fn resolve_type<'a>(
     }
 }
 
+fn tool_ident_arg_positions(
+    args: &[ToolExprIR],
+) -> Option<std::collections::HashMap<String, usize>> {
+    let mut positions = std::collections::HashMap::new();
+    for (idx, arg) in args.iter().enumerate() {
+        match arg {
+            ToolExprIR::Ident { name } => {
+                if positions.insert(name.clone(), idx).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(positions)
+}
+
+/// Generate reward evaluation code for a pipeline.
+/// Identifiers resolve against local bindings from pipeline steps.
+fn gen_pipeline_reward(
+    pipeline_name: &str,
+    reward: &Option<ExprIR>,
+    local_vars: &std::collections::HashSet<String>,
+) -> TokenStream {
+    match reward {
+        Some(expr) => {
+            let pipeline_name_lit = Literal::string(pipeline_name);
+            // Use gen_pipeline_expr which already resolves local step bindings directly
+            let reward_expr =
+                gen_pipeline_expr(expr, &std::collections::HashSet::new(), local_vars);
+            quote! {
+                {
+                    let __reward_val = #reward_expr;
+                    let __reward_f64: f64 = if __reward_val { 1.0 } else { 0.0 };
+                    eprintln!(
+                        "{{\"kind\":\"reward\",\"component\":\"{}\",\"component_type\":\"pipeline\",\"value\":{}}}",
+                        #pipeline_name_lit,
+                        __reward_f64
+                    );
+                }
+            }
+        }
+        None => quote! {},
+    }
+}
+
 /// Generate code for pipeline steps
 fn gen_pipeline_steps(
+    pipeline_name: &str,
     steps: &[PipelineStepIR],
     input_fields: &std::collections::HashSet<String>,
     output_type: &TypeIR,
+    reward: &Option<ExprIR>,
     tools_index: &std::collections::HashMap<String, ToolIR>,
     prompts_index: &std::collections::HashMap<String, PromptIR>,
     agents_index: &std::collections::HashMap<String, AgentIR>,
@@ -220,6 +271,7 @@ fn gen_pipeline_steps(
 ) -> TokenStream {
     let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (step_code, last_expr, local_vars) = gen_pipeline_steps_with_locals(
+        pipeline_name,
         steps,
         input_fields,
         tools_index,
@@ -227,6 +279,9 @@ fn gen_pipeline_steps(
         agents_index,
         &empty_locals,
     );
+
+    // Generate reward evaluation using local bindings
+    let reward_code = gen_pipeline_reward(pipeline_name, reward, &local_vars);
 
     // The last step's result should be returned
     if steps.is_empty() {
@@ -253,17 +308,19 @@ fn gen_pipeline_steps(
                 return quote! {
                     #step_code
                     let __output = Output { #(#field_inits),* };
+                    #reward_code
                     Ok(__output)
                 };
             }
         }
         // Fallback: return last step result
         let fallback = last_expr.unwrap_or_else(|| quote! { Default::default() });
-        quote! { #step_code Ok(#fallback) }
+        quote! { #step_code #reward_code Ok(#fallback) }
     }
 }
 
 fn gen_pipeline_steps_with_locals(
+    pipeline_name: &str,
     steps: &[PipelineStepIR],
     input_fields: &std::collections::HashSet<String>,
     tools_index: &std::collections::HashMap<String, ToolIR>,
@@ -282,6 +339,7 @@ fn gen_pipeline_steps_with_locals(
 
     for (idx, step) in steps.iter().enumerate() {
         let call_code = gen_pipeline_call(
+            pipeline_name,
             &step.call,
             input_fields,
             &local_vars,
@@ -294,9 +352,35 @@ fn gen_pipeline_steps_with_locals(
             Some(name) => (format_ident!("{}", to_ident(name)), name.clone()),
             None => (format_ident!("__step_{}", idx), format!("__step_{}", idx)),
         };
+        let pipeline_name_lit = Literal::string(pipeline_name);
+        let step_label_lit = Literal::string(&binding_name);
 
         step_codes.push(quote! {
-            let #binding_ident = #call_code;
+            if std::env::var("SCAFFOLD_LOG").is_ok() {
+                eprintln!("[pipeline:{}] step_start: {}", #pipeline_name_lit, #step_label_lit);
+            }
+            let __step_result: scaffold_runtime::Result<_> = async {
+                scaffold_runtime::Result::Ok(#call_code)
+            }.await;
+            let #binding_ident = match __step_result {
+                scaffold_runtime::Result::Ok(value) => {
+                    if std::env::var("SCAFFOLD_LOG").is_ok() {
+                        eprintln!("[pipeline:{}] step_ok: {}", #pipeline_name_lit, #step_label_lit);
+                    }
+                    value
+                }
+                scaffold_runtime::Result::Err(err) => {
+                    if std::env::var("SCAFFOLD_LOG").is_ok() {
+                        eprintln!(
+                            "[pipeline:{}] step_error: {} -> {}",
+                            #pipeline_name_lit,
+                            #step_label_lit,
+                            err
+                        );
+                    }
+                    return scaffold_runtime::Result::Err(err);
+                }
+            };
         });
 
         local_vars.insert(binding_name);
@@ -308,6 +392,7 @@ fn gen_pipeline_steps_with_locals(
 
 /// Generate code for a pipeline call
 fn gen_pipeline_call(
+    pipeline_name: &str,
     call: &PipelineCallIR,
     input_fields: &std::collections::HashSet<String>,
     local_vars: &std::collections::HashSet<String>,
@@ -328,16 +413,30 @@ fn gen_pipeline_call(
             if let Some(prompt_ir) = prompts_index.get(name) {
                 match &prompt_ir.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
+                        let named_positions = tool_ident_arg_positions(args);
+                        let use_named_mapping = named_positions
+                            .as_ref()
+                            .map(|m| fields.keys().all(|k| m.contains_key(k)))
+                            .unwrap_or(false);
                         // Construct the prompt's Input struct
                         let field_inits: Vec<_> = fields
                             .keys()
                             .enumerate()
                             .map(|(i, k)| {
                                 let fname = format_ident!("{}", to_ident(k));
-                                let val = arg_codes
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or(quote! { Default::default() });
+                                let val = if use_named_mapping {
+                                    named_positions
+                                        .as_ref()
+                                        .and_then(|m| m.get(k))
+                                        .and_then(|pos| arg_codes.get(*pos))
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                } else {
+                                    arg_codes
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                };
                                 quote! { #fname: #val }
                             })
                             .collect();
@@ -373,27 +472,47 @@ fn gen_pipeline_call(
             }
         }
         PipelineCallIR::Tool { name, args } => {
-            let tool_struct = format_ident!("{}Tool", to_pascal_case(name));
-            let tool_mod = format_ident!("{}", to_snake_case(name));
             let arg_codes: Vec<_> = args
                 .iter()
                 .map(|a| gen_tool_expr(a, input_fields, local_vars))
                 .collect();
 
+            // Check if this is a builtin function call
+            if crate::tools::is_builtin(name) {
+                return crate::tools::gen_builtin_call(name, &arg_codes);
+            }
+
+            let tool_struct = format_ident!("{}Tool", to_pascal_case(name));
+            let tool_mod = format_ident!("{}", to_snake_case(name));
+
             // Look up the tool to determine its input type
             if let Some(tool_ir) = tools_index.get(name) {
                 match &tool_ir.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
+                        let named_positions = tool_ident_arg_positions(args);
+                        let use_named_mapping = named_positions
+                            .as_ref()
+                            .map(|m| fields.keys().all(|k| m.contains_key(k)))
+                            .unwrap_or(false);
                         // Construct the tool's Input struct
                         let field_inits: Vec<_> = fields
                             .keys()
                             .enumerate()
                             .map(|(i, k)| {
                                 let fname = format_ident!("{}", to_ident(k));
-                                let val = arg_codes
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or(quote! { Default::default() });
+                                let val = if use_named_mapping {
+                                    named_positions
+                                        .as_ref()
+                                        .and_then(|m| m.get(k))
+                                        .and_then(|pos| arg_codes.get(*pos))
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                } else {
+                                    arg_codes
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                };
                                 quote! { #fname: #val }
                             })
                             .collect();
@@ -447,15 +566,29 @@ fn gen_pipeline_call(
             if let Some(agent_ir) = agents_index.get(name) {
                 match &agent_ir.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
+                        let named_positions = tool_ident_arg_positions(args);
+                        let use_named_mapping = named_positions
+                            .as_ref()
+                            .map(|m| fields.keys().all(|k| m.contains_key(k)))
+                            .unwrap_or(false);
                         let field_inits: Vec<_> = fields
                             .keys()
                             .enumerate()
                             .map(|(i, k)| {
                                 let fname = format_ident!("{}", to_ident(k));
-                                let val = arg_codes
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or(quote! { Default::default() });
+                                let val = if use_named_mapping {
+                                    named_positions
+                                        .as_ref()
+                                        .and_then(|m| m.get(k))
+                                        .and_then(|pos| arg_codes.get(*pos))
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                } else {
+                                    arg_codes
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                };
                                 quote! { #fname: #val }
                             })
                             .collect();
@@ -498,6 +631,7 @@ fn gen_pipeline_call(
         } => {
             let cond_code = gen_pipeline_expr(condition, input_fields, local_vars);
             let (then_code, then_last, _) = gen_pipeline_steps_with_locals(
+                pipeline_name,
                 then_steps,
                 input_fields,
                 tools_index,
@@ -506,6 +640,7 @@ fn gen_pipeline_call(
                 local_vars,
             );
             let (else_code, else_last, _) = gen_pipeline_steps_with_locals(
+                pipeline_name,
                 else_steps,
                 input_fields,
                 tools_index,
@@ -536,6 +671,7 @@ fn gen_pipeline_call(
             for (idx, arm) in arms.iter().enumerate() {
                 let pat = gen_pipeline_expr(&arm.pattern, input_fields, local_vars);
                 let (arm_code, arm_last, _) = gen_pipeline_steps_with_locals(
+                    pipeline_name,
                     &arm.steps,
                     input_fields,
                     tools_index,
@@ -579,6 +715,7 @@ fn gen_pipeline_call(
 
             for (idx, branch) in branches.iter().enumerate() {
                 let (branch_code, _branch_last, _) = gen_pipeline_steps_with_locals(
+                    pipeline_name,
                     branch,
                     input_fields,
                     tools_index,
@@ -716,6 +853,14 @@ fn gen_pipeline_expr(
                 .collect();
             quote! { #module_ident::#func_ident(#(#arg_codes),*) }
         }
+        scaffold_ir::ExprIR::List { elements } => {
+            let item_codes: Vec<_> = elements
+                .iter()
+                .map(|e| gen_pipeline_expr(e, input_fields, local_vars))
+                .collect();
+            quote! { vec![#(#item_codes),*] }
+        }
+        scaffold_ir::ExprIR::Record { .. } => crate::expr::gen_expr(expr),
     }
 }
 

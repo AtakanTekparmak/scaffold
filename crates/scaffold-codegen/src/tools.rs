@@ -16,31 +16,93 @@ use crate::util::{to_ident, to_pascal_case, to_snake_case};
 /// Generate input/output type - either use existing type or generate inline struct
 use scaffold_ir::ExprIR;
 
+/// Set of builtin function names recognized by the codegen.
+/// When a ToolCall name matches, we generate `scaffold_runtime::builtins::xxx()`
+/// instead of `crate::tools::XxxTool::new().execute()`.
+const BUILTIN_NAMES: &[&str] = &[
+    "http_get",
+    "http_get_with_headers",
+    "http_post",
+    "json_parse",
+    "json_get",
+    "json_stringify",
+    "regex_extract",
+    "regex_extract_all",
+    "regex_matches",
+    "regex_replace",
+    "text_split",
+    "text_join",
+    "text_truncate",
+    "html_strip",
+    "text_count",
+    "text_contains_ci",
+    "url_encode",
+    "url_decode",
+];
+
+/// Check if a function name is a known builtin.
+pub fn is_builtin(name: &str) -> bool {
+    BUILTIN_NAMES.contains(&name)
+}
+
+/// Generate a builtin function call: `scaffold_runtime::builtins::xxx(args)?`
+/// Arguments are passed by reference for string-typed args.
+pub fn gen_builtin_call(name: &str, arg_codes: &[TokenStream]) -> TokenStream {
+    let func = format_ident!("{}", name);
+    if arg_codes.is_empty() {
+        quote! { scaffold_runtime::builtins::#func()? }
+    } else {
+        // Pass args by reference
+        quote! { scaffold_runtime::builtins::#func(#(&#arg_codes),*)? }
+    }
+}
+
 /// Parse shell command template and generate code with variable interpolation
 /// Returns (generated_code, has_variables)
 fn interpolate_shell_command(command: &str) -> (TokenStream, bool) {
-    use regex::Regex;
+    let mut placeholders: Vec<String> = Vec::new();
+    let mut format_str = String::with_capacity(command.len());
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0usize;
 
-    // Find all {variable} patterns
-    let re = Regex::new(r"\{(\w+)\}").unwrap();
-    let mut vars: Vec<String> = Vec::new();
-
-    for cap in re.captures_iter(command) {
-        let var_name = cap[1].to_string();
-        if !vars.contains(&var_name) {
-            vars.push(var_name);
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '{' {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            if j > start && j < chars.len() && chars[j] == '}' {
+                let name: String = chars[start..j].iter().collect();
+                placeholders.push(name);
+                format_str.push_str("{}");
+                i = j + 1;
+                continue;
+            }
+            // Literal '{' for format! strings.
+            format_str.push_str("{{");
+            i += 1;
+            continue;
         }
+        if ch == '}' {
+            // Literal '}' for format! strings.
+            format_str.push_str("}}");
+            i += 1;
+            continue;
+        }
+        format_str.push(ch);
+        i += 1;
     }
 
-    if vars.is_empty() {
+    if placeholders.is_empty() {
         return (quote! {}, false);
     }
 
-    // Replace {var} with {} for format! macro
-    let format_str = re.replace_all(command, "{}").to_string();
-
-    // Generate the variable accessors
-    let var_accesses: Vec<_> = vars
+    // Generate one accessor per placeholder occurrence so repeated
+    // placeholders (e.g. {root} appearing multiple times) are matched
+    // by the correct number of format! arguments.
+    let var_accesses: Vec<_> = placeholders
         .iter()
         .map(|v| {
             let var_ident = format_ident!("{}", v);
@@ -55,6 +117,146 @@ fn interpolate_shell_command(command: &str) -> (TokenStream, bool) {
     (code, true)
 }
 
+fn expr_ident_arg_positions(args: &[ExprIR]) -> Option<std::collections::HashMap<String, usize>> {
+    let mut positions = std::collections::HashMap::new();
+    for (idx, arg) in args.iter().enumerate() {
+        match arg {
+            ExprIR::Ident { name } => {
+                if positions.insert(name.clone(), idx).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(positions)
+}
+
+fn tool_ident_arg_positions(
+    args: &[ToolExprIR],
+) -> Option<std::collections::HashMap<String, usize>> {
+    let mut positions = std::collections::HashMap::new();
+    for (idx, arg) in args.iter().enumerate() {
+        match arg {
+            ToolExprIR::Ident { name } => {
+                if positions.insert(name.clone(), idx).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(positions)
+}
+
+/// Generate an expression in tool context where identifiers may refer to:
+/// - local bindings in the tool body
+/// - input fields (prefixed as input.<field>)
+/// - helper/global symbols
+fn gen_expr_with_tool_ctx(
+    expr: &ExprIR,
+    input_fields: &std::collections::HashSet<String>,
+    local_vars: &std::collections::HashSet<String>,
+) -> TokenStream {
+    match expr {
+        ExprIR::Literal { value } => gen_literal(value),
+        ExprIR::Ident { name } => {
+            let ident = format_ident!("{}", to_ident(name));
+            if local_vars.contains(name) {
+                quote! { #ident.clone() }
+            } else if input_fields.contains(name) {
+                quote! { input.#ident.clone() }
+            } else {
+                quote! { #ident.clone() }
+            }
+        }
+        ExprIR::FieldAccess { base, field } => {
+            let base_code = gen_expr_with_tool_ctx(base, input_fields, local_vars);
+            let field_ident = format_ident!("{}", to_ident(field));
+            quote! { #base_code.#field_ident.clone() }
+        }
+        ExprIR::Binary { left, op, right } => {
+            let left_code = gen_expr_with_tool_ctx(left, input_fields, local_vars);
+            let right_code = gen_expr_with_tool_ctx(right, input_fields, local_vars);
+            match op.as_str() {
+                "==" => quote! { (#left_code == #right_code) },
+                "!=" => quote! { (#left_code != #right_code) },
+                "<" => quote! { (#left_code < #right_code) },
+                "<=" => quote! { (#left_code <= #right_code) },
+                ">" => quote! { (#left_code > #right_code) },
+                ">=" => quote! { (#left_code >= #right_code) },
+                "&&" | "and" => quote! { (#left_code && #right_code) },
+                "||" | "or" => quote! { (#left_code || #right_code) },
+                "+" => quote! { (#left_code + #right_code) },
+                "-" => quote! { (#left_code - #right_code) },
+                "*" => quote! { (#left_code * #right_code) },
+                "/" => quote! { (#left_code / #right_code) },
+                "%" => quote! { (#left_code % #right_code) },
+                other => {
+                    let method = format_ident!("{}", to_ident(other));
+                    quote! { #left_code.#method(#right_code) }
+                }
+            }
+        }
+        ExprIR::Call { function, args } => {
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_expr_with_tool_ctx(a, input_fields, local_vars))
+                .collect();
+            let func_ident = format_ident!("{}", to_ident(function));
+            let builtins = [
+                "len",
+                "is_empty",
+                "contains",
+                "is_some",
+                "is_none",
+                "unwrap",
+                "unwrap_or",
+                "abs",
+                "min",
+                "max",
+                "not",
+            ];
+            if builtins.contains(&function.as_str()) {
+                if arg_codes.is_empty() {
+                    quote! { #func_ident() }
+                } else {
+                    quote! { #func_ident(#(#arg_codes),*) }
+                }
+            } else if arg_codes.is_empty() {
+                quote! { #func_ident() }
+            } else {
+                quote! { #func_ident(#(&#arg_codes),*) }
+            }
+        }
+        ExprIR::ForeignCall {
+            module,
+            function,
+            args,
+        } => {
+            let module_ident = format_ident!("{}", to_ident(module));
+            let func_ident = format_ident!("{}", to_ident(function));
+            let arg_codes: Vec<_> = args
+                .iter()
+                .map(|a| gen_expr_with_tool_ctx(a, input_fields, local_vars))
+                .collect();
+            if arg_codes.is_empty() {
+                quote! { #module_ident::#func_ident() }
+            } else {
+                quote! { #module_ident::#func_ident(#(#arg_codes),*) }
+            }
+        }
+        ExprIR::List { elements } => {
+            let item_codes: Vec<_> = elements
+                .iter()
+                .map(|e| gen_expr_with_tool_ctx(e, input_fields, local_vars))
+                .collect();
+            quote! { vec![#(#item_codes),*] }
+        }
+        ExprIR::Record { .. } => gen_expr(expr),
+    }
+}
+
 /// Generate expression, treating function calls as potential tool calls
 fn gen_expr_or_tool_call(
     expr: &ExprIR,
@@ -64,28 +266,48 @@ fn gen_expr_or_tool_call(
 ) -> TokenStream {
     match expr {
         ExprIR::Call { function, args } => {
-            // Treat as a tool call - generate proper tool invocation
-            let tool_struct = format_ident!("{}Tool", to_pascal_case(function));
-            let tool_mod = format_ident!("{}", to_snake_case(function));
             let arg_codes: Vec<_> = args
                 .iter()
                 .map(|arg| gen_expr_or_tool_call(arg, tools_index, input_fields, local_vars))
                 .collect();
 
+            // Check if this is a builtin function call
+            if is_builtin(function) {
+                return gen_builtin_call(function, &arg_codes);
+            }
+
+            // Treat as a tool call - generate proper tool invocation
+            let tool_struct = format_ident!("{}Tool", to_pascal_case(function));
+            let tool_mod = format_ident!("{}", to_snake_case(function));
+
             // Look up the tool to determine its input type
             if let Some(tool_ir) = tools_index.get(function) {
                 match &tool_ir.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
+                        let named_positions = expr_ident_arg_positions(args);
+                        let use_named_mapping = named_positions
+                            .as_ref()
+                            .map(|m| fields.keys().all(|k| m.contains_key(k)))
+                            .unwrap_or(false);
                         // Construct the tool's Input struct
                         let field_inits: Vec<_> = fields
                             .keys()
                             .enumerate()
                             .map(|(i, k)| {
                                 let fname = format_ident!("{}", to_ident(k));
-                                let val = arg_codes
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or(quote! { Default::default() });
+                                let val = if use_named_mapping {
+                                    named_positions
+                                        .as_ref()
+                                        .and_then(|m| m.get(k))
+                                        .and_then(|pos| arg_codes.get(*pos))
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                } else {
+                                    arg_codes
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                };
                                 quote! { #fname: #val }
                             })
                             .collect();
@@ -463,7 +685,7 @@ fn gen_tool_impl_with_ctx(
         ToolImplIR::Expr { expr } => {
             let expr_code =
                 gen_tool_expr_with_ctx(expr, expected, tools_index, input_fields, local_vars);
-            quote! { Ok(#expr_code) }
+            quote! { scaffold_runtime::Result::Ok(#expr_code) }
         }
         ToolImplIR::Sequence { statements } => {
             // Track local variables incrementally
@@ -501,7 +723,7 @@ fn gen_tool_impl_with_ctx(
                         return quote! {
                             #(#stmts)*
                             let __output = Output { #(#field_inits),* };
-                            Ok(__output)
+                            scaffold_runtime::Result::Ok(__output)
                         };
                     }
                 }
@@ -513,14 +735,14 @@ fn gen_tool_impl_with_ctx(
                     let last_ident = format_ident!("{}", name);
                     return quote! {
                         #(#stmts)*
-                        Ok(#last_ident)
+                        scaffold_runtime::Result::Ok(#last_ident)
                     };
                 }
             }
 
             quote! {
                 #(#stmts)*
-                Ok(Default::default())
+                scaffold_runtime::Result::Ok(Default::default())
             }
         }
         ToolImplIR::Parallel { statements } => {
@@ -559,7 +781,7 @@ fn gen_tool_impl_with_ctx(
                             // TODO: Execute in parallel (currently sequential)
                             #(#stmts)*
                             let __output = Output { #(#field_inits),* };
-                            Ok(__output)
+                            scaffold_runtime::Result::Ok(__output)
                         };
                     }
                 }
@@ -572,7 +794,7 @@ fn gen_tool_impl_with_ctx(
                     return quote! {
                         // TODO: Execute in parallel (currently sequential)
                         #(#stmts)*
-                        Ok(#last_ident)
+                        scaffold_runtime::Result::Ok(#last_ident)
                     };
                 }
             }
@@ -580,7 +802,7 @@ fn gen_tool_impl_with_ctx(
             quote! {
                 // TODO: Execute in parallel (currently sequential)
                 #(#stmts)*
-                Ok(Default::default())
+                scaffold_runtime::Result::Ok(Default::default())
             }
         }
     }
@@ -630,25 +852,45 @@ fn gen_tool_expr_with_ctx(
             }
         }
         ToolExprIR::ToolCall { tool, args } => {
-            let tool_struct = format_ident!("{}Tool", to_pascal_case(tool));
-            let callee_mod = format_ident!("{}", to_snake_case(tool));
             let arg_codes: Vec<_> = args
                 .iter()
                 .map(|a| gen_tool_expr_with_ctx(a, None, tools_index, input_fields, local_vars))
                 .collect();
 
+            // Check if this is a builtin function call
+            if is_builtin(tool) {
+                return gen_builtin_call(tool, &arg_codes);
+            }
+
+            let tool_struct = format_ident!("{}Tool", to_pascal_case(tool));
+            let callee_mod = format_ident!("{}", to_snake_case(tool));
+
             if let Some(callee) = tools_index.get(tool) {
                 match &callee.input {
                     TypeIR::Struct { fields } if !fields.is_empty() => {
+                        let named_positions = tool_ident_arg_positions(args);
+                        let use_named_mapping = named_positions
+                            .as_ref()
+                            .map(|m| fields.keys().all(|k| m.contains_key(k)))
+                            .unwrap_or(false);
                         let field_inits: Vec<_> = fields
                             .keys()
                             .enumerate()
                             .map(|(i, k)| {
                                 let fname = format_ident!("{}", to_ident(k));
-                                let val = arg_codes
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or(quote! { Default::default() });
+                                let val = if use_named_mapping {
+                                    named_positions
+                                        .as_ref()
+                                        .and_then(|m| m.get(k))
+                                        .and_then(|pos| arg_codes.get(*pos))
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                } else {
+                                    arg_codes
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or(quote! { Default::default() })
+                                };
                                 quote! { #fname: #val }
                             })
                             .collect();
@@ -732,7 +974,7 @@ fn gen_tool_expr_with_ctx(
             then_branch,
             else_branch,
         } => {
-            let cond_code = gen_expr(condition);
+            let cond_code = gen_expr_with_tool_ctx(condition, input_fields, local_vars);
             let then_code = gen_tool_impl_with_ctx(
                 then_branch,
                 expected,
@@ -744,14 +986,16 @@ fn gen_tool_expr_with_ctx(
                 Some(branch) => {
                     gen_tool_impl_with_ctx(branch, expected, tools_index, input_fields, local_vars)
                 }
-                None => quote! { Ok(Default::default()) },
+                None => quote! { scaffold_runtime::Result::Ok(Default::default()) },
             };
             quote! {
-                if #cond_code {
-                    #then_code
-                } else {
-                    #else_code
-                }?
+                {
+                    if #cond_code {
+                        (#then_code)?
+                    } else {
+                        (#else_code)?
+                    }
+                }
             }
         }
         ToolExprIR::Match { scrutinee, arms } => {
@@ -760,7 +1004,7 @@ fn gen_tool_expr_with_ctx(
             let arm_codes: Vec<_> = arms
                 .iter()
                 .map(|arm| {
-                    let pattern = gen_expr(&arm.pattern);
+                    let pattern = gen_expr_with_tool_ctx(&arm.pattern, input_fields, local_vars);
                     let body = gen_tool_impl_with_ctx(
                         &arm.body,
                         expected,
@@ -769,15 +1013,17 @@ fn gen_tool_expr_with_ctx(
                         local_vars,
                     );
                     quote! {
-                        #pattern => { #body }
+                        #pattern => { (#body)? }
                     }
                 })
                 .collect();
             quote! {
-                match #scrutinee_code {
-                    #(#arm_codes)*
-                    _ => Ok(Default::default()),
-                }?
+                {
+                    match #scrutinee_code {
+                        #(#arm_codes)*
+                        _ => Default::default(),
+                    }
+                }
             }
         }
         ToolExprIR::Literal { value } => gen_literal(value),
@@ -822,10 +1068,10 @@ fn gen_tool_expr_with_ctx(
                 gen_tool_impl_with_ctx(body, None, tools_index, input_fields, &body_locals);
             quote! {
                 {
-                    let mut __for_result = Ok(Default::default());
+                    let mut __for_result = scaffold_runtime::Result::Ok(Default::default());
                     for #var_ident in #iterable_code.into_iter() {
                         match (|| { #body_code })() {
-                            Ok(val) => __for_result = Ok(val),
+                            Ok(val) => __for_result = scaffold_runtime::Result::Ok(val),
                             Err(scaffold_runtime::Error::LoopBreak) => break,
                             Err(scaffold_runtime::Error::LoopContinue) => continue,
                             Err(e) => return Err(e),
@@ -836,15 +1082,15 @@ fn gen_tool_expr_with_ctx(
             }
         }
         ToolExprIR::While { condition, body } => {
-            let cond_code = gen_expr(condition);
+            let cond_code = gen_expr_with_tool_ctx(condition, input_fields, local_vars);
             let body_code =
                 gen_tool_impl_with_ctx(body, None, tools_index, input_fields, local_vars);
             quote! {
                 {
-                    let mut __while_result = Ok(Default::default());
+                    let mut __while_result = scaffold_runtime::Result::Ok(Default::default());
                     while #cond_code {
                         match (|| { #body_code })() {
-                            Ok(val) => __while_result = Ok(val),
+                            Ok(val) => __while_result = scaffold_runtime::Result::Ok(val),
                             Err(scaffold_runtime::Error::LoopBreak) => break,
                             Err(scaffold_runtime::Error::LoopContinue) => continue,
                             Err(e) => return Err(e),
@@ -859,10 +1105,10 @@ fn gen_tool_expr_with_ctx(
                 gen_tool_impl_with_ctx(body, None, tools_index, input_fields, local_vars);
             quote! {
                 {
-                    let mut __loop_result = Ok(Default::default());
+                    let mut __loop_result = scaffold_runtime::Result::Ok(Default::default());
                     loop {
                         match (|| { #body_code })() {
-                            Ok(val) => __loop_result = Ok(val),
+                            Ok(val) => __loop_result = scaffold_runtime::Result::Ok(val),
                             Err(scaffold_runtime::Error::LoopBreak) => break,
                             Err(scaffold_runtime::Error::LoopContinue) => continue,
                             Err(e) => return Err(e),

@@ -48,14 +48,21 @@ impl<'source> Parser<'source> {
         let token = self.peek_token()?;
         match &token.token {
             Token::Type => Ok(Declaration::Type(self.parse_type_decl()?)),
+            Token::Artifact => Ok(Declaration::Artifact(self.parse_artifact_decl()?)),
             Token::Extern => Ok(Declaration::ExternCrate(self.parse_extern_crate_decl()?)),
             Token::Foreign => Ok(Declaration::Foreign(self.parse_foreign_decl()?)),
             Token::Tool => Ok(Declaration::Tool(self.parse_tool_decl()?)),
             Token::Prompt => Ok(Declaration::Prompt(self.parse_prompt_decl()?)),
             Token::Agent => Ok(Declaration::Agent(self.parse_agent_decl()?)),
             Token::Pipeline => Ok(Declaration::Pipeline(self.parse_pipeline_decl()?)),
+            Token::Task => Ok(Declaration::Task(self.parse_task_decl()?)),
+            Token::Harness => Ok(Declaration::Harness(self.parse_harness_decl()?)),
+            Token::Objective => Ok(Declaration::Objective(self.parse_objective_decl()?)),
             _ => Err(ParseError::new(
-                format!("expected declaration (type, extern, foreign, tool, prompt, agent, pipeline), found '{}'", token.token),
+                format!(
+                    "expected declaration (type, artifact, extern, foreign, tool, prompt, agent, pipeline, task, harness, objective), found '{}'",
+                    token.token
+                ),
                 token.span,
             )),
         }
@@ -70,6 +77,19 @@ impl<'source> Parser<'source> {
         let ty = self.parse_type_expr()?;
 
         Ok(TypeDecl {
+            name,
+            span: start.merge(ty.span),
+            ty,
+        })
+    }
+
+    fn parse_artifact_decl(&mut self) -> ParseResult<ArtifactDecl> {
+        let start = self.expect(Token::Artifact)?.span;
+        let name = self.parse_ident()?;
+        self.expect(Token::Eq)?;
+        let ty = self.parse_type_expr()?;
+
+        Ok(ArtifactDecl {
             name,
             span: start.merge(ty.span),
             ty,
@@ -197,7 +217,7 @@ impl<'source> Parser<'source> {
     }
 
     fn parse_field_decl(&mut self) -> ParseResult<FieldDecl> {
-        let name = self.parse_ident()?;
+        let name = self.parse_name_like_ident()?;
         self.expect(Token::Colon)?;
         let ty = self.parse_type_expr()?;
         Ok(FieldDecl { name, ty })
@@ -1330,6 +1350,620 @@ impl<'source> Parser<'source> {
         Ok((PipelineCall::Match { scrutinee, arms }, end))
     }
 
+    // =========== Task / Harness / Objective Parsing ===========
+
+    fn parse_task_decl(&mut self) -> ParseResult<TaskDecl> {
+        let start = self.expect(Token::Task)?.span;
+        let name = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+
+        self.expect(Token::Input)?;
+        self.expect(Token::Colon)?;
+        let input = self.parse_type_expr()?;
+
+        self.expect(Token::Output)?;
+        self.expect(Token::Colon)?;
+        let output = self.parse_type_expr()?;
+
+        let artifacts = if self.check(&Token::Artifacts) {
+            self.parse_task_artifacts_block()?
+        } else {
+            Vec::new()
+        };
+
+        let mut nodes = Vec::new();
+        while !self.check(&Token::Emit) && !self.check(&Token::RBrace) {
+            nodes.push(self.parse_task_node()?);
+        }
+        if nodes.is_empty() {
+            let token = self.peek_token()?;
+            return Err(ParseError::new(
+                "task requires at least one stage, loop, or branch before emit",
+                token.span,
+            ));
+        }
+
+        let emit = self.parse_task_emit_block()?;
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(TaskDecl {
+            name,
+            input,
+            output,
+            artifacts,
+            nodes,
+            emit,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_task_artifacts_block(&mut self) -> ParseResult<Vec<ArtifactSlotDecl>> {
+        self.expect(Token::Artifacts)?;
+        self.expect(Token::LBrace)?;
+
+        let mut artifacts = Vec::new();
+        while !self.check(&Token::RBrace) {
+            let name = self.parse_ident()?;
+            self.expect(Token::Colon)?;
+            let ty = self.parse_type_expr()?;
+            let span = name.span.merge(ty.span);
+            artifacts.push(ArtifactSlotDecl { name, ty, span });
+            self.consume_optional_comma();
+        }
+
+        self.expect(Token::RBrace)?;
+        Ok(artifacts)
+    }
+
+    fn parse_task_emit_block(&mut self) -> ParseResult<Vec<EmitField>> {
+        self.expect(Token::Emit)?;
+        self.expect(Token::LBrace)?;
+
+        let mut fields = Vec::new();
+        while !self.check(&Token::RBrace) {
+            let name = self.parse_name_like_ident()?;
+            self.expect(Token::Colon)?;
+            let value = self.parse_expr()?;
+            let span = name.span.merge(value.span);
+            fields.push(EmitField { name, value, span });
+            self.consume_optional_comma();
+        }
+
+        self.expect(Token::RBrace)?;
+        Ok(fields)
+    }
+
+    fn parse_task_node(&mut self) -> ParseResult<TaskNode> {
+        let token = self.peek_token()?;
+        match token.token {
+            Token::Stage => Ok(TaskNode::Stage(self.parse_stage_decl()?)),
+            Token::Loop => Ok(TaskNode::Loop(self.parse_task_loop_decl()?)),
+            Token::If => Ok(TaskNode::Branch(self.parse_task_branch_decl()?)),
+            _ => Err(ParseError::new(
+                format!(
+                    "expected task node (stage, loop, if), found '{}'",
+                    token.token
+                ),
+                token.span,
+            )),
+        }
+    }
+
+    fn parse_stage_decl(&mut self) -> ParseResult<StageDecl> {
+        let start = self.expect(Token::Stage)?.span;
+        let name = self.parse_ident()?;
+        self.expect(Token::Using)?;
+        let kind = self.parse_stage_kind()?;
+        let component = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+
+        self.expect(Token::In)?;
+        self.expect(Token::Colon)?;
+        let input = self.parse_expr()?;
+
+        if !self.check_ident("out") {
+            let token = self.peek_token()?;
+            return Err(ParseError::new(
+                "stage requires 'out: <artifact>'",
+                token.span,
+            ));
+        }
+        self.advance();
+        self.expect(Token::Colon)?;
+        let output = self.parse_ident()?;
+
+        let when = if self.check(&Token::When) {
+            self.advance();
+            self.expect(Token::Colon)?;
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(StageDecl {
+            name,
+            kind,
+            component,
+            input,
+            output,
+            when,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_stage_kind(&mut self) -> ParseResult<StageKind> {
+        let token = self.peek_token()?;
+        match token.token {
+            Token::Tool => {
+                self.advance();
+                Ok(StageKind::Tool)
+            }
+            Token::Prompt => {
+                self.advance();
+                Ok(StageKind::Prompt)
+            }
+            Token::Agent => {
+                self.advance();
+                Ok(StageKind::Agent)
+            }
+            _ => Err(ParseError::new(
+                format!(
+                    "expected stage kind (tool, prompt, agent), found '{}'",
+                    token.token
+                ),
+                token.span,
+            )),
+        }
+    }
+
+    fn parse_task_loop_decl(&mut self) -> ParseResult<TaskLoopDecl> {
+        let start = self.expect(Token::Loop)?.span;
+        let name = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+
+        self.expect(Token::MaxIters)?;
+        self.expect(Token::Colon)?;
+        let max_iters = self.parse_expr()?;
+
+        self.expect(Token::Carry)?;
+        self.expect(Token::Colon)?;
+        self.expect(Token::LBracket)?;
+        let mut carry = Vec::new();
+        if !self.check(&Token::RBracket) {
+            carry.push(self.parse_ident()?);
+            while self.check(&Token::Comma) {
+                self.advance();
+                if self.check(&Token::RBracket) {
+                    break;
+                }
+                carry.push(self.parse_ident()?);
+            }
+        }
+        self.expect(Token::RBracket)?;
+
+        self.expect(Token::Until)?;
+        self.expect(Token::Colon)?;
+        let until = self.parse_expr()?;
+
+        let nodes = self.parse_task_nodes_block()?;
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(TaskLoopDecl {
+            name,
+            max_iters,
+            carry,
+            until,
+            nodes,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_task_branch_decl(&mut self) -> ParseResult<TaskBranchDecl> {
+        let start = self.expect(Token::If)?.span;
+        let condition = self.parse_expr()?;
+        self.expect(Token::LBrace)?;
+        let then_nodes = self.parse_task_nodes_block()?;
+        let mut end = self.expect(Token::RBrace)?.span;
+
+        let else_nodes = if self.check(&Token::Else) {
+            self.advance();
+            self.expect(Token::LBrace)?;
+            let nodes = self.parse_task_nodes_block()?;
+            end = self.expect(Token::RBrace)?.span;
+            nodes
+        } else {
+            Vec::new()
+        };
+
+        Ok(TaskBranchDecl {
+            condition,
+            then_nodes,
+            else_nodes,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_task_nodes_block(&mut self) -> ParseResult<Vec<TaskNode>> {
+        let mut nodes = Vec::new();
+        while !self.check(&Token::RBrace) {
+            nodes.push(self.parse_task_node()?);
+        }
+        if nodes.is_empty() {
+            let token = self.peek_token()?;
+            return Err(ParseError::new(
+                "expected at least one task node in block",
+                token.span,
+            ));
+        }
+        Ok(nodes)
+    }
+
+    fn parse_harness_decl(&mut self) -> ParseResult<HarnessDecl> {
+        let start = self.expect(Token::Harness)?.span;
+        let name = self.parse_ident()?;
+        self.expect(Token::For)?;
+        self.expect(Token::Task)?;
+        let task = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+
+        let defaults = if self.check(&Token::Defaults) {
+            self.parse_harness_defaults_block()?
+        } else {
+            Vec::new()
+        };
+
+        let mut binds = Vec::new();
+        while self.check(&Token::Bind) {
+            binds.push(self.parse_harness_bind_decl()?);
+        }
+
+        let tune = if self.check(&Token::Tune) {
+            self.parse_harness_tune_block()?
+        } else {
+            Vec::new()
+        };
+
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(HarnessDecl {
+            name,
+            task,
+            defaults,
+            binds,
+            tune,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_harness_defaults_block(&mut self) -> ParseResult<Vec<BindingStmt>> {
+        self.expect(Token::Defaults)?;
+        self.expect(Token::LBrace)?;
+
+        let bindings = self.parse_binding_statements()?;
+        self.expect(Token::RBrace)?;
+        Ok(bindings)
+    }
+
+    fn parse_harness_bind_decl(&mut self) -> ParseResult<HarnessBindDecl> {
+        let start = self.expect(Token::Bind)?.span;
+        let target = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+        let bindings = self.parse_binding_statements()?;
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(HarnessBindDecl {
+            target,
+            bindings,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_binding_statements(&mut self) -> ParseResult<Vec<BindingStmt>> {
+        let mut bindings = Vec::new();
+        while !self.check(&Token::RBrace) {
+            let key = self.parse_binding_path()?;
+            self.expect(Token::Colon)?;
+            let value = self.parse_expr()?;
+            let span = key.span.merge(value.span);
+            bindings.push(BindingStmt { key, value, span });
+            self.consume_optional_comma();
+        }
+        Ok(bindings)
+    }
+
+    fn parse_binding_path(&mut self) -> ParseResult<BindingPath> {
+        let mut segments = vec![self.parse_name_like_ident()?];
+        while self.check(&Token::Dot) {
+            self.advance();
+            segments.push(self.parse_name_like_ident()?);
+        }
+        let span = segments
+            .first()
+            .map(|first| first.span)
+            .unwrap()
+            .merge(segments.last().unwrap().span);
+        Ok(BindingPath { segments, span })
+    }
+
+    fn parse_harness_tune_block(&mut self) -> ParseResult<Vec<TuneStmt>> {
+        self.expect(Token::Tune)?;
+        self.expect(Token::LBrace)?;
+
+        let mut tune = Vec::new();
+        while !self.check(&Token::RBrace) {
+            let path = self.parse_binding_path()?;
+            let operator = self.parse_tune_operator()?;
+            let domain = self.parse_finite_domain()?;
+            let span = path.span.merge(match &domain {
+                FiniteDomain::List(values) => {
+                    values.first().map(|value| value.span).unwrap_or(path.span)
+                }
+                FiniteDomain::Variants(_) => path.span,
+            });
+            tune.push(TuneStmt {
+                path,
+                operator,
+                domain,
+                span,
+            });
+            self.consume_optional_comma();
+        }
+
+        self.expect(Token::RBrace)?;
+        Ok(tune)
+    }
+
+    fn parse_tune_operator(&mut self) -> ParseResult<TuneOperator> {
+        let token = self.peek_token()?;
+        match token.token {
+            Token::In => {
+                self.advance();
+                Ok(TuneOperator::In)
+            }
+            Token::SubsetOf => {
+                self.advance();
+                Ok(TuneOperator::SubsetOf)
+            }
+            _ => Err(ParseError::new(
+                format!(
+                    "expected tune operator ('in' or 'subset_of'), found '{}'",
+                    token.token
+                ),
+                token.span,
+            )),
+        }
+    }
+
+    fn parse_finite_domain(&mut self) -> ParseResult<FiniteDomain> {
+        if self.check(&Token::Variants) {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let name = self.parse_string()?;
+            self.expect(Token::RParen)?;
+            return Ok(FiniteDomain::Variants(name));
+        }
+
+        self.expect(Token::LBracket)?;
+        let values = self.parse_expr_list(Token::RBracket)?;
+        Ok(FiniteDomain::List(values))
+    }
+
+    fn parse_objective_decl(&mut self) -> ParseResult<ObjectiveDecl> {
+        let start = self.expect(Token::Objective)?.span;
+        let name = self.parse_ident()?;
+        self.expect(Token::For)?;
+        self.expect(Token::Task)?;
+        let task = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+
+        self.expect(Token::Dataset)?;
+        self.expect(Token::Colon)?;
+        let dataset = self.parse_dataset_spec()?;
+
+        self.expect(Token::Harness)?;
+        self.expect(Token::Colon)?;
+        let harness = self.parse_ident()?;
+
+        let repeats = if self.check(&Token::Repeats) {
+            self.advance();
+            self.expect(Token::Colon)?;
+            Some(self.parse_int()? as u64)
+        } else {
+            None
+        };
+
+        let mut metrics = Vec::new();
+        while self.check(&Token::Metric) {
+            metrics.push(self.parse_metric_decl()?);
+        }
+        if metrics.is_empty() {
+            let token = self.peek_token()?;
+            return Err(ParseError::new(
+                "objective requires at least one metric",
+                token.span,
+            ));
+        }
+
+        self.expect(Token::Score)?;
+        self.expect(Token::Eq)?;
+        let score = self.parse_expr()?;
+
+        let split = if self.check(&Token::Split) {
+            Some(self.parse_objective_split()?)
+        } else {
+            None
+        };
+
+        let select = if self.check(&Token::Select) {
+            Some(self.parse_objective_select()?)
+        } else {
+            None
+        };
+
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(ObjectiveDecl {
+            name,
+            task,
+            dataset,
+            harness,
+            repeats,
+            metrics,
+            score,
+            split,
+            select,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_dataset_spec(&mut self) -> ParseResult<DatasetSpec> {
+        if self.check(&Token::File) {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let path = self.parse_string()?;
+            self.expect(Token::RParen)?;
+            return Ok(DatasetSpec::File(path));
+        }
+
+        self.expect(Token::LBracket)?;
+        let mut cases = Vec::new();
+        if !self.check(&Token::RBracket) {
+            cases.push(self.parse_inline_dataset_case()?);
+            while self.check(&Token::Comma) {
+                self.advance();
+                if self.check(&Token::RBracket) {
+                    break;
+                }
+                cases.push(self.parse_inline_dataset_case()?);
+            }
+        }
+        self.expect(Token::RBracket)?;
+        Ok(DatasetSpec::Inline(cases))
+    }
+
+    fn parse_inline_dataset_case(&mut self) -> ParseResult<InlineDatasetCase> {
+        let start = self.expect(Token::LBrace)?.span;
+        let mut input = None;
+        let mut expected = None;
+        let mut id = None;
+
+        while !self.check(&Token::RBrace) {
+            let token = self.peek_token()?;
+            match &token.token {
+                Token::Input => {
+                    self.advance();
+                    self.expect(Token::Colon)?;
+                    input = Some(self.parse_expr()?);
+                }
+                Token::Ident(name) if name == "expected" => {
+                    self.advance();
+                    self.expect(Token::Colon)?;
+                    expected = Some(self.parse_expr()?);
+                }
+                Token::Ident(name) if name == "id" => {
+                    self.advance();
+                    self.expect(Token::Colon)?;
+                    id = Some(self.parse_string()?);
+                }
+                _ => {
+                    return Err(ParseError::new(
+                        format!(
+                            "expected inline dataset field (input, expected, id), found '{}'",
+                            token.token
+                        ),
+                        token.span,
+                    ))
+                }
+            }
+
+            if self.check(&Token::Comma) {
+                self.advance();
+                if self.check(&Token::RBrace) {
+                    break;
+                }
+            }
+        }
+
+        let end = self.expect(Token::RBrace)?.span;
+        let input =
+            input.ok_or_else(|| ParseError::new("inline dataset case requires input", start))?;
+
+        Ok(InlineDatasetCase {
+            input,
+            expected,
+            id,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_metric_decl(&mut self) -> ParseResult<MetricDecl> {
+        let start = self.expect(Token::Metric)?.span;
+        let name = self.parse_ident()?;
+        self.expect(Token::Eq)?;
+        let expr = self.parse_expr()?;
+        Ok(MetricDecl {
+            name,
+            expr: expr.clone(),
+            span: start.merge(expr.span),
+        })
+    }
+
+    fn parse_objective_split(&mut self) -> ParseResult<ObjectiveSplit> {
+        let start = self.expect(Token::Split)?.span;
+        self.expect(Token::LBrace)?;
+
+        self.expect(Token::Train)?;
+        self.expect(Token::Colon)?;
+        let train = self.parse_number()?;
+        self.consume_optional_comma();
+
+        self.expect(Token::Val)?;
+        self.expect(Token::Colon)?;
+        let val = self.parse_number()?;
+        self.consume_optional_comma();
+
+        self.expect(Token::Test)?;
+        self.expect(Token::Colon)?;
+        let test = self.parse_number()?;
+
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(ObjectiveSplit {
+            train,
+            val,
+            test,
+            span: start.merge(end),
+        })
+    }
+
+    fn parse_objective_select(&mut self) -> ParseResult<ObjectiveSelect> {
+        let start = self.expect(Token::Select)?.span;
+        self.expect(Token::LBrace)?;
+
+        self.expect(Token::Primary)?;
+        self.expect(Token::Colon)?;
+        let primary = self.parse_expr()?;
+
+        let tie_breakers = if self.check(&Token::TieBreakers) {
+            self.advance();
+            self.expect(Token::Colon)?;
+            self.expect(Token::LBracket)?;
+            self.parse_expr_list(Token::RBracket)?
+        } else {
+            Vec::new()
+        };
+
+        let end = self.expect(Token::RBrace)?.span;
+
+        Ok(ObjectiveSelect {
+            primary,
+            tie_breakers,
+            span: start.merge(end),
+        })
+    }
+
     /// Parse a string literal or file("path") reference
     fn parse_string_or_file(&mut self) -> ParseResult<StringOrFile> {
         let token = self.peek_token()?;
@@ -1498,6 +2132,48 @@ impl<'source> Parser<'source> {
             )),
             Token::Null => Ok(Spanned::new(Expr::Literal(Literal::Null), token.span)),
             Token::Ident(name) => Ok(Spanned::new(Expr::Ident(name.clone()), token.span)),
+            Token::LBracket => {
+                let mut items = Vec::new();
+                if !self.check(&Token::RBracket) {
+                    items.push(self.parse_expr()?);
+                    while self.check(&Token::Comma) {
+                        self.advance();
+                        if self.check(&Token::RBracket) {
+                            break;
+                        }
+                        items.push(self.parse_expr()?);
+                    }
+                }
+                let end = self.expect(Token::RBracket)?.span;
+                Ok(Spanned::new(
+                    Expr::ListLiteral(items),
+                    token.span.merge(end),
+                ))
+            }
+            Token::LBrace => {
+                let mut fields = Vec::new();
+                if !self.check(&Token::RBrace) {
+                    loop {
+                        let key = self.parse_field_name()?;
+                        self.expect(Token::Colon)?;
+                        let value = self.parse_expr()?;
+                        fields.push(ExprField { key, value });
+
+                        if !self.check(&Token::Comma) {
+                            break;
+                        }
+                        self.advance();
+                        if self.check(&Token::RBrace) {
+                            break;
+                        }
+                    }
+                }
+                let end = self.expect(Token::RBrace)?.span;
+                Ok(Spanned::new(
+                    Expr::RecordLiteral(fields),
+                    token.span.merge(end),
+                ))
+            }
             Token::LParen => {
                 let inner = self.parse_expr()?;
                 let end = self.expect(Token::RParen)?.span;
@@ -1537,34 +2213,119 @@ impl<'source> Parser<'source> {
         }
     }
 
-    /// Parse an identifier that can also be a keyword (for field access)
-    fn parse_field_name(&mut self) -> ParseResult<Ident> {
+    /// Parse an identifier-like token, allowing reserved keywords in path and field positions.
+    fn parse_name_like_ident(&mut self) -> ParseResult<Ident> {
         let token = self.next_token()?;
-        let name = match &token.token {
-            Token::Ident(name) => name.clone(),
-            // Allow keywords as field names
-            Token::Done => "done".to_string(),
-            Token::Pre => "pre".to_string(),
-            Token::Post => "post".to_string(),
+        let name = match token.token {
+            Token::Ident(name) => name,
+            Token::Task => "task".to_string(),
+            Token::Artifact => "artifact".to_string(),
+            Token::Artifacts => "artifacts".to_string(),
+            Token::Type => "type".to_string(),
             Token::Input => "input".to_string(),
             Token::Output => "output".to_string(),
             Token::State => "state".to_string(),
+            Token::Decompose => "decompose".to_string(),
+            Token::Subgoal => "subgoal".to_string(),
+            Token::Pre => "pre".to_string(),
+            Token::Post => "post".to_string(),
             Token::Options => "options".to_string(),
+            Token::Done => "done".to_string(),
             Token::Reward => "reward".to_string(),
             Token::Timeout => "timeout".to_string(),
-            Token::Type => "type".to_string(),
-            Token::Task => "task".to_string(),
-            Token::Subgoal => "subgoal".to_string(),
-            Token::Decompose => "decompose".to_string(),
             Token::Verify => "verify".to_string(),
-            _ => {
+            Token::OnFail => "on_fail".to_string(),
+            Token::OnError => "on_error".to_string(),
+            Token::Tool => "tool".to_string(),
+            Token::Stage => "stage".to_string(),
+            Token::Using => "using".to_string(),
+            Token::When => "when".to_string(),
+            Token::Emit => "emit".to_string(),
+            Token::Harness => "harness".to_string(),
+            Token::Defaults => "defaults".to_string(),
+            Token::Bind => "bind".to_string(),
+            Token::Tune => "tune".to_string(),
+            Token::Objective => "objective".to_string(),
+            Token::Dataset => "dataset".to_string(),
+            Token::Metric => "metric".to_string(),
+            Token::Score => "score".to_string(),
+            Token::Split => "split".to_string(),
+            Token::Select => "select".to_string(),
+            Token::Repeats => "repeats".to_string(),
+            Token::Train => "train".to_string(),
+            Token::Val => "val".to_string(),
+            Token::Test => "test".to_string(),
+            Token::Primary => "primary".to_string(),
+            Token::TieBreakers => "tie_breakers".to_string(),
+            Token::Carry => "carry".to_string(),
+            Token::Until => "until".to_string(),
+            Token::SubsetOf => "subset_of".to_string(),
+            Token::MaxIters => "max_iters".to_string(),
+            Token::Prompt => "prompt".to_string(),
+            Token::Agent => "agent".to_string(),
+            Token::Pipeline => "pipeline".to_string(),
+            Token::System => "system".to_string(),
+            Token::Template => "template".to_string(),
+            Token::Tools => "tools".to_string(),
+            Token::MaxTurns => "max_turns".to_string(),
+            Token::Model => "model".to_string(),
+            Token::File => "file".to_string(),
+            Token::Extern => "extern".to_string(),
+            Token::Crate => "crate".to_string(),
+            Token::Foreign => "foreign".to_string(),
+            Token::Fn => "fn".to_string(),
+            Token::Impl => "impl".to_string(),
+            Token::Spec => "spec".to_string(),
+            Token::Variants => "variants".to_string(),
+            Token::Pure => "pure".to_string(),
+            Token::Sequence => "sequence".to_string(),
+            Token::Parallel => "parallel".to_string(),
+            Token::Let => "let".to_string(),
+            Token::For => "for".to_string(),
+            Token::In => "in".to_string(),
+            Token::While => "while".to_string(),
+            Token::Loop => "loop".to_string(),
+            Token::Break => "break".to_string(),
+            Token::Continue => "continue".to_string(),
+            Token::If => "if".to_string(),
+            Token::Else => "else".to_string(),
+            Token::Match => "match".to_string(),
+            Token::Result_ => "result".to_string(),
+            Token::Bytes => "bytes".to_string(),
+            Token::Reachable => "reachable".to_string(),
+            Token::NoDeadlock => "no_deadlock".to_string(),
+            Token::Bounded => "bounded".to_string(),
+            Token::Grounded => "grounded".to_string(),
+            Token::Terminates => "terminates".to_string(),
+            Token::Retry => "retry".to_string(),
+            Token::Rollback => "rollback".to_string(),
+            Token::Abort => "abort".to_string(),
+            Token::Replan => "replan".to_string(),
+            Token::Bool => "bool".to_string(),
+            Token::Int => "int".to_string(),
+            Token::Float => "float".to_string(),
+            Token::String_ => "string".to_string(),
+            Token::Any => "any".to_string(),
+            Token::List => "list".to_string(),
+            Token::Map => "map".to_string(),
+            Token::Option_ => "option".to_string(),
+            Token::Json => "json".to_string(),
+            Token::True => "true".to_string(),
+            Token::False => "false".to_string(),
+            Token::Null => "null".to_string(),
+            other => {
                 return Err(ParseError::new(
-                    format!("expected field name, found '{}'", token.token),
+                    format!("expected identifier-like name, found '{}'", other),
                     token.span,
                 ))
             }
         };
         Ok(Spanned::new(name, token.span))
+    }
+
+    /// Parse an identifier that can also be a keyword (for field access)
+    fn parse_field_name(&mut self) -> ParseResult<Ident> {
+        self.parse_name_like_ident()
     }
 
     fn parse_string(&mut self) -> ParseResult<String> {
@@ -1584,6 +2345,18 @@ impl<'source> Parser<'source> {
             Token::IntLit(n) => Ok(n),
             _ => Err(ParseError::new(
                 format!("expected integer literal, found '{}'", token.token),
+                token.span,
+            )),
+        }
+    }
+
+    fn parse_number(&mut self) -> ParseResult<f64> {
+        let token = self.next_token()?;
+        match token.token {
+            Token::IntLit(n) => Ok(n as f64),
+            Token::FloatLit(n) => Ok(n),
+            _ => Err(ParseError::new(
+                format!("expected numeric literal, found '{}'", token.token),
                 token.span,
             )),
         }
@@ -1618,6 +2391,28 @@ impl<'source> Parser<'source> {
             .peek()
             .map(|t| std::mem::discriminant(&t.token) == std::mem::discriminant(expected))
             .unwrap_or(false)
+    }
+
+    fn parse_expr_list(&mut self, terminator: Token) -> ParseResult<Vec<Spanned<Expr>>> {
+        let mut values = Vec::new();
+        if !self.check(&terminator) {
+            values.push(self.parse_expr()?);
+            while self.check(&Token::Comma) {
+                self.advance();
+                if self.check(&terminator) {
+                    break;
+                }
+                values.push(self.parse_expr()?);
+            }
+        }
+        self.expect(terminator)?;
+        Ok(values)
+    }
+
+    fn consume_optional_comma(&mut self) {
+        if self.check(&Token::Comma) {
+            self.advance();
+        }
     }
 
     fn advance(&mut self) -> SpannedToken {
@@ -1663,6 +2458,153 @@ mod tests {
                 assert_eq!(t.name.node, "Position");
             }
             _ => panic!("expected type declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_artifact_decl() {
+        let source = "artifact ResearchNotes = { summary: string, score: float }";
+        let program = parse(source).unwrap();
+        assert_eq!(program.declarations.len(), 1);
+        match &program.declarations[0] {
+            Declaration::Artifact(a) => assert_eq!(a.name.node, "ResearchNotes"),
+            _ => panic!("expected artifact declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_task_harness_and_objective() {
+        let source = r#"
+artifact ResearchNotes = { summary: string, score: float }
+
+task summarize {
+    input: string
+    output: { summary: string }
+    artifacts {
+        notes: ResearchNotes
+        final: { summary: string }
+    }
+    stage draft using prompt writer {
+        in: { text: input }
+        out: notes
+    }
+    loop revise {
+        max_iters: 3
+        carry: [notes]
+        until: notes.score > 0.9
+        if notes.score < 0.5 {
+            stage improve using agent reviewer {
+                in: notes
+                out: notes
+            }
+        } else {
+            stage format using tool formatter {
+                in: { summary: notes.summary }
+                out: final
+            }
+        }
+    }
+    emit {
+        summary: final.summary
+    }
+}
+
+harness baseline for task summarize {
+    defaults {
+        model: "gpt-5"
+    }
+    bind draft {
+        model: "gpt-5-mini"
+        max_iters: 2
+    }
+    tune {
+        draft.model in ["gpt-5-mini", "gpt-5"]
+        revise.max_iters in [1, 2, 3]
+        draft.tools subset_of ["search", "critic"]
+        draft.variant in variants("writer")
+    }
+}
+
+objective quality for task summarize {
+    dataset: [
+        { input: "A", expected: { summary: "A" }, id: "case-1" },
+    ]
+    harness: baseline
+    repeats: 2
+    metric accuracy = output.summary == expected.summary
+    score = accuracy
+    split {
+        train: 0.7
+        val: 0.2
+        test: 0.1
+    }
+    select {
+        primary: accuracy
+        tie_breakers: [rollout.cost, rollout.latency]
+    }
+}
+"#;
+
+        let program = parse(source).unwrap();
+        assert_eq!(program.declarations.len(), 4);
+
+        match &program.declarations[1] {
+            Declaration::Task(task) => {
+                assert_eq!(task.name.node, "summarize");
+                assert_eq!(task.artifacts.len(), 2);
+                assert_eq!(task.nodes.len(), 2);
+                match &task.nodes[0] {
+                    TaskNode::Stage(stage) => {
+                        assert_eq!(stage.name.node, "draft");
+                        assert_eq!(stage.output.node, "notes");
+                    }
+                    _ => panic!("expected first task node to be a stage"),
+                }
+            }
+            _ => panic!("expected task declaration"),
+        }
+
+        match &program.declarations[2] {
+            Declaration::Harness(harness) => {
+                assert_eq!(harness.name.node, "baseline");
+                assert_eq!(harness.binds.len(), 1);
+                assert_eq!(harness.tune.len(), 4);
+            }
+            _ => panic!("expected harness declaration"),
+        }
+
+        match &program.declarations[3] {
+            Declaration::Objective(objective) => {
+                assert_eq!(objective.name.node, "quality");
+                assert_eq!(objective.metrics.len(), 1);
+                assert!(objective.split.is_some());
+                assert!(objective.select.is_some());
+            }
+            _ => panic!("expected objective declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_literal_expr() {
+        let expr = Parser::new("[1, 2, 3]").parse_expr().unwrap();
+        match expr.node {
+            Expr::ListLiteral(items) => assert_eq!(items.len(), 3),
+            _ => panic!("expected list literal"),
+        }
+    }
+
+    #[test]
+    fn test_parse_record_literal_expr() {
+        let expr = Parser::new("{ answer: \"ok\", score: 1 }")
+            .parse_expr()
+            .unwrap();
+        match expr.node {
+            Expr::RecordLiteral(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].key.node, "answer");
+                assert_eq!(fields[1].key.node, "score");
+            }
+            _ => panic!("expected record literal"),
         }
     }
 }

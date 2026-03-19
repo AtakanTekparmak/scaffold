@@ -29,8 +29,6 @@ pub type LowerResult<T> = Result<T, LowerError>;
 pub struct Lowerer {
     /// Source file name (for debugging)
     source_file: Option<String>,
-    /// Known tool names (for classifying pipeline calls)
-    tool_names: std::collections::HashSet<String>,
     /// Known prompt names (for classifying pipeline calls)
     prompt_names: std::collections::HashSet<String>,
     /// Known agent names (for classifying pipeline calls)
@@ -41,7 +39,6 @@ impl Lowerer {
     pub fn new() -> Self {
         Self {
             source_file: None,
-            tool_names: std::collections::HashSet::new(),
             prompt_names: std::collections::HashSet::new(),
             agent_names: std::collections::HashSet::new(),
         }
@@ -55,15 +52,12 @@ impl Lowerer {
     /// Lower a complete program to IR
     pub fn lower(&self, program: &Program, _type_env: &TypeEnv) -> LowerResult<ScaffoldIR> {
         // First pass: collect tool, prompt, and agent names for classifying pipeline calls
-        let mut tool_names = std::collections::HashSet::new();
         let mut prompt_names = std::collections::HashSet::new();
         let mut agent_names = std::collections::HashSet::new();
 
         for decl in &program.declarations {
             match decl {
-                Declaration::Tool(tool) => {
-                    tool_names.insert(tool.name.node.clone());
-                }
+                Declaration::Tool(_) => {}
                 Declaration::Prompt(prompt) => {
                     prompt_names.insert(prompt.name.node.clone());
                 }
@@ -77,7 +71,6 @@ impl Lowerer {
         // Create a new lowerer with the collected names
         let lowerer = Lowerer {
             source_file: self.source_file.clone(),
-            tool_names,
             prompt_names,
             agent_names,
         };
@@ -89,6 +82,9 @@ impl Lowerer {
             match decl {
                 Declaration::Type(type_decl) => {
                     ir.types.push(lowerer.lower_type_decl(type_decl)?);
+                }
+                Declaration::Artifact(artifact_decl) => {
+                    ir.types.push(lowerer.lower_artifact_decl(artifact_decl)?);
                 }
                 Declaration::ExternCrate(extern_crate) => {
                     ir.extern_crates
@@ -109,6 +105,33 @@ impl Lowerer {
                 Declaration::Pipeline(pipeline) => {
                     ir.pipelines.push(lowerer.lower_pipeline(pipeline)?);
                 }
+                Declaration::Task(task) => {
+                    return Err(LowerError::new(
+                        format!(
+                            "task '{}' lowering is not implemented yet; use `scaffold parse` or `scaffold check` for now",
+                            task.name.node
+                        ),
+                        task.span,
+                    ));
+                }
+                Declaration::Harness(harness) => {
+                    return Err(LowerError::new(
+                        format!(
+                            "harness '{}' lowering is not implemented yet; use `scaffold parse` or `scaffold check` for now",
+                            harness.name.node
+                        ),
+                        harness.span,
+                    ));
+                }
+                Declaration::Objective(objective) => {
+                    return Err(LowerError::new(
+                        format!(
+                            "objective '{}' lowering is not implemented yet; use `scaffold parse` or `scaffold check` for now",
+                            objective.name.node
+                        ),
+                        objective.span,
+                    ));
+                }
             }
         }
 
@@ -122,13 +145,11 @@ impl Lowerer {
         })
     }
 
-    fn lower_type_ref(&self, ty: &Spanned<TypeExpr>) -> LowerResult<TypeRefIR> {
-        match &ty.node {
-            TypeExpr::Named(name) => Ok(TypeRefIR::Named {
-                ref_name: name.clone(),
-            }),
-            _ => Ok(TypeRefIR::Inline(self.lower_type_expr(&ty.node)?)),
-        }
+    fn lower_artifact_decl(&self, artifact_decl: &ArtifactDecl) -> LowerResult<TypeDefIR> {
+        Ok(TypeDefIR {
+            name: artifact_decl.name.node.clone(),
+            definition: self.lower_type_expr(&artifact_decl.ty.node)?,
+        })
     }
 
     fn lower_type_expr(&self, ty: &TypeExpr) -> LowerResult<TypeIR> {
@@ -208,6 +229,23 @@ impl Lowerer {
                     function: function.clone(),
                     args: ir_args,
                 })
+            }
+            Expr::ListLiteral(items) => {
+                let mut elements = Vec::with_capacity(items.len());
+                for item in items {
+                    elements.push(self.lower_expr(&item.node)?);
+                }
+                Ok(ExprIR::List { elements })
+            }
+            Expr::RecordLiteral(fields) => {
+                let mut ir_fields = Vec::with_capacity(fields.len());
+                for field in fields {
+                    ir_fields.push(ExprFieldIR {
+                        key: field.key.node.clone(),
+                        value: self.lower_expr(&field.value.node)?,
+                    });
+                }
+                Ok(ExprIR::Record { fields: ir_fields })
             }
             Expr::Paren(inner) => self.lower_expr(&inner.node),
         }
@@ -425,7 +463,9 @@ impl Lowerer {
                         value: self.lower_tool_expr(&entry.value.node)?,
                     });
                 }
-                Ok(ToolExprIR::MapLiteral { entries: ir_entries })
+                Ok(ToolExprIR::MapLiteral {
+                    entries: ir_entries,
+                })
             }
             ToolExpr::Expr(expr) => Ok(ToolExprIR::Expr {
                 expr: Box::new(self.lower_expr(&expr.node)?),
@@ -589,7 +629,9 @@ impl Lowerer {
                 for branch in branches {
                     ir_branches.push(self.lower_pipeline_steps(branch)?);
                 }
-                PipelineCallIR::Parallel { branches: ir_branches }
+                PipelineCallIR::Parallel {
+                    branches: ir_branches,
+                }
             }
             PipelineCall::If {
                 condition,

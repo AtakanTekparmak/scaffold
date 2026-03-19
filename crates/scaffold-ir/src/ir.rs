@@ -130,6 +130,18 @@ pub enum ExprIR {
         function: String,
         args: Vec<ExprIR>,
     },
+    List {
+        elements: Vec<ExprIR>,
+    },
+    Record {
+        fields: Vec<ExprFieldIR>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExprFieldIR {
+    pub key: String,
+    pub value: ExprIR,
 }
 
 /// Literal value IR

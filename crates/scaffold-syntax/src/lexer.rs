@@ -13,6 +13,10 @@ pub enum Token {
     // Keywords
     #[token("task")]
     Task,
+    #[token("artifact")]
+    Artifact,
+    #[token("artifacts")]
+    Artifacts,
     #[token("type")]
     Type,
     #[token("input")]
@@ -45,6 +49,54 @@ pub enum Token {
     OnError,
     #[token("tool")]
     Tool,
+    #[token("stage")]
+    Stage,
+    #[token("using")]
+    Using,
+    #[token("when")]
+    When,
+    #[token("emit")]
+    Emit,
+    #[token("harness")]
+    Harness,
+    #[token("defaults")]
+    Defaults,
+    #[token("bind")]
+    Bind,
+    #[token("tune")]
+    Tune,
+    #[token("objective")]
+    Objective,
+    #[token("dataset")]
+    Dataset,
+    #[token("metric")]
+    Metric,
+    #[token("score")]
+    Score,
+    #[token("split")]
+    Split,
+    #[token("select")]
+    Select,
+    #[token("repeats")]
+    Repeats,
+    #[token("train")]
+    Train,
+    #[token("val")]
+    Val,
+    #[token("test")]
+    Test,
+    #[token("primary")]
+    Primary,
+    #[token("tie_breakers")]
+    TieBreakers,
+    #[token("carry")]
+    Carry,
+    #[token("until")]
+    Until,
+    #[token("subset_of")]
+    SubsetOf,
+    #[token("max_iters")]
+    MaxIters,
 
     // New semantic constructs
     #[token("prompt")]
@@ -270,6 +322,8 @@ impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Token::Task => write!(f, "task"),
+            Token::Artifact => write!(f, "artifact"),
+            Token::Artifacts => write!(f, "artifacts"),
             Token::Type => write!(f, "type"),
             Token::Input => write!(f, "input"),
             Token::Output => write!(f, "output"),
@@ -286,6 +340,30 @@ impl std::fmt::Display for Token {
             Token::OnFail => write!(f, "on_fail"),
             Token::OnError => write!(f, "on_error"),
             Token::Tool => write!(f, "tool"),
+            Token::Stage => write!(f, "stage"),
+            Token::Using => write!(f, "using"),
+            Token::When => write!(f, "when"),
+            Token::Emit => write!(f, "emit"),
+            Token::Harness => write!(f, "harness"),
+            Token::Defaults => write!(f, "defaults"),
+            Token::Bind => write!(f, "bind"),
+            Token::Tune => write!(f, "tune"),
+            Token::Objective => write!(f, "objective"),
+            Token::Dataset => write!(f, "dataset"),
+            Token::Metric => write!(f, "metric"),
+            Token::Score => write!(f, "score"),
+            Token::Split => write!(f, "split"),
+            Token::Select => write!(f, "select"),
+            Token::Repeats => write!(f, "repeats"),
+            Token::Train => write!(f, "train"),
+            Token::Val => write!(f, "val"),
+            Token::Test => write!(f, "test"),
+            Token::Primary => write!(f, "primary"),
+            Token::TieBreakers => write!(f, "tie_breakers"),
+            Token::Carry => write!(f, "carry"),
+            Token::Until => write!(f, "until"),
+            Token::SubsetOf => write!(f, "subset_of"),
+            Token::MaxIters => write!(f, "max_iters"),
             Token::Prompt => write!(f, "prompt"),
             Token::Agent => write!(f, "agent"),
             Token::Pipeline => write!(f, "pipeline"),

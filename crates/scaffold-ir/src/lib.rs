@@ -7,10 +7,12 @@
 //! - JSON Schema generation
 
 pub mod ir;
+pub mod pretty;
 pub mod schema;
 pub mod serialize;
 
 pub use ir::*;
+pub use pretty::pretty_print;
 pub use schema::{
     type_to_json_schema, type_to_json_schema_compact, type_to_json_schema_string,
     types_to_json_schema_document,
