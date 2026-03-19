@@ -1,0 +1,9 @@
+Classify the banking support message into exactly one allowed label.
+
+Allowed labels:
+{label_guide}
+
+User message:
+{text}
+
+Return the exact label string only.

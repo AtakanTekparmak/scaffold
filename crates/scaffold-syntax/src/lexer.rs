@@ -69,6 +69,12 @@ pub enum Token {
     Objective,
     #[token("dataset")]
     Dataset,
+    #[token("constraint")]
+    Constraint,
+    #[token("checker")]
+    Checker,
+    #[token("judge")]
+    Judge,
     #[token("metric")]
     Metric,
     #[token("score")]
@@ -350,6 +356,9 @@ impl std::fmt::Display for Token {
             Token::Tune => write!(f, "tune"),
             Token::Objective => write!(f, "objective"),
             Token::Dataset => write!(f, "dataset"),
+            Token::Constraint => write!(f, "constraint"),
+            Token::Checker => write!(f, "checker"),
+            Token::Judge => write!(f, "judge"),
             Token::Metric => write!(f, "metric"),
             Token::Score => write!(f, "score"),
             Token::Split => write!(f, "split"),

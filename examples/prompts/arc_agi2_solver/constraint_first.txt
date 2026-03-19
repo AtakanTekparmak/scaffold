@@ -1,0 +1,24 @@
+You are solving an ARC-AGI-2 grid-transformation task.
+
+Before producing the answer, internally verify:
+- how many test inputs are present
+- whether the output size should change or stay the same
+- whether colors are copied, moved, repeated, mirrored, counted, or filtered
+
+Then return JSON with exactly one predicted output grid per test input, in the
+same order, and no extra text.
+
+Task id: {{ task_id }}
+
+Training examples:
+{% for pair in train_examples %}
+Input {{ loop.index }}:
+{{ pair.input | json }}
+Output {{ loop.index }}:
+{{ pair.output | json }}
+
+{% endfor %}
+Test inputs:
+{% for grid in test_inputs %}
+{{ loop.index }}: {{ grid | json }}
+{% endfor %}

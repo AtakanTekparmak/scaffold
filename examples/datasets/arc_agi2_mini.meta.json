@@ -1,0 +1,36 @@
+{
+  "source": "derived from examples/datasets/arc_agi2_subset.jsonl",
+  "preset": "mini",
+  "seed": 11,
+  "filters": {
+    "max_grid_cells": "derived-from-current-subset",
+    "max_total_pairs": "derived-from-current-subset"
+  },
+  "counts": {
+    "train": 4,
+    "val": 2,
+    "test": 2,
+    "total": 8
+  },
+  "recommended_objective_split": {
+    "train": 0.5,
+    "val": 0.25,
+    "test": 0.25
+  },
+  "train_task_ids": [
+    "63613498",
+    "2601afb7",
+    "66e6c45b",
+    "7c008303"
+  ],
+  "val_task_ids": [
+    "d017b73f",
+    "a1570a43"
+  ],
+  "test_task_ids": [
+    "faa9f03d",
+    "dbff022c"
+  ],
+  "output": "examples/datasets/arc_agi2_mini.jsonl",
+  "note": "Regenerate with python3 tools/snapshot_arc_agi2.py --preset mini for a fresh official sample."
+}

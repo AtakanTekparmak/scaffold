@@ -169,6 +169,27 @@ scaffold run example.scaffold --task answer_question --input '{"question": "..."
 
 # Run a task with a harness override
 scaffold run example.scaffold --task answer_question --harness answer_default --input '{"question": "..."}'
+
+# Evaluate an objective with the harness defaults
+scaffold evaluate example.scaffold --objective answer_quality
+
+# Evaluate an objective with explicit harness assignments
+scaffold evaluate example.scaffold --objective answer_quality --assignments '{"write.temperature":0.2}'
+
+# Optimize with the default interpreter backend
+scaffold optimize example.scaffold --objective answer_quality
+
+# Optimize and persist the winning harness patch plus candidate summaries
+scaffold optimize example.scaffold --objective answer_quality --report-dir runs/answer_quality
+
+# Optimize with the DSPy GEPA backend
+scaffold optimize example.scaffold --objective answer_quality --backend dspy --backend-command "uv run --python 3.11 --with 'dspy>=3' python tools/dspy_optimize.py"
+
+# Rebuild the cheap ARC-AGI-2 mini slice
+python3 tools/snapshot_arc_agi2.py --preset mini
+
+# Rebuild the larger ARC-AGI-2 benchmark slice
+python3 tools/snapshot_arc_agi2.py
 ```
 
 ## Configuration

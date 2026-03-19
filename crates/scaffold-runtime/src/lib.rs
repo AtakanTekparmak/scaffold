@@ -45,7 +45,14 @@ pub mod value;
 pub use agent_convos::maybe_log_agent_conversation;
 pub use config::{config, Config};
 pub use error::{Error, Result};
-pub use interpreter::execute_task;
+pub use interpreter::{
+    evaluate_objective_candidate, execute_task, optimize_objective,
+    optimize_objective_with_artifacts, optimize_objective_with_options,
+    CandidateOptimizationReport, ObjectiveOptimizationArtifacts, ObjectiveOptimizationReport,
+    OptimizationBackendKind, OptimizationBackendRequest, OptimizationBackendResponse,
+    OptimizationDatasetCase, OptimizationOptions, OptimizationTunableDomain,
+    SplitEvaluationSummary,
+};
 pub use llm::{
     query as llm_query, query_structured, query_structured_with_config, query_with_config,
     query_with_model, Agent, AgentBuilder, LlmBackend, LlmConfig,

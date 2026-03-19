@@ -58,7 +58,10 @@ Execution Model
 - `scaffold run` is interpreter-first and task-centric.
 - The runtime executes verified `task` IR directly instead of generating a temporary crate for inner-loop runs.
 - Harnesses are applied as typed runtime overlays on top of a task.
-- Objective-driven optimization remains part of the language direction, but the CLI optimizer is under redesign and is not exposed in the current command surface.
+- `scaffold optimize` evaluates objectives over datasets and searches the declared finite `harness.tune` space directly in the interpreter.
+- `scaffold optimize` now supports pluggable candidate-proposal backends. The default `interpreter` backend enumerates finite search spaces, while external backends like `dspy` can propose candidate assignments and let Scaffold evaluate them.
+- The recommended DSPy invocation is `--backend dspy --backend-command "uv run --python 3.11 --with 'dspy>=3' python tools/dspy_optimize.py"`. That path enables DSPy GEPA, and the backend inherits runtime config and `.env` provider credentials.
+- Objective expressions can inspect rollout telemetry through fields such as `rollout.duration_ms`, `rollout.stage_count`, `rollout.tool_call_count`, `rollout.prompt_call_count`, `rollout.agent_turn_count`, `rollout.loop_iteration_count`, and `rollout.trace`.
 
 CLI Cheatsheet
 --------------
@@ -66,6 +69,8 @@ CLI Cheatsheet
 - `scaffold parse FILE` — syntax only (for debugging).
 - `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
 - `scaffold run FILE --task TASK [--harness H] --input JSON` — execute a task directly from IR.
+- `scaffold evaluate FILE --objective OBJ [--assignments JSON] [--case-id ID]` — evaluate an objective with the harness defaults or explicit assignment overrides.
+- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|dspy] [--report-dir DIR]` — optimize an objective with a pluggable proposal backend and optionally persist candidate reports.
 
 Repository Layout
 -----------------
@@ -91,9 +96,9 @@ Design Principles
 Status
 ------
 - Parser, type checker, verifier, IR, runtime interpreter, and task-centric CLI are integrated.
-- Task/harness/objective syntax is present and task execution now runs directly from IR.
-- `examples/` now contains a small task-first starter set: tool stages, prompt+harness usage, and a bounded revision loop with an objective.
-- Ongoing: expand interpreter coverage for tool-backed agent stages, and rebuild optimizer/codegen on the new architecture.
+- Task/harness/objective syntax is present, task execution runs directly from IR, and optimization is available from the CLI with pluggable proposal backends.
+- `examples/` now contains a task-first starter set including tool stages, prompt+harness usage, a bounded revision loop, a Banking77 experiment, and an ARC-AGI-2 benchmark track with both mini and larger whole-task exact slices.
+- Ongoing: broaden interpreter coverage for remaining legacy tool constructs such as `pipe`/`foreign`, add richer evaluator provenance and judge policies, and revisit codegen as an export path on top of the new semantics.
 
 Contributing
 ------------

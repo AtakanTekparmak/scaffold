@@ -5,16 +5,22 @@
 //! - compile: Compile to IR and output JSON
 //! - parse: Parse a scaffold file and list declarations
 //! - run: Execute a task directly from IR with an optional harness
+//! - optimize: Search the declared harness space for an objective
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use scaffold_ir::{to_json, Lowerer, ScaffoldIR};
-use scaffold_runtime::execute_task as execute_ir_task;
+use scaffold_runtime::{
+    evaluate_objective_candidate as evaluate_ir_objective_candidate,
+    execute_task as execute_ir_task, optimize_objective_with_artifacts as optimize_ir_objective,
+    CandidateOptimizationReport, ObjectiveOptimizationArtifacts, OptimizationBackendKind,
+    OptimizationOptions,
+};
 use scaffold_syntax::parse;
 use scaffold_types::check;
 use scaffold_verify::{verify, Severity};
@@ -25,6 +31,12 @@ use scaffold_verify::{verify, Severity};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum OptimizeBackend {
+    Interpreter,
+    Dspy,
 }
 
 #[derive(Subcommand)]
@@ -92,6 +104,93 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+
+    /// Optimize an objective by searching its declared harness space
+    Optimize {
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Objective to optimize
+        #[arg(short, long)]
+        objective: Option<String>,
+
+        /// Show verbose output
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Enable verification checks
+        #[arg(long)]
+        verify: bool,
+
+        /// Config file to load into the runtime
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Maximum number of candidates to evaluate
+        #[arg(long, default_value_t = 256)]
+        max_candidates: usize,
+
+        /// Candidate proposal backend
+        #[arg(long, value_enum, default_value_t = OptimizeBackend::Interpreter)]
+        backend: OptimizeBackend,
+
+        /// Override the backend command for external backends like DSPy
+        #[arg(long)]
+        backend_command: Option<String>,
+
+        /// Directory where the optimization report and candidate summaries are written
+        #[arg(long)]
+        report_dir: Option<PathBuf>,
+    },
+
+    /// Evaluate an objective with the harness defaults or explicit assignments
+    Evaluate {
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Objective to evaluate
+        #[arg(short, long)]
+        objective: Option<String>,
+
+        /// Candidate assignment JSON object to apply on top of the harness defaults
+        #[arg(long, default_value = "{}")]
+        assignments: String,
+
+        /// Restrict evaluation to a single dataset case id
+        #[arg(long)]
+        case_id: Option<String>,
+
+        /// Enable verification checks
+        #[arg(long)]
+        verify: bool,
+
+        /// Config file to load into the runtime
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    #[command(hide = true, name = "internal-evaluate-candidate")]
+    InternalEvaluateCandidate {
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        #[arg(long)]
+        objective: String,
+
+        #[arg(long)]
+        assignments: String,
+
+        #[arg(long)]
+        case_id: Option<String>,
+
+        #[arg(long)]
+        verify: bool,
+
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -119,6 +218,57 @@ fn main() -> ExitCode {
             harness.as_deref(),
             &input,
             verbose,
+            verify,
+            config.as_deref(),
+        ),
+        Commands::Optimize {
+            file,
+            objective,
+            verbose,
+            verify,
+            config,
+            max_candidates,
+            backend,
+            backend_command,
+            report_dir,
+        } => cmd_optimize(
+            &file,
+            objective.as_deref(),
+            verbose,
+            verify,
+            config.as_deref(),
+            max_candidates,
+            backend,
+            backend_command.as_deref(),
+            report_dir.as_deref(),
+        ),
+        Commands::Evaluate {
+            file,
+            objective,
+            assignments,
+            case_id,
+            verify,
+            config,
+        } => cmd_evaluate(
+            &file,
+            objective.as_deref(),
+            &assignments,
+            case_id.as_deref(),
+            verify,
+            config.as_deref(),
+        ),
+        Commands::InternalEvaluateCandidate {
+            file,
+            objective,
+            assignments,
+            case_id,
+            verify,
+            config,
+        } => cmd_internal_evaluate_candidate(
+            &file,
+            &objective,
+            &assignments,
+            case_id.as_deref(),
             verify,
             config.as_deref(),
         ),
@@ -355,6 +505,8 @@ fn cmd_run(
                 return ExitCode::FAILURE;
             }
         }
+        // Propagate explicit config selection to subprocess-based optimizer backends.
+        std::env::set_var("SCAFFOLD_CONFIG_PATH", config_path);
     }
 
     let input_value = match serde_json::from_str::<serde_json::Value>(&input_json) {
@@ -387,6 +539,325 @@ fn cmd_run(
         },
         Err(error) => {
             eprintln!("Task execution failed: {}", error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_optimize(
+    file: &PathBuf,
+    objective: Option<&str>,
+    verbose: bool,
+    verify_enabled: bool,
+    config: Option<&Path>,
+    max_candidates: usize,
+    backend: OptimizeBackend,
+    backend_command: Option<&str>,
+    report_dir: Option<&Path>,
+) -> ExitCode {
+    let ir = match parse_typecheck_lower(file, verify_enabled) {
+        Ok(ir) => ir,
+        Err(code) => return code,
+    };
+
+    let objective_name = if let Some(name) = objective {
+        name.to_string()
+    } else if ir.objectives.len() == 1 {
+        ir.objectives[0].name.clone()
+    } else if ir.objectives.is_empty() {
+        eprintln!("No objectives found in {}", file.display());
+        return ExitCode::FAILURE;
+    } else {
+        let objective_names = ir
+            .objectives
+            .iter()
+            .map(|objective| objective.name.clone())
+            .collect::<Vec<_>>();
+        eprintln!("Multiple objectives available. Please specify one:");
+        eprintln!("  Objectives: {:?}", objective_names);
+        eprintln!(
+            "\nUsage: scaffold optimize {} --objective <OBJECTIVE>",
+            file.display()
+        );
+        return ExitCode::FAILURE;
+    };
+
+    if !ir
+        .objectives
+        .iter()
+        .any(|candidate| candidate.name == objective_name)
+    {
+        eprintln!(
+            "objective '{}' not found in {}",
+            objective_name,
+            file.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if let Some(config_path) = config {
+        if let Err(error) = scaffold_runtime::config::init_from_path(config_path) {
+            if error != "Config already initialized" {
+                eprintln!(
+                    "Failed to initialize runtime config from {}: {}",
+                    config_path.display(),
+                    error
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        std::env::set_var("SCAFFOLD_CONFIG_PATH", config_path);
+    }
+
+    if verbose {
+        eprintln!(
+            "Optimizing objective {} with {:?} backend and up to {} candidate(s)",
+            objective_name, backend, max_candidates
+        );
+    }
+
+    let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let options = OptimizationOptions {
+        backend: match backend {
+            OptimizeBackend::Interpreter => OptimizationBackendKind::Interpreter,
+            OptimizeBackend::Dspy => OptimizationBackendKind::Dspy,
+        },
+        max_candidates,
+        backend_command: backend_command.map(str::to_string),
+        source_file: Some(fs::canonicalize(file).unwrap_or_else(|_| file.clone())),
+    };
+    match optimize_ir_objective(&ir, &objective_name, base_dir, options) {
+        Ok(artifacts) => {
+            if let Some(report_dir) = report_dir {
+                match write_optimization_report_dir(report_dir, &artifacts) {
+                    Ok(path) => eprintln!("Wrote optimization report to {}", path.display()),
+                    Err(error) => {
+                        eprintln!("Failed to write optimization report dir: {}", error);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            match serde_json::to_string_pretty(&artifacts.report) {
+                Ok(json) => {
+                    println!("{}", json);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("Failed to serialize optimization report: {}", error);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("Optimization failed: {}", error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn write_optimization_report_dir(
+    report_dir: &Path,
+    artifacts: &ObjectiveOptimizationArtifacts,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(report_dir).map_err(|error| {
+        format!(
+            "failed to create report directory {}: {}",
+            report_dir.display(),
+            error
+        )
+    })?;
+
+    let report_path = report_dir.join("report.json");
+    let best_candidate_path = report_dir.join("best.candidate.json");
+    let best_assignments_path = report_dir.join("best.assignments.json");
+    let candidates_path = report_dir.join("candidates.jsonl");
+
+    let report_json = serde_json::to_string_pretty(&artifacts.report)
+        .map_err(|error| format!("failed to serialize report.json: {}", error))?;
+    fs::write(&report_path, report_json)
+        .map_err(|error| format!("failed to write {}: {}", report_path.display(), error))?;
+
+    let best_candidate_json = serde_json::to_string_pretty(&artifacts.report.best)
+        .map_err(|error| format!("failed to serialize best.candidate.json: {}", error))?;
+    fs::write(&best_candidate_path, best_candidate_json).map_err(|error| {
+        format!(
+            "failed to write {}: {}",
+            best_candidate_path.display(),
+            error
+        )
+    })?;
+
+    let best_assignments_json = serde_json::to_string_pretty(&artifacts.report.best.assignments)
+        .map_err(|error| format!("failed to serialize best.assignments.json: {}", error))?;
+    fs::write(&best_assignments_path, best_assignments_json).map_err(|error| {
+        format!(
+            "failed to write {}: {}",
+            best_assignments_path.display(),
+            error
+        )
+    })?;
+
+    let mut candidates_jsonl = String::new();
+    for (index, candidate) in artifacts.candidates.iter().enumerate() {
+        let line = candidate_report_line(index, candidate)
+            .map_err(|error| format!("failed to serialize candidates.jsonl: {}", error))?;
+        candidates_jsonl.push_str(&line);
+        candidates_jsonl.push('\n');
+    }
+    fs::write(&candidates_path, candidates_jsonl)
+        .map_err(|error| format!("failed to write {}: {}", candidates_path.display(), error))?;
+
+    Ok(fs::canonicalize(report_dir).unwrap_or_else(|_| report_dir.to_path_buf()))
+}
+
+fn candidate_report_line(
+    index: usize,
+    candidate: &CandidateOptimizationReport,
+) -> serde_json::Result<String> {
+    let mut payload = serde_json::to_value(candidate)?;
+    let object = payload
+        .as_object_mut()
+        .expect("candidate reports always serialize to objects");
+    object.insert("index".to_string(), serde_json::json!(index));
+    serde_json::to_string(&payload)
+}
+
+fn cmd_evaluate(
+    file: &PathBuf,
+    objective: Option<&str>,
+    assignments: &str,
+    case_id: Option<&str>,
+    verify_enabled: bool,
+    config: Option<&Path>,
+) -> ExitCode {
+    let ir = match parse_typecheck_lower(file, verify_enabled) {
+        Ok(ir) => ir,
+        Err(code) => return code,
+    };
+
+    let objective_name = if let Some(name) = objective {
+        name.to_string()
+    } else if ir.objectives.len() == 1 {
+        ir.objectives[0].name.clone()
+    } else if ir.objectives.is_empty() {
+        eprintln!("No objectives found in {}", file.display());
+        return ExitCode::FAILURE;
+    } else {
+        let objective_names = ir
+            .objectives
+            .iter()
+            .map(|objective| objective.name.clone())
+            .collect::<Vec<_>>();
+        eprintln!("Multiple objectives available. Please specify one:");
+        eprintln!("  Objectives: {:?}", objective_names);
+        eprintln!(
+            "\nUsage: scaffold evaluate {} --objective <OBJECTIVE>",
+            file.display()
+        );
+        return ExitCode::FAILURE;
+    };
+
+    if !ir
+        .objectives
+        .iter()
+        .any(|candidate| candidate.name == objective_name)
+    {
+        eprintln!(
+            "objective '{}' not found in {}",
+            objective_name,
+            file.display()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if let Some(config_path) = config {
+        if let Err(error) = scaffold_runtime::config::init_from_path(config_path) {
+            if error != "Config already initialized" {
+                eprintln!(
+                    "Failed to initialize runtime config from {}: {}",
+                    config_path.display(),
+                    error
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+        std::env::set_var("SCAFFOLD_CONFIG_PATH", config_path);
+    }
+
+    cmd_evaluate_candidate(file, &ir, &objective_name, assignments, case_id)
+}
+
+fn cmd_internal_evaluate_candidate(
+    file: &PathBuf,
+    objective: &str,
+    assignments: &str,
+    case_id: Option<&str>,
+    verify_enabled: bool,
+    config: Option<&Path>,
+) -> ExitCode {
+    let ir = match parse_typecheck_lower(file, verify_enabled) {
+        Ok(ir) => ir,
+        Err(code) => return code,
+    };
+
+    let inherited_config = std::env::var_os("SCAFFOLD_CONFIG_PATH").map(PathBuf::from);
+    if let Some(config_path) = config.map(PathBuf::from).or(inherited_config) {
+        if let Err(error) = scaffold_runtime::config::init_from_path(&config_path) {
+            if error != "Config already initialized" {
+                eprintln!(
+                    "Failed to initialize runtime config from {}: {}",
+                    config_path.display(),
+                    error
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    cmd_evaluate_candidate(file, &ir, objective, assignments, case_id)
+}
+
+fn cmd_evaluate_candidate(
+    file: &PathBuf,
+    ir: &ScaffoldIR,
+    objective: &str,
+    assignments: &str,
+    case_id: Option<&str>,
+) -> ExitCode {
+    let assignments_json = match serde_json::from_str::<serde_json::Value>(assignments) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Failed to parse assignments JSON: {}", error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let assignments_object = match assignments_json {
+        serde_json::Value::Object(map) => map,
+        _ => {
+            eprintln!("Assignments JSON must be an object");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let assignments_map = assignments_object
+        .into_iter()
+        .map(|(key, value)| (key, scaffold_runtime::Value::from(value)))
+        .collect();
+
+    let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
+    match evaluate_ir_objective_candidate(&ir, objective, &assignments_map, base_dir, case_id) {
+        Ok(report) => match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                println!("{}", json);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("Failed to serialize candidate evaluation report: {}", error);
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("Candidate evaluation failed: {}", error);
             ExitCode::FAILURE
         }
     }

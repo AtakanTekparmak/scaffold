@@ -1,5 +1,6 @@
 //! Interpreter-style execution for task/harness IR.
 
+use crate::config::config as runtime_config;
 use crate::error::{Error, Result};
 use crate::llm::{query_structured_with_config, LlmConfig};
 use crate::prompt::PromptManager;
@@ -12,7 +13,7 @@ use scaffold_ir::{
     SelectIR, StageIR, StageKindIR, StringOrFileIR, TaskIR, TaskNodeIR, ToolExprIR, ToolIR,
     ToolImplIR, ToolStatementIR, TunableIR, TuneOperatorIR, TypeIR,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
 use std::collections::{hash_map::DefaultHasher, BTreeSet, HashMap};
@@ -20,6 +21,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::time::Instant;
 use tokio::time::{timeout, Duration};
@@ -47,12 +49,60 @@ pub fn optimize_objective(
     base_dir: &Path,
     max_candidates: usize,
 ) -> Result<ObjectiveOptimizationReport> {
+    optimize_objective_with_options(
+        ir,
+        objective_name,
+        base_dir,
+        OptimizationOptions {
+            max_candidates,
+            ..OptimizationOptions::default()
+        },
+    )
+}
+
+/// Evaluate one concrete harness assignment against an objective.
+pub fn evaluate_objective_candidate(
+    ir: &ScaffoldIR,
+    objective_name: &str,
+    assignments: &HashMap<String, Value>,
+    base_dir: &Path,
+    case_id: Option<&str>,
+) -> Result<CandidateOptimizationReport> {
+    let interpreter = TaskInterpreter::new(ir, base_dir);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Runtime(format!("failed to create task runtime: {}", e)))?;
+    runtime.block_on(interpreter.evaluate_objective_candidate_report(
+        objective_name,
+        assignments,
+        case_id,
+    ))
+}
+
+/// Optimize an objective using a pluggable proposal backend.
+pub fn optimize_objective_with_options(
+    ir: &ScaffoldIR,
+    objective_name: &str,
+    base_dir: &Path,
+    options: OptimizationOptions,
+) -> Result<ObjectiveOptimizationReport> {
+    Ok(optimize_objective_with_artifacts(ir, objective_name, base_dir, options)?.report)
+}
+
+/// Optimize an objective and return the full evaluated candidate set.
+pub fn optimize_objective_with_artifacts(
+    ir: &ScaffoldIR,
+    objective_name: &str,
+    base_dir: &Path,
+    options: OptimizationOptions,
+) -> Result<ObjectiveOptimizationArtifacts> {
     let interpreter = TaskInterpreter::new(ir, base_dir);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| Error::Runtime(format!("failed to create optimization runtime: {}", e)))?;
-    runtime.block_on(interpreter.optimize(objective_name, max_candidates))
+    runtime.block_on(interpreter.optimize(objective_name, &options))
 }
 
 struct TaskInterpreter<'a> {
@@ -89,17 +139,84 @@ impl ResolvedHarness {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizationBackendKind {
+    #[default]
+    Interpreter,
+    Dspy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationOptions {
+    pub backend: OptimizationBackendKind,
+    pub max_candidates: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<PathBuf>,
+}
+
+impl Default for OptimizationOptions {
+    fn default() -> Self {
+        Self {
+            backend: OptimizationBackendKind::Interpreter,
+            max_candidates: 256,
+            backend_command: None,
+            source_file: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationTunableDomain {
+    pub path: String,
+    pub options: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationDatasetCase {
+    pub id: Option<String>,
+    pub input: Value,
+    pub expected: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationBackendRequest {
+    pub objective_name: String,
+    pub task: TaskIR,
+    pub harness: HarnessIR,
+    pub objective: ObjectiveIR,
+    pub dataset: Vec<OptimizationDatasetCase>,
+    pub tunables: Vec<OptimizationTunableDomain>,
+    pub max_candidates: usize,
+    pub base_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizationBackendResponse {
+    pub assignments: Vec<HashMap<String, Value>>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectiveOptimizationReport {
     pub objective: String,
     pub task: String,
     pub harness: String,
+    pub backend: OptimizationBackendKind,
     pub evaluated_candidates: usize,
     pub truncated: bool,
     pub best: CandidateOptimizationReport,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectiveOptimizationArtifacts {
+    pub report: ObjectiveOptimizationReport,
+    pub candidates: Vec<CandidateOptimizationReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateOptimizationReport {
     pub assignments: HashMap<String, Value>,
     pub train: SplitEvaluationSummary,
@@ -107,7 +224,7 @@ pub struct CandidateOptimizationReport {
     pub test: Option<SplitEvaluationSummary>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitEvaluationSummary {
     pub rollouts: usize,
     pub metrics: HashMap<String, f64>,
@@ -122,6 +239,17 @@ struct CandidateEvaluation {
     train: SplitEvaluationSummary,
     val: Option<SplitEvaluationSummary>,
     test: Option<SplitEvaluationSummary>,
+}
+
+impl CandidateEvaluation {
+    fn to_report(&self) -> CandidateOptimizationReport {
+        CandidateOptimizationReport {
+            assignments: self.assignments.clone(),
+            train: self.train.clone(),
+            val: self.val.clone(),
+            test: self.test.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2699,8 +2827,9 @@ impl<'a> TaskInterpreter<'a> {
     async fn optimize(
         &self,
         objective_name: &str,
-        max_candidates: usize,
-    ) -> Result<ObjectiveOptimizationReport> {
+        options: &OptimizationOptions,
+    ) -> Result<ObjectiveOptimizationArtifacts> {
+        let max_candidates = options.max_candidates;
         if max_candidates == 0 {
             return Err(Error::Runtime(
                 "optimize requires max_candidates >= 1".to_string(),
@@ -2718,12 +2847,17 @@ impl<'a> TaskInterpreter<'a> {
             )));
         }
 
-        let (assignments, truncated) =
-            self.enumerate_candidate_assignments(task, harness, max_candidates)?;
+        let OptimizationBackendResponse {
+            assignments,
+            truncated,
+        } = self
+            .propose_candidate_assignments(objective, task, harness, &dataset, options)
+            .await?;
         let evaluated_candidates = assignments.len();
         let (train_cases, val_cases, test_cases) = self.partition_dataset(&dataset, objective);
 
         let mut best: Option<CandidateEvaluation> = None;
+        let mut candidate_reports = Vec::with_capacity(evaluated_candidates);
         for assignment in assignments {
             let resolved = self.resolve_harness_with_assignments(
                 &objective.task,
@@ -2741,6 +2875,7 @@ impl<'a> TaskInterpreter<'a> {
                     &test_cases,
                 )
                 .await?;
+            candidate_reports.push(candidate.to_report());
             if best
                 .as_ref()
                 .map(|current| self.candidate_beats(&candidate, current))
@@ -2757,19 +2892,341 @@ impl<'a> TaskInterpreter<'a> {
             ))
         })?;
 
-        Ok(ObjectiveOptimizationReport {
-            objective: objective.name.clone(),
-            task: objective.task.clone(),
-            harness: objective.harness.clone(),
-            evaluated_candidates,
-            truncated,
-            best: CandidateOptimizationReport {
-                assignments: best.assignments,
-                train: best.train,
-                val: best.val,
-                test: best.test,
+        Ok(ObjectiveOptimizationArtifacts {
+            report: ObjectiveOptimizationReport {
+                objective: objective.name.clone(),
+                task: objective.task.clone(),
+                harness: objective.harness.clone(),
+                backend: options.backend,
+                evaluated_candidates,
+                truncated,
+                best: best.to_report(),
             },
+            candidates: candidate_reports,
         })
+    }
+
+    async fn evaluate_objective_candidate_report(
+        &self,
+        objective_name: &str,
+        assignments: &HashMap<String, Value>,
+        case_id: Option<&str>,
+    ) -> Result<CandidateOptimizationReport> {
+        let objective = self.find_objective(objective_name)?;
+        let task = self.find_task(&objective.task)?;
+        let dataset = self.load_dataset_cases(objective, task)?;
+        if dataset.is_empty() {
+            return Err(Error::Runtime(format!(
+                "objective '{}' has an empty dataset",
+                objective.name
+            )));
+        }
+
+        let filtered = if let Some(case_id) = case_id {
+            let filtered = dataset
+                .into_iter()
+                .filter(|case| case.id.as_deref() == Some(case_id))
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                return Err(Error::Runtime(format!(
+                    "objective '{}' does not contain dataset case '{}'",
+                    objective.name, case_id
+                )));
+            }
+            filtered
+        } else {
+            dataset
+        };
+
+        let resolved = self.resolve_harness_with_assignments(
+            &objective.task,
+            &objective.harness,
+            assignments,
+        )?;
+        let (train_cases, val_cases, test_cases) = if case_id.is_some() {
+            (filtered, Vec::new(), Vec::new())
+        } else {
+            self.partition_dataset(&filtered, objective)
+        };
+
+        let candidate = self
+            .evaluate_candidate(
+                objective,
+                task,
+                &resolved,
+                assignments,
+                &train_cases,
+                &val_cases,
+                &test_cases,
+            )
+            .await?;
+
+        Ok(CandidateOptimizationReport {
+            assignments: candidate.assignments,
+            train: candidate.train,
+            val: candidate.val,
+            test: candidate.test,
+        })
+    }
+
+    async fn propose_candidate_assignments(
+        &self,
+        objective: &ObjectiveIR,
+        task: &TaskIR,
+        harness: &HarnessIR,
+        dataset: &[DatasetCase],
+        options: &OptimizationOptions,
+    ) -> Result<OptimizationBackendResponse> {
+        match options.backend {
+            OptimizationBackendKind::Interpreter => {
+                let (assignments, truncated) =
+                    self.enumerate_candidate_assignments(task, harness, options.max_candidates)?;
+                Ok(OptimizationBackendResponse {
+                    assignments,
+                    truncated,
+                })
+            }
+            OptimizationBackendKind::Dspy => {
+                let tunables = self.collect_tunable_domains(task, harness)?;
+                let request = OptimizationBackendRequest {
+                    objective_name: objective.name.clone(),
+                    task: task.clone(),
+                    harness: harness.clone(),
+                    objective: objective.clone(),
+                    dataset: dataset
+                        .iter()
+                        .map(|case| OptimizationDatasetCase {
+                            id: case.id.clone(),
+                            input: case.input.clone(),
+                            expected: case.expected.clone(),
+                        })
+                        .collect(),
+                    tunables: tunables.clone(),
+                    max_candidates: options.max_candidates,
+                    base_dir: self.base_dir.clone(),
+                };
+                let response = self.run_external_optimizer_backend(options, &request)?;
+                let assignments = self.validate_proposed_assignments(
+                    &tunables,
+                    response.assignments,
+                    options.max_candidates,
+                )?;
+                Ok(OptimizationBackendResponse {
+                    truncated: response.truncated || assignments.len() >= options.max_candidates,
+                    assignments,
+                })
+            }
+        }
+    }
+
+    fn collect_tunable_domains(
+        &self,
+        task: &TaskIR,
+        harness: &HarnessIR,
+    ) -> Result<Vec<OptimizationTunableDomain>> {
+        harness
+            .tunables
+            .iter()
+            .map(|tunable| {
+                Ok(OptimizationTunableDomain {
+                    path: tunable.path.segments.join("."),
+                    options: self.expand_tunable_domain(task, harness, tunable)?,
+                })
+            })
+            .collect()
+    }
+
+    fn validate_proposed_assignments(
+        &self,
+        tunables: &[OptimizationTunableDomain],
+        assignments: Vec<HashMap<String, Value>>,
+        max_candidates: usize,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        let allowed = tunables
+            .iter()
+            .map(|tunable| (tunable.path.clone(), tunable.options.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let mut dedup = BTreeSet::new();
+        let mut validated = Vec::new();
+        for assignment in assignments {
+            for (path, value) in &assignment {
+                let options = allowed.get(path).ok_or_else(|| {
+                    Error::Runtime(format!(
+                        "optimizer backend proposed unknown tunable path '{}'",
+                        path
+                    ))
+                })?;
+                if !options.iter().any(|candidate| candidate == value) {
+                    return Err(Error::Runtime(format!(
+                        "optimizer backend proposed illegal value for '{}': {}",
+                        path, value
+                    )));
+                }
+            }
+
+            let key = serde_json::to_string(&assignment)
+                .map_err(|e| Error::SerializationError(e.to_string()))?;
+            if dedup.insert(key) {
+                validated.push(assignment);
+            }
+            if validated.len() >= max_candidates {
+                break;
+            }
+        }
+
+        if validated.is_empty() {
+            validated.push(HashMap::new());
+        }
+
+        Ok(validated)
+    }
+
+    fn run_external_optimizer_backend(
+        &self,
+        options: &OptimizationOptions,
+        request: &OptimizationBackendRequest,
+    ) -> Result<OptimizationBackendResponse> {
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| self.base_dir.clone());
+        let command = options
+            .backend_command
+            .clone()
+            .or_else(|| std::env::var("SCAFFOLD_DSPY_BACKEND_CMD").ok())
+            .unwrap_or_else(|| "python3 tools/dspy_optimize.py".to_string());
+
+        let payload =
+            serde_json::to_vec(request).map_err(|e| Error::SerializationError(e.to_string()))?;
+        let mut process = if cfg!(windows) {
+            let mut command_process = Command::new("cmd");
+            command_process
+                .arg("/C")
+                .arg(&command)
+                .current_dir(&working_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            self.configure_optimizer_backend_command_env(
+                &mut command_process,
+                &working_dir,
+                options,
+            );
+            command_process.spawn()
+        } else {
+            let mut command_process = Command::new("sh");
+            command_process
+                .arg("-lc")
+                .arg(&command)
+                .current_dir(&working_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            self.configure_optimizer_backend_command_env(
+                &mut command_process,
+                &working_dir,
+                options,
+            );
+            command_process.spawn()
+        }
+        .map_err(|e| {
+            Error::Runtime(format!(
+                "failed to start {:?} optimizer backend command '{}': {}",
+                options.backend, command, e
+            ))
+        })?;
+
+        if let Some(mut stdin) = process.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(&payload)
+                .and_then(|_| stdin.flush())
+                .map_err(|e| {
+                    Error::Runtime(format!(
+                        "failed to send request to {:?} optimizer backend: {}",
+                        options.backend, e
+                    ))
+                })?;
+        }
+
+        let output = process.wait_with_output().map_err(|e| {
+            Error::Runtime(format!(
+                "failed to wait for {:?} optimizer backend: {}",
+                options.backend, e
+            ))
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Err(Error::Runtime(format!(
+                "{:?} optimizer backend command '{}' failed with status {}. stderr: {}{}",
+                options.backend,
+                command,
+                output.status,
+                if stderr.is_empty() {
+                    "<empty>"
+                } else {
+                    &stderr
+                },
+                if stdout.is_empty() {
+                    String::new()
+                } else {
+                    format!(", stdout: {}", stdout)
+                }
+            )));
+        }
+
+        serde_json::from_slice::<OptimizationBackendResponse>(&output.stdout).map_err(|e| {
+            Error::Runtime(format!(
+                "failed to parse {:?} optimizer backend response as JSON: {}",
+                options.backend, e
+            ))
+        })
+    }
+
+    fn configure_optimizer_backend_command_env(
+        &self,
+        command: &mut Command,
+        working_dir: &Path,
+        options: &OptimizationOptions,
+    ) {
+        let config = runtime_config();
+
+        if let Some(value) = std::env::var("OPENROUTER_API_KEY")
+            .ok()
+            .or_else(|| config.llm.openrouter.api_key.clone())
+        {
+            command.env("OPENROUTER_API_KEY", value);
+        }
+        if let Some(value) = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .or_else(|| config.llm.openai.api_key.clone())
+        {
+            command.env("OPENAI_API_KEY", value);
+        }
+        if let Some(value) = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .or_else(|| config.llm.anthropic.api_key.clone())
+        {
+            command.env("ANTHROPIC_API_KEY", value);
+        }
+        if let Some(value) = std::env::var("SCAFFOLD_DSPY_API_BASE")
+            .ok()
+            .or_else(|| config.llm.openrouter.base_url.clone())
+            .or_else(|| config.llm.openai.base_url.clone())
+            .or_else(|| config.llm.anthropic.base_url.clone())
+        {
+            command.env("SCAFFOLD_DSPY_API_BASE", value);
+        }
+
+        command
+            .env("SCAFFOLD_WORKSPACE_DIR", working_dir)
+            .env("SCAFFOLD_FILE_DIR", &self.base_dir);
+        if let Ok(value) = std::env::current_exe() {
+            command.env("SCAFFOLD_CLI_BIN", value);
+        }
+        if let Some(source_file) = &options.source_file {
+            command.env("SCAFFOLD_SOURCE_FILE", source_file);
+        }
     }
 
     fn load_dataset_cases(
@@ -5224,6 +5681,182 @@ mod tests {
         let report = optimize_objective(&ir, "quality", Path::new("."), 8).unwrap();
 
         assert_eq!(report.evaluated_candidates, 2);
+        assert_eq!(
+            report.best.assignments.get("format.variant"),
+            Some(&Value::String("formatter::shout".to_string()))
+        );
+        assert_eq!(report.backend, OptimizationBackendKind::Interpreter);
+        assert_eq!(report.best.train.primary, 1.0);
+    }
+
+    #[test]
+    fn optimize_objective_accepts_external_backend_proposals() {
+        let ir = ScaffoldIR {
+            tools: vec![ToolIR {
+                name: "formatter".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::String,
+                implementation: Some(ToolImplIR::Expr {
+                    expr: ToolExprIR::Ident {
+                        name: "text".to_string(),
+                    },
+                }),
+                spec: None,
+                variants: vec![
+                    ToolVariantIR {
+                        name: "plain".to_string(),
+                        implementation: ToolImplIR::Expr {
+                            expr: ToolExprIR::Ident {
+                                name: "text".to_string(),
+                            },
+                        },
+                    },
+                    ToolVariantIR {
+                        name: "shout".to_string(),
+                        implementation: ToolImplIR::Expr {
+                            expr: ToolExprIR::Shell {
+                                command: "printf '{text}' | tr '[:lower:]' '[:upper:]'".to_string(),
+                            },
+                        },
+                    },
+                ],
+            }],
+            types: vec![TypeDefIR {
+                name: "TaskOutput".to_string(),
+                kind: TypeDefKindIR::Type,
+                definition: TypeIR::Struct {
+                    fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                },
+            }],
+            tasks: vec![TaskIR {
+                name: "format_text".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::Named {
+                    name: "TaskOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "formatted".to_string(),
+                    ty: TypeIR::String,
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "format".to_string(),
+                    stage_kind: StageKindIR::Tool,
+                    component: "formatter".to_string(),
+                    input: ExprIR::Ident {
+                        name: "input".to_string(),
+                    },
+                    output: "formatted".to_string(),
+                    when: None,
+                })],
+                emit: vec![EmitFieldIR {
+                    name: "answer".to_string(),
+                    value: ExprIR::Ident {
+                        name: "formatted".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "search".to_string(),
+                task: "format_text".to_string(),
+                defaults: Vec::new(),
+                bindings: Vec::new(),
+                tunables: vec![TunableIR {
+                    path: BindingPathIR {
+                        segments: vec!["format".to_string(), "variant".to_string()],
+                    },
+                    operator: TuneOperatorIR::In,
+                    domain: FiniteDomainIR::Variants {
+                        name: "formatter".to_string(),
+                    },
+                }],
+            }],
+            objectives: vec![ObjectiveIR {
+                name: "quality".to_string(),
+                task: "format_text".to_string(),
+                harness: "search".to_string(),
+                dataset: scaffold_ir::DatasetSpecIR::Inline {
+                    cases: vec![scaffold_ir::InlineDatasetCaseIR {
+                        id: Some("one".to_string()),
+                        input: ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "text".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "hello".to_string(),
+                                    },
+                                },
+                            }],
+                        },
+                        expected: Some(ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "answer".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "HELLO".to_string(),
+                                    },
+                                },
+                            }],
+                        }),
+                    }],
+                },
+                repeats: Some(1),
+                constraints: Vec::new(),
+                checkers: Vec::new(),
+                judges: Vec::new(),
+                metrics: vec![MetricIR {
+                    name: "exact".to_string(),
+                    expr: ExprIR::Binary {
+                        left: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "output".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                        op: "==".to_string(),
+                        right: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "expected".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                    },
+                }],
+                score: ExprIR::Ident {
+                    name: "exact".to_string(),
+                },
+                split: None,
+                select: Some(SelectIR {
+                    primary: ExprIR::Ident {
+                        name: "exact".to_string(),
+                    },
+                    tie_breakers: Vec::new(),
+                }),
+            }],
+            ..empty_ir()
+        };
+
+        let report = optimize_objective_with_options(
+            &ir,
+            "quality",
+            Path::new("."),
+            OptimizationOptions {
+                backend: OptimizationBackendKind::Dspy,
+                max_candidates: 8,
+                backend_command: Some(
+                    r#"printf '%s' '{"assignments":[{"format.variant":"formatter::shout"}],"truncated":false}'"#
+                        .to_string(),
+                ),
+                source_file: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.backend, OptimizationBackendKind::Dspy);
+        assert_eq!(report.evaluated_candidates, 1);
         assert_eq!(
             report.best.assignments.get("format.variant"),
             Some(&Value::String("formatter::shout".to_string()))

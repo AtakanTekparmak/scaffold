@@ -16,6 +16,7 @@ tool normalize_text {
     impl: shell("printf '%s' '{text}' | tr '\\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'")
 
     variants {
+        plain: shell("printf '%s' '{text}' | tr '\\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'")
         loud: shell("printf '%s' '{text}' | tr '[:lower:]' '[:upper:]' | tr '\\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'")
     }
 }
@@ -68,8 +69,29 @@ task inspect_text {
     }
 }
 
-harness loud_text for task inspect_text {
-    bind normalize {
-        variant: "normalize_text::loud"
+harness search_normalizer for task inspect_text {
+    tune {
+        normalize.variant in variants("normalize_text")
+    }
+}
+
+objective uppercase_cleaning for task inspect_text {
+    dataset: [
+        {
+            id: "loud-cleaning",
+            input: { text: "hello  world" },
+            expected: { cleaned: "HELLO WORLD", words: 2, chars: 11 }
+        }
+    ]
+    harness: search_normalizer
+    repeats: 1
+    constraint clean_present = len(output.cleaned) > 0
+    checker exact_cleaned = output.cleaned == expected.cleaned
+    metric word_match = output.words == expected.words
+    metric char_match = output.chars == expected.chars
+    score = exact_cleaned
+    select {
+        primary: exact_cleaned
+        tie_breakers: [word_match, char_match]
     }
 }
