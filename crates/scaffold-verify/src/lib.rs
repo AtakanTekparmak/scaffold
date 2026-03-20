@@ -132,6 +132,7 @@ enum TaskTargetKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HarnessFieldValueKind {
+    Bool,
     Int,
     Float,
     String,
@@ -738,6 +739,8 @@ impl<'a> ProgramVerifier<'a> {
                 let mut seen_fields = HashSet::new();
                 for binding in &bind.bindings {
                     self.verify_target_binding(
+                        task,
+                        &summary,
                         harness,
                         &bind.target,
                         target_kind,
@@ -799,7 +802,7 @@ impl<'a> ProgramVerifier<'a> {
                 continue;
             };
 
-            self.verify_tune_stmt(harness, tune, target_kind, spec);
+            self.verify_tune_stmt(task, &summary, harness, tune, target_kind, spec);
         }
     }
 
@@ -853,6 +856,8 @@ impl<'a> ProgramVerifier<'a> {
 
     fn verify_target_binding(
         &mut self,
+        task: &TaskDecl,
+        summary: &TaskSummary,
         harness: &HarnessDecl,
         target: &Ident,
         target_kind: TaskTargetKind,
@@ -895,16 +900,26 @@ impl<'a> ProgramVerifier<'a> {
             );
         }
 
-        self.verify_binding_value(
-            &format!("{}.{}", target.node, field.node),
-            spec,
-            &binding.value,
-            binding.span,
-        );
+        let path = format!("{}.{}", target.node, field.node);
+        if field.node == "component" {
+            self.verify_component_binding_value(
+                task,
+                summary,
+                target,
+                target_kind,
+                &path,
+                &binding.value,
+                binding.span,
+            );
+        } else {
+            self.verify_binding_value(&path, spec, &binding.value, binding.span);
+        }
     }
 
     fn verify_tune_stmt(
         &mut self,
+        task: &TaskDecl,
+        summary: &TaskSummary,
         _harness: &HarnessDecl,
         tune: &TuneStmt,
         target_kind: TaskTargetKind,
@@ -966,8 +981,23 @@ impl<'a> ProgramVerifier<'a> {
                 }
             }
             (_, FiniteDomain::List(values), _) => {
-                for value in values {
-                    self.verify_binding_value(&path, spec, value, value.span);
+                if tune.path.segments[1].node == "component" {
+                    let target = &tune.path.segments[0];
+                    for value in values {
+                        self.verify_component_binding_value(
+                            task,
+                            summary,
+                            target,
+                            target_kind,
+                            &path,
+                            value,
+                            value.span,
+                        );
+                    }
+                } else {
+                    for value in values {
+                        self.verify_binding_value(&path, spec, value, value.span);
+                    }
                 }
             }
             (TuneOperator::In, FiniteDomain::Variants(_), HarnessFieldValueKind::TextSurface) => {}
@@ -1003,6 +1033,12 @@ impl<'a> ProgramVerifier<'a> {
     ) -> Option<HarnessFieldSpec> {
         match target_kind {
             TaskTargetKind::Stage(StageKind::Tool) => match field {
+                "enabled" => Some(HarnessFieldSpec {
+                    value_kind: HarnessFieldValueKind::Bool,
+                }),
+                "component" => Some(HarnessFieldSpec {
+                    value_kind: HarnessFieldValueKind::String,
+                }),
                 "timeout_secs" | "retries" => Some(HarnessFieldSpec {
                     value_kind: HarnessFieldValueKind::Int,
                 }),
@@ -1012,6 +1048,12 @@ impl<'a> ProgramVerifier<'a> {
                 _ => None,
             },
             TaskTargetKind::Stage(StageKind::Prompt) => match field {
+                "enabled" => Some(HarnessFieldSpec {
+                    value_kind: HarnessFieldValueKind::Bool,
+                }),
+                "component" => Some(HarnessFieldSpec {
+                    value_kind: HarnessFieldValueKind::String,
+                }),
                 "model" => Some(HarnessFieldSpec {
                     value_kind: HarnessFieldValueKind::String,
                 }),
@@ -1027,6 +1069,12 @@ impl<'a> ProgramVerifier<'a> {
                 _ => None,
             },
             TaskTargetKind::Stage(StageKind::Agent) => match field {
+                "enabled" => Some(HarnessFieldSpec {
+                    value_kind: HarnessFieldValueKind::Bool,
+                }),
+                "component" => Some(HarnessFieldSpec {
+                    value_kind: HarnessFieldValueKind::String,
+                }),
                 "model" => Some(HarnessFieldSpec {
                     value_kind: HarnessFieldValueKind::String,
                 }),
@@ -1061,6 +1109,11 @@ impl<'a> ProgramVerifier<'a> {
         error_span: Span,
     ) {
         match spec.value_kind {
+            HarnessFieldValueKind::Bool => {
+                if !matches!(&expr.node, Expr::Literal(Literal::Bool(_))) {
+                    self.error(format!("'{}' must be a boolean literal", path), error_span);
+                }
+            }
             HarnessFieldValueKind::Int => {
                 if !self.is_numeric_config_expr(expr) {
                     self.error(
@@ -1160,6 +1213,129 @@ impl<'a> ProgramVerifier<'a> {
                 format!("'{}' references unknown tool '{}'", path, tool_name),
                 expr.span,
             );
+        }
+    }
+
+    fn verify_component_binding_value(
+        &mut self,
+        task: &TaskDecl,
+        summary: &TaskSummary,
+        target: &Ident,
+        target_kind: TaskTargetKind,
+        path: &str,
+        expr: &Spanned<Expr>,
+        error_span: Span,
+    ) {
+        let TaskTargetKind::Stage(stage_kind) = target_kind else {
+            self.error(
+                format!("'{}' may only target stage components", path),
+                error_span,
+            );
+            return;
+        };
+
+        let Expr::Literal(Literal::String(component_name)) = &expr.node else {
+            self.error(
+                format!(
+                    "'{}' must be a string literal naming a compatible {}",
+                    path,
+                    self.stage_kind_component_name(stage_kind)
+                ),
+                error_span,
+            );
+            return;
+        };
+
+        let Some(stage) = self.find_stage_decl(&task.nodes, &target.node) else {
+            self.error(
+                format!(
+                    "task '{}' does not define stage target '{}'",
+                    task.name.node, target.node
+                ),
+                target.span,
+            );
+            return;
+        };
+
+        let candidate_sig = match stage_kind {
+            StageKind::Tool => self.tool_sigs.get(component_name),
+            StageKind::Prompt => self.prompt_sigs.get(component_name),
+            StageKind::Agent => self.agent_sigs.get(component_name),
+        };
+
+        let Some(candidate_sig) = candidate_sig else {
+            self.error(
+                format!(
+                    "'{}' references unknown {} '{}'",
+                    path,
+                    self.stage_kind_component_name(stage_kind),
+                    component_name
+                ),
+                error_span,
+            );
+            return;
+        };
+
+        let expected_input = self.infer_expr_type(&stage.input, &summary.scope);
+        let Some(expected_output) = summary.artifacts.get(&stage.output.node) else {
+            self.error(
+                format!(
+                    "stage '{}' writes to unknown artifact '{}'",
+                    stage.name.node, stage.output.node
+                ),
+                stage.output.span,
+            );
+            return;
+        };
+
+        if !candidate_sig.input.is_compatible_with(&expected_input)
+            || !candidate_sig.output.is_compatible_with(expected_output)
+        {
+            self.error(
+                format!(
+                    "'{}' swaps stage '{}' to {} '{}', but it expects {} -> {} while the stage requires {} -> {}",
+                    path,
+                    stage.name.node,
+                    self.stage_kind_component_name(stage_kind),
+                    component_name,
+                    candidate_sig.input,
+                    candidate_sig.output,
+                    expected_input,
+                    expected_output
+                ),
+                error_span,
+            );
+        }
+    }
+
+    fn find_stage_decl<'b>(&self, nodes: &'b [TaskNode], target: &str) -> Option<&'b StageDecl> {
+        for node in nodes {
+            match node {
+                TaskNode::Stage(stage) if stage.name.node == target => return Some(stage),
+                TaskNode::Loop(loop_decl) => {
+                    if let Some(stage) = self.find_stage_decl(&loop_decl.nodes, target) {
+                        return Some(stage);
+                    }
+                }
+                TaskNode::Branch(branch) => {
+                    if let Some(stage) = self.find_stage_decl(&branch.then_nodes, target) {
+                        return Some(stage);
+                    }
+                    if let Some(stage) = self.find_stage_decl(&branch.else_nodes, target) {
+                        return Some(stage);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn stage_kind_component_name(&self, kind: StageKind) -> &'static str {
+        match kind {
+            StageKind::Tool => "tool",
+            StageKind::Prompt => "prompt",
+            StageKind::Agent => "agent",
         }
     }
 
@@ -2017,6 +2193,96 @@ mod tests {
                 .message
                 .contains("field 'model' is not mutable for tool stage 'gather'")
         }));
+    }
+
+    #[test]
+    fn test_verify_stage_enabled_binding_and_tune() {
+        let source = r#"
+            artifact Notes = { text: string }
+
+            prompt write_notes {
+                input: { question: string }
+                output: Notes
+                template: "write"
+            }
+
+            task answer_question {
+                input: { question: string }
+                output: { text: string }
+                artifacts {
+                    notes: Notes
+                }
+                stage write using prompt write_notes {
+                    in: { question: input.question }
+                    out: notes
+                }
+                emit {
+                    text: notes.text
+                }
+            }
+
+            harness baseline for task answer_question {
+                bind write {
+                    enabled: false
+                }
+                tune {
+                    write.enabled in [true, false]
+                }
+            }
+        "#;
+
+        let program = parse(source).unwrap();
+        let type_env = check(&program).unwrap();
+        let result = verify(&program, &type_env);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn test_verify_invalid_component_binding_type_mismatch() {
+        let source = r#"
+            artifact Draft = { text: string }
+            artifact Review = { score: float }
+
+            prompt write_draft {
+                input: { question: string }
+                output: Draft
+                template: "write"
+            }
+
+            prompt review_draft {
+                input: { question: string }
+                output: Review
+                template: "review"
+            }
+
+            task answer_question {
+                input: { question: string }
+                output: { text: string }
+                artifacts {
+                    draft: Draft
+                }
+                stage write using prompt write_draft {
+                    in: { question: input.question }
+                    out: draft
+                }
+                emit {
+                    text: draft.text
+                }
+            }
+
+            harness baseline for task answer_question {
+                bind write {
+                    component: "review_draft"
+                }
+            }
+        "#;
+
+        let program = parse(source).unwrap();
+        let type_env = check(&program).unwrap();
+        let result = verify(&program, &type_env);
+        assert!(result.errors.iter().any(|error| error
+            .message
+            .contains("swaps stage 'write' to prompt 'review_draft'")));
     }
 
     #[test]

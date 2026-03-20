@@ -70,7 +70,7 @@ CLI Cheatsheet
 - `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
 - `scaffold run FILE --task TASK [--harness H] --input JSON` — execute a task directly from IR.
 - `scaffold evaluate FILE --objective OBJ [--assignments JSON] [--case-id ID]` — evaluate an objective with the harness defaults or explicit assignment overrides.
-- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|dspy] [--report-dir DIR]` — optimize an objective with a pluggable proposal backend and optionally persist candidate reports.
+- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|dspy] [--report-dir DIR] [--write-best FILE]` — optimize an objective, optionally persist candidate reports, and optionally freeze the best evolved harness into a runnable `.scaffold` file with resolved prompt/system text surfaces.
 
 Repository Layout
 -----------------

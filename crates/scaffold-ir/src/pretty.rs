@@ -179,11 +179,13 @@ fn pp_tool(out: &mut String, tool: &ToolIR) {
         out.push('\n');
     }
 
-    for variant in &tool.variants {
-        out.push_str(&format!("    variant {} {{\n", variant.name));
-        out.push_str("        ");
-        pp_tool_impl(out, &variant.implementation, 2);
-        out.push('\n');
+    if !tool.variants.is_empty() {
+        out.push_str("    variants {\n");
+        for variant in &tool.variants {
+            out.push_str(&format!("        {}: ", variant.name));
+            pp_tool_impl(out, &variant.implementation, 2);
+            out.push('\n');
+        }
         out.push_str("    }\n");
     }
 

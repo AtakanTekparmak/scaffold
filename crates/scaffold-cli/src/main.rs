@@ -7,6 +7,7 @@
 //! - run: Execute a task directly from IR with an optional harness
 //! - optimize: Search the declared harness space for an objective
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -14,7 +15,10 @@ use std::process::ExitCode;
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use scaffold_ir::{to_json, Lowerer, ScaffoldIR};
+use scaffold_ir::{
+    pretty_print, to_json, AgentIR, BindingIR, BindingPathIR, ExprIR, HarnessIR, Lowerer, PromptIR,
+    ScaffoldIR, StageKindIR, StringOrFileIR, TaskIR, TaskNodeIR,
+};
 use scaffold_runtime::{
     evaluate_objective_candidate as evaluate_ir_objective_candidate,
     execute_task as execute_ir_task, optimize_objective_with_artifacts as optimize_ir_objective,
@@ -142,6 +146,10 @@ enum Commands {
         /// Directory where the optimization report and candidate summaries are written
         #[arg(long)]
         report_dir: Option<PathBuf>,
+
+        /// Write a self-contained scaffold file with the best harness materialized
+        #[arg(long)]
+        write_best: Option<PathBuf>,
     },
 
     /// Evaluate an objective with the harness defaults or explicit assignments
@@ -231,6 +239,7 @@ fn main() -> ExitCode {
             backend,
             backend_command,
             report_dir,
+            write_best,
         } => cmd_optimize(
             &file,
             objective.as_deref(),
@@ -241,6 +250,7 @@ fn main() -> ExitCode {
             backend,
             backend_command.as_deref(),
             report_dir.as_deref(),
+            write_best.as_deref(),
         ),
         Commands::Evaluate {
             file,
@@ -554,6 +564,7 @@ fn cmd_optimize(
     backend: OptimizeBackend,
     backend_command: Option<&str>,
     report_dir: Option<&Path>,
+    write_best: Option<&Path>,
 ) -> ExitCode {
     let ir = match parse_typecheck_lower(file, verify_enabled) {
         Ok(ir) => ir,
@@ -633,6 +644,21 @@ fn cmd_optimize(
                     Ok(path) => eprintln!("Wrote optimization report to {}", path.display()),
                     Err(error) => {
                         eprintln!("Failed to write optimization report dir: {}", error);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            if let Some(write_best) = write_best {
+                match write_materialized_best_scaffold(
+                    write_best,
+                    &ir,
+                    &objective_name,
+                    &artifacts.report.best,
+                    base_dir,
+                ) {
+                    Ok(path) => eprintln!("Wrote materialized scaffold to {}", path.display()),
+                    Err(error) => {
+                        eprintln!("Failed to write materialized scaffold: {}", error);
                         return ExitCode::FAILURE;
                     }
                 }
@@ -720,6 +746,487 @@ fn candidate_report_line(
         .expect("candidate reports always serialize to objects");
     object.insert("index".to_string(), serde_json::json!(index));
     serde_json::to_string(&payload)
+}
+
+fn write_materialized_best_scaffold(
+    output_path: &Path,
+    ir: &ScaffoldIR,
+    objective_name: &str,
+    best: &CandidateOptimizationReport,
+    base_dir: &Path,
+) -> Result<PathBuf, String> {
+    let objective = ir
+        .objectives
+        .iter()
+        .find(|objective| objective.name == objective_name)
+        .ok_or_else(|| format!("objective '{}' not found in IR", objective_name))?;
+    let original_task = ir
+        .tasks
+        .iter()
+        .find(|task| task.name == objective.task)
+        .ok_or_else(|| format!("task '{}' not found in IR", objective.task))?;
+    let original_harness = ir
+        .harnesses
+        .iter()
+        .find(|harness| harness.name == objective.harness)
+        .ok_or_else(|| format!("harness '{}' not found in IR", objective.harness))?;
+
+    let mut generated = ScaffoldIR::new();
+    generated.types = ir.types.clone();
+    generated.extern_crates = ir.extern_crates.clone();
+    generated.foreign_modules = ir.foreign_modules.clone();
+    generated.tools = ir.tools.clone();
+    generated.prompts = ir.prompts.clone();
+    generated.agents = ir.agents.clone();
+
+    let mut task = original_task.clone();
+    let mut harness = original_harness.clone();
+    harness.name = unique_harness_name(ir, &format!("{}_optimized", objective.harness));
+    harness.tunables.clear();
+    apply_candidate_assignments(&mut harness, &best.assignments)?;
+    materialize_task_text_surfaces(&mut task, &mut harness, &mut generated, ir, base_dir)?;
+    generated.tasks = vec![task];
+    generated.harnesses = vec![harness];
+
+    let rendered = pretty_print(&generated);
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create parent directory {}: {}",
+                parent.display(),
+                error
+            )
+        })?;
+    }
+    fs::write(output_path, rendered)
+        .map_err(|error| format!("failed to write {}: {}", output_path.display(), error))?;
+    Ok(fs::canonicalize(output_path).unwrap_or_else(|_| output_path.to_path_buf()))
+}
+
+fn unique_harness_name(ir: &ScaffoldIR, base: &str) -> String {
+    let used = ir
+        .harnesses
+        .iter()
+        .map(|harness| harness.name.as_str())
+        .collect::<HashSet<_>>();
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    let mut index = 2usize;
+    loop {
+        let candidate = format!("{}_{}", base, index);
+        if !used.contains(candidate.as_str()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn apply_candidate_assignments(
+    harness: &mut HarnessIR,
+    assignments: &std::collections::HashMap<String, scaffold_runtime::Value>,
+) -> Result<(), String> {
+    for (path, value) in assignments {
+        let segments = path.split('.').map(str::to_string).collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
+        }
+        let expr = value_to_expr(value);
+        if segments.len() == 1 {
+            upsert_binding(&mut harness.defaults, segments, expr);
+        } else {
+            let target = segments[0].clone();
+            let key = segments[1..].to_vec();
+            let block = harness
+                .bindings
+                .iter_mut()
+                .find(|binding| binding.target == target);
+            match block {
+                Some(block) => upsert_binding(&mut block.bindings, key, expr),
+                None => harness.bindings.push(scaffold_ir::TargetBindingIR {
+                    target,
+                    bindings: vec![BindingIR {
+                        key: BindingPathIR { segments: key },
+                        value: expr,
+                    }],
+                }),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn upsert_binding(bindings: &mut Vec<BindingIR>, segments: Vec<String>, value: ExprIR) {
+    if let Some(existing) = bindings
+        .iter_mut()
+        .find(|binding| binding.key.segments == segments)
+    {
+        existing.value = value;
+    } else {
+        bindings.push(BindingIR {
+            key: BindingPathIR { segments },
+            value,
+        });
+    }
+}
+
+fn value_to_expr(value: &scaffold_runtime::Value) -> ExprIR {
+    match value {
+        scaffold_runtime::Value::Int(value) => ExprIR::Literal {
+            value: scaffold_ir::LiteralIR::Int { value: *value },
+        },
+        scaffold_runtime::Value::Float(value) => ExprIR::Literal {
+            value: scaffold_ir::LiteralIR::Float { value: *value },
+        },
+        scaffold_runtime::Value::String(value) => ExprIR::Literal {
+            value: scaffold_ir::LiteralIR::String {
+                value: value.clone(),
+            },
+        },
+        scaffold_runtime::Value::Bytes(values) => ExprIR::List {
+            elements: values
+                .iter()
+                .map(|value| ExprIR::Literal {
+                    value: scaffold_ir::LiteralIR::Int {
+                        value: i64::from(*value),
+                    },
+                })
+                .collect(),
+        },
+        scaffold_runtime::Value::Bool(value) => ExprIR::Literal {
+            value: scaffold_ir::LiteralIR::Bool { value: *value },
+        },
+        scaffold_runtime::Value::Null => ExprIR::Literal {
+            value: scaffold_ir::LiteralIR::Null,
+        },
+        scaffold_runtime::Value::List(values) => ExprIR::List {
+            elements: values.iter().map(value_to_expr).collect(),
+        },
+        scaffold_runtime::Value::Map(values)
+        | scaffold_runtime::Value::Struct { fields: values, .. } => ExprIR::Record {
+            fields: values
+                .iter()
+                .map(|(key, value)| scaffold_ir::ExprFieldIR {
+                    key: key.clone(),
+                    value: value_to_expr(value),
+                })
+                .collect(),
+        },
+        scaffold_runtime::Value::Result(result) => match &**result {
+            scaffold_runtime::ResultValue::Ok(value)
+            | scaffold_runtime::ResultValue::Err(value) => value_to_expr(value),
+        },
+    }
+}
+
+fn materialize_task_text_surfaces(
+    task: &mut TaskIR,
+    harness: &mut HarnessIR,
+    generated: &mut ScaffoldIR,
+    source_ir: &ScaffoldIR,
+    base_dir: &Path,
+) -> Result<(), String> {
+    materialize_task_nodes(
+        &mut task.body,
+        harness,
+        generated,
+        source_ir,
+        base_dir,
+        &task.name,
+    )
+}
+
+fn materialize_task_nodes(
+    nodes: &mut [TaskNodeIR],
+    harness: &mut HarnessIR,
+    generated: &mut ScaffoldIR,
+    source_ir: &ScaffoldIR,
+    base_dir: &Path,
+    task_name: &str,
+) -> Result<(), String> {
+    for node in nodes {
+        match node {
+            TaskNodeIR::Stage(stage) => {
+                let resolved_component = harness_string_field(harness, &stage.name, "component")?
+                    .unwrap_or_else(|| stage.component.clone());
+                match stage.stage_kind {
+                    StageKindIR::Prompt => {
+                        let prompt = source_ir
+                            .prompts
+                            .iter()
+                            .find(|prompt| prompt.name == resolved_component)
+                            .ok_or_else(|| {
+                                format!(
+                                    "prompt '{}' not found for stage '{}'",
+                                    resolved_component, stage.name
+                                )
+                            })?;
+                        let cloned_name = unique_component_name(
+                            generated.prompts.iter().map(|prompt| prompt.name.as_str()),
+                            &format!("{}_{}_optimized", prompt.name, stage.name),
+                        );
+                        let template =
+                            resolved_prompt_template(prompt, harness, &stage.name, base_dir)?;
+                        let system =
+                            resolved_prompt_system(prompt, harness, &stage.name, base_dir)?;
+                        generated.prompts.push(PromptIR {
+                            name: cloned_name.clone(),
+                            input: prompt.input.clone(),
+                            output: prompt.output.clone(),
+                            template: StringOrFileIR::Literal { value: template },
+                            system: system.map(|value| StringOrFileIR::Literal { value }),
+                        });
+                        stage.component = cloned_name;
+                        strip_stage_bindings(
+                            harness,
+                            &stage.name,
+                            &["component", "variant", "system_prompt"],
+                        );
+                    }
+                    StageKindIR::Agent => {
+                        let agent = source_ir
+                            .agents
+                            .iter()
+                            .find(|agent| agent.name == resolved_component)
+                            .ok_or_else(|| {
+                                format!(
+                                    "agent '{}' not found for stage '{}'",
+                                    resolved_component, stage.name
+                                )
+                            })?;
+                        let cloned_name = unique_component_name(
+                            generated.agents.iter().map(|agent| agent.name.as_str()),
+                            &format!("{}_{}_optimized", agent.name, stage.name),
+                        );
+                        let system = resolved_agent_system(agent, harness, &stage.name, base_dir)?;
+                        let mut cloned = agent.clone();
+                        cloned.name = cloned_name.clone();
+                        cloned.system = StringOrFileIR::Literal { value: system };
+                        generated.agents.push(cloned);
+                        stage.component = cloned_name;
+                        strip_stage_bindings(
+                            harness,
+                            &stage.name,
+                            &["component", "variant", "system_prompt"],
+                        );
+                    }
+                    StageKindIR::Tool => {
+                        stage.component = resolved_component;
+                        strip_stage_bindings(harness, &stage.name, &["component"]);
+                    }
+                }
+            }
+            TaskNodeIR::Loop(loop_ir) => {
+                materialize_task_nodes(
+                    &mut loop_ir.body,
+                    harness,
+                    generated,
+                    source_ir,
+                    base_dir,
+                    task_name,
+                )?;
+            }
+            TaskNodeIR::Branch(branch) => {
+                materialize_task_nodes(
+                    &mut branch.then_body,
+                    harness,
+                    generated,
+                    source_ir,
+                    base_dir,
+                    task_name,
+                )?;
+                materialize_task_nodes(
+                    &mut branch.else_body,
+                    harness,
+                    generated,
+                    source_ir,
+                    base_dir,
+                    task_name,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unique_component_name<'a>(existing: impl Iterator<Item = &'a str>, base: &str) -> String {
+    let used = existing.collect::<HashSet<_>>();
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    let mut index = 2usize;
+    loop {
+        let candidate = format!("{}_{}", base, index);
+        if !used.contains(candidate.as_str()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn resolved_prompt_template(
+    prompt: &PromptIR,
+    harness: &HarnessIR,
+    target: &str,
+    base_dir: &Path,
+) -> Result<String, String> {
+    if let Some(variant) = harness_string_field(harness, target, "variant")? {
+        return resolve_text_surface(base_dir, &variant, true);
+    }
+    resolve_string_or_file(base_dir, &prompt.template)
+}
+
+fn resolved_prompt_system(
+    prompt: &PromptIR,
+    harness: &HarnessIR,
+    target: &str,
+    base_dir: &Path,
+) -> Result<Option<String>, String> {
+    if let Some(system_prompt) = harness_string_field(harness, target, "system_prompt")? {
+        return resolve_text_surface(base_dir, &system_prompt, false).map(Some);
+    }
+    prompt
+        .system
+        .as_ref()
+        .map(|value| resolve_string_or_file(base_dir, value))
+        .transpose()
+}
+
+fn resolved_agent_system(
+    agent: &AgentIR,
+    harness: &HarnessIR,
+    target: &str,
+    base_dir: &Path,
+) -> Result<String, String> {
+    if let Some(system_prompt) = harness_string_field(harness, target, "system_prompt")? {
+        return resolve_text_surface(base_dir, &system_prompt, false);
+    }
+    if let Some(variant) = harness_string_field(harness, target, "variant")? {
+        return resolve_text_surface(base_dir, &variant, true);
+    }
+    resolve_string_or_file(base_dir, &agent.system)
+}
+
+fn harness_string_field(
+    harness: &HarnessIR,
+    target: &str,
+    field: &str,
+) -> Result<Option<String>, String> {
+    if let Some(value) = harness
+        .bindings
+        .iter()
+        .find(|binding| binding.target == target)
+        .and_then(|binding| {
+            binding
+                .bindings
+                .iter()
+                .find(|item| item.key.segments.join(".") == field)
+        })
+        .map(|binding| &binding.value)
+    {
+        return expr_to_string(value).map(Some);
+    }
+
+    harness
+        .defaults
+        .iter()
+        .find(|binding| binding.key.segments.join(".") == field)
+        .map(|binding| expr_to_string(&binding.value))
+        .transpose()
+}
+
+fn strip_stage_bindings(harness: &mut HarnessIR, target: &str, fields: &[&str]) {
+    let fields = fields.iter().copied().collect::<HashSet<_>>();
+    if let Some(index) = harness
+        .bindings
+        .iter()
+        .position(|binding| binding.target == target)
+    {
+        harness.bindings[index]
+            .bindings
+            .retain(|item| !fields.contains(item.key.segments.join(".").as_str()));
+        if harness.bindings[index].bindings.is_empty() {
+            harness.bindings.remove(index);
+        }
+    }
+}
+
+fn expr_to_string(expr: &ExprIR) -> Result<String, String> {
+    match expr {
+        ExprIR::Literal {
+            value: scaffold_ir::LiteralIR::String { value },
+        } => Ok(value.clone()),
+        ExprIR::Call { function, args } if function == "variant" && args.len() == 2 => {
+            let group = expr_to_string(&args[0])?;
+            let name = expr_to_string(&args[1])?;
+            Ok(format!("{}::{}", group, name))
+        }
+        ExprIR::Ident { name } => Ok(name.clone()),
+        other => Err(format!(
+            "cannot materialize non-string binding expression: {:?}",
+            other
+        )),
+    }
+}
+
+fn resolve_string_or_file(base_dir: &Path, value: &StringOrFileIR) -> Result<String, String> {
+    match value {
+        StringOrFileIR::Literal { value } => Ok(value.clone()),
+        StringOrFileIR::File { path } => {
+            let resolved = base_dir.join(path);
+            fs::read_to_string(&resolved)
+                .map_err(|error| format!("failed to read {}: {}", resolved.display(), error))
+        }
+    }
+}
+
+fn resolve_text_surface(
+    base_dir: &Path,
+    value: &str,
+    require_variant: bool,
+) -> Result<String, String> {
+    if let Some((group, name)) = value.split_once("::") {
+        if let Some(path) = find_variant_file(base_dir, group, name) {
+            return fs::read_to_string(&path)
+                .map_err(|error| format!("failed to read {}: {}", path.display(), error));
+        }
+        if require_variant {
+            return Err(format!(
+                "variant '{}' could not be resolved under {}",
+                value,
+                base_dir.display()
+            ));
+        }
+    }
+    Ok(value.to_string())
+}
+
+fn find_variant_file(base_dir: &Path, group: &str, name: &str) -> Option<PathBuf> {
+    let candidates = [
+        base_dir
+            .join("variants")
+            .join(group)
+            .join(format!("{}.md", name)),
+        base_dir
+            .join("variants")
+            .join(group)
+            .join(format!("{}.txt", name)),
+        base_dir
+            .join("variants")
+            .join(group)
+            .join(format!("{}.prompt", name)),
+        base_dir
+            .join("prompts")
+            .join(group)
+            .join(format!("{}.md", name)),
+        base_dir
+            .join("prompts")
+            .join(group)
+            .join(format!("{}.txt", name)),
+        base_dir.join("prompts").join(format!("{}.md", name)),
+        base_dir.join("prompts").join(format!("{}.txt", name)),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn cmd_evaluate(

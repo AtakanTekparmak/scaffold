@@ -182,6 +182,9 @@ scaffold optimize example.scaffold --objective answer_quality
 # Optimize and persist the winning harness patch plus candidate summaries
 scaffold optimize example.scaffold --objective answer_quality --report-dir runs/answer_quality
 
+# Optimize and freeze the best evolved harness into a runnable scaffold file
+scaffold optimize example.scaffold --objective answer_quality --write-best outputs/answer_quality_best.scaffold
+
 # Optimize with the DSPy GEPA backend
 scaffold optimize example.scaffold --objective answer_quality --backend dspy --backend-command "uv run --python 3.11 --with 'dspy>=3' python tools/dspy_optimize.py"
 

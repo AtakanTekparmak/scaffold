@@ -4,10 +4,13 @@ Status: proposed direction
 
 Companion grammar: [task-harness-v1-grammar.md](/Users/kayaomers/Documents/firstbatch/scaffold/docs/task-harness-v1-grammar.md)
 
+Related design note: [typed-recursive-workspaces.md](/Users/kayaomers/Documents/firstbatch/scaffold/docs/typed-recursive-workspaces.md)
+
 This document defines a stronger V1 for Scaffold built around the user's core objective:
 
 - harnesses should fail to compile when they are structurally miswired
 - optimization should search over typed, bounded harness choices
+- the language should let an LLM synthesize a harness specialized for both the task and the model
 - multi-agent systems should support explicit feedback flow, including sequential loops where error can accumulate
 
 The design in this document intentionally shifts the semantic center of Scaffold away from "tool/prompt/agent/pipeline as the whole product" and toward "task/harness/objective as the product, with tools/prompts/agents as components inside it."
@@ -32,9 +35,9 @@ If the core goal is the language itself, the strongest path is to make those con
 
 ## Design Principles
 
-1. Immutable task, mutable harness
+1. Fixed objective and invariants, mutable harness program
 
-The task defines the workflow graph, artifact flow, and structural correctness. The harness defines how that graph is instantiated for a run or optimization trial.
+The objective, I/O contracts, artifact schemas, and safety constraints define the fixed contract. The harness is the searchable program that instantiates one legal strategy for satisfying that contract.
 
 2. Typed artifacts, not free-floating text
 
@@ -42,7 +45,7 @@ Feedback between stages must move through named, typed artifacts. Free text is a
 
 3. Optimization only over declared search space
 
-The optimizer may mutate only fields exposed in `harness.tune`. Nothing else is implicitly mutable.
+The optimizer may mutate only fields, variants, optional stages, tool selections, and structural alternatives exposed in `harness.tune`. Nothing else is implicitly mutable.
 
 4. Compile-time guarantees are structural
 
@@ -51,6 +54,41 @@ The compiler can prove that dataflow, bindings, loop-carried state, and search s
 5. Execution first, codegen later
 
 V1 should run through an interpreter/executor over typed IR. Codegen is still valuable, but should follow stable semantics rather than define them.
+
+## Harness As Searchable Program
+
+The most important clarification is this:
+
+- a harness is not just runtime configuration
+- a harness is the typed search space for strategy synthesis
+
+That means a harness may evolve:
+
+- prompts
+- system prompts
+- tool subsets
+- model routing
+- recursion depth
+- memory policy
+- loop bounds
+- optional critique/revision stages
+- declared orchestration variants
+
+What stays fixed is not "the whole task graph" in the narrow sense. What stays fixed is:
+
+- the objective
+- the I/O contracts
+- the artifact types
+- the verifier-enforced invariants
+- the legal search space
+
+So Scaffold should support constrained program evolution, not merely parameter tuning.
+
+The rule is:
+
+- the LLM may evolve the harness structure
+- but only within explicitly declared, typed mutation surfaces
+- and every candidate must still parse, type-check, and verify
 
 ## Core Constructs
 
@@ -62,7 +100,7 @@ V1 introduces eight primary top-level constructs:
 - `prompt`: single-call LLM component
 - `agent`: multi-turn LLM component with tool access
 - `task`: the typed orchestration graph
-- `harness`: the mutable execution policy and search space for a task
+- `harness`: the mutable execution policy and searchable program for a task
 - `objective`: the evaluation and optimization definition for a task
 
 `tool`, `prompt`, and `agent` remain important, but they are now inputs to `task`, not the top-level product.
@@ -199,6 +237,8 @@ task answer_question {
 
 ### Harnesses
 
+Harnesses should be thought of as typed search programs, not only as bags of scalar settings.
+
 ```scaffold
 harness answer_default for task answer_question {
     defaults {
@@ -237,6 +277,35 @@ harness answer_default for task answer_question {
     }
 }
 ```
+
+That is the minimal form. The stronger intended direction is that harnesses should also expose structural alternatives explicitly:
+
+```scaffold
+harness answer_search for task answer_question {
+    defaults {
+        model: "openai/gpt-4.1-mini"
+    }
+
+    bind strategy {
+        variant: "draft_then_critique"
+    }
+
+    tune {
+        strategy.variant in [
+            "single_pass",
+            "draft_then_critique",
+            "tree_search"
+        ]
+        write.prompt in variants("writer")
+        review.enabled in [true, false]
+        revise.tools subset_of [web_search, retrieve_notes]
+        runtime.depth_policy in ["flat", "recursive", "adaptive"]
+        memory.policy in ["none", "rolling_summary", "hierarchical"]
+    }
+}
+```
+
+The key constraint is that these structural choices must still be declared and typed. Harnesses should not rewrite arbitrary code.
 
 ### Objectives
 

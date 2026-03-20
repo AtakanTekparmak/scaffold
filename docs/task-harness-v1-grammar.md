@@ -19,6 +19,7 @@ The grammar is designed to support the stronger direction for Scaffold:
 - objectives define evaluation and optimization
 - artifact flow is explicit and typed
 - optimization mutates only declared tunable fields
+- the tunable space may include declared structural alternatives, not only scalar knobs
 
 ## Non-Goals
 
@@ -228,6 +229,16 @@ emit_field
 ## Harnesses
 
 Harnesses are typed overlays on tasks.
+
+The important semantic note is that `tune` is not limited to numeric or string hyperparameters. A tunable path may refer to any declared legal mutation surface, including:
+
+- model choice
+- prompt or system variants
+- tool subsets
+- memory policies
+- loop bounds
+- optional stage enablement
+- named orchestration variants
 
 ```ebnf
 harness_decl

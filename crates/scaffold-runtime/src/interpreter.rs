@@ -677,6 +677,31 @@ impl<'a> TaskInterpreter<'a> {
     ) -> Result<()> {
         let started = Instant::now();
         let (model, variant, timeout_secs, retries) = self.stage_metadata(stage, harness)?;
+        let component = self.effective_stage_component(stage, harness)?;
+        if matches!(
+            self.harness_bool(harness, &stage.name, "enabled")?,
+            Some(false)
+        ) {
+            self.record_stage_telemetry(
+                &ctx.telemetry,
+                StageTelemetry {
+                    stage_name: stage.name.clone(),
+                    stage_kind: self.stage_kind_label(stage.stage_kind).to_string(),
+                    component: component.clone(),
+                    output_artifact: stage.output.clone(),
+                    status: "disabled".to_string(),
+                    duration_ms: 0.0,
+                    input: serde_json::Value::Null,
+                    output: None,
+                    error: None,
+                    model,
+                    variant,
+                    timeout_secs,
+                    retries,
+                },
+            );
+            return Ok(());
+        }
         if let Some(when) = &stage.when {
             if !self.eval_bool(when, ctx)? {
                 self.record_stage_telemetry(
@@ -684,7 +709,7 @@ impl<'a> TaskInterpreter<'a> {
                     StageTelemetry {
                         stage_name: stage.name.clone(),
                         stage_kind: self.stage_kind_label(stage.stage_kind).to_string(),
-                        component: stage.component.clone(),
+                        component: component.clone(),
                         output_artifact: stage.output.clone(),
                         status: "skipped".to_string(),
                         duration_ms: 0.0,
@@ -705,15 +730,15 @@ impl<'a> TaskInterpreter<'a> {
         let stage_input_json = serde_json::Value::from(stage_input.clone());
         let result = match stage.stage_kind {
             StageKindIR::Prompt => {
-                self.execute_prompt_stage(stage, stage_input, harness, &ctx.telemetry)
+                self.execute_prompt_stage(&component, stage, stage_input, harness, &ctx.telemetry)
                     .await
             }
             StageKindIR::Agent => {
-                self.execute_agent_stage(stage, stage_input, harness, &ctx.telemetry)
+                self.execute_agent_stage(&component, stage, stage_input, harness, &ctx.telemetry)
                     .await
             }
             StageKindIR::Tool => {
-                self.execute_tool_stage(stage, stage_input, harness, &ctx.telemetry)
+                self.execute_tool_stage(&component, stage, stage_input, harness, &ctx.telemetry)
             }
         };
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -725,7 +750,7 @@ impl<'a> TaskInterpreter<'a> {
                     StageTelemetry {
                         stage_name: stage.name.clone(),
                         stage_kind: self.stage_kind_label(stage.stage_kind).to_string(),
-                        component: stage.component.clone(),
+                        component: component.clone(),
                         output_artifact: stage.output.clone(),
                         status: "ok".to_string(),
                         duration_ms,
@@ -747,7 +772,7 @@ impl<'a> TaskInterpreter<'a> {
                     StageTelemetry {
                         stage_name: stage.name.clone(),
                         stage_kind: self.stage_kind_label(stage.stage_kind).to_string(),
-                        component: stage.component.clone(),
+                        component,
                         output_artifact: stage.output.clone(),
                         status: "error".to_string(),
                         duration_ms,
@@ -767,6 +792,7 @@ impl<'a> TaskInterpreter<'a> {
 
     async fn execute_prompt_stage(
         &self,
+        component: &str,
         stage: &StageIR,
         input: Value,
         harness: &ResolvedHarness,
@@ -776,6 +802,8 @@ impl<'a> TaskInterpreter<'a> {
             &stage.name,
             harness,
             &[
+                "enabled",
+                "component",
                 "model",
                 "temperature",
                 "timeout_secs",
@@ -784,7 +812,7 @@ impl<'a> TaskInterpreter<'a> {
                 "variant",
             ],
         )?;
-        let prompt = self.find_prompt(&stage.component)?;
+        let prompt = self.find_prompt(component)?;
         let input = self.validate_value(input, &prompt.input)?;
         let schema = self.output_schema_string(&prompt.output)?;
         let rendered = self.render_prompt(prompt, &input, harness, &stage.name)?;
@@ -847,6 +875,7 @@ impl<'a> TaskInterpreter<'a> {
 
     async fn execute_agent_stage(
         &self,
+        component: &str,
         stage: &StageIR,
         input: Value,
         harness: &ResolvedHarness,
@@ -856,6 +885,8 @@ impl<'a> TaskInterpreter<'a> {
             &stage.name,
             harness,
             &[
+                "enabled",
+                "component",
                 "model",
                 "temperature",
                 "timeout_secs",
@@ -866,7 +897,7 @@ impl<'a> TaskInterpreter<'a> {
                 "tools",
             ],
         )?;
-        let agent = self.find_agent(&stage.component)?;
+        let agent = self.find_agent(component)?;
         let input = self.validate_value(input, &agent.input)?;
         let retries = self
             .harness_u64(harness, &stage.name, "retries")?
@@ -915,6 +946,7 @@ impl<'a> TaskInterpreter<'a> {
 
     fn execute_tool_stage(
         &self,
+        component: &str,
         stage: &StageIR,
         input: Value,
         harness: &ResolvedHarness,
@@ -923,9 +955,9 @@ impl<'a> TaskInterpreter<'a> {
         self.ensure_supported_fields(
             &stage.name,
             harness,
-            &["timeout_secs", "retries", "variant"],
+            &["enabled", "component", "timeout_secs", "retries", "variant"],
         )?;
-        let tool = self.find_tool(&stage.component)?;
+        let tool = self.find_tool(component)?;
         let input = self.validate_value(input, &tool.input)?;
         let retries = self
             .harness_u64(harness, &stage.name, "retries")?
@@ -2644,6 +2676,16 @@ impl<'a> TaskInterpreter<'a> {
         self.expect_string_list(value)
     }
 
+    fn effective_stage_component(
+        &self,
+        stage: &StageIR,
+        harness: &ResolvedHarness,
+    ) -> Result<String> {
+        Ok(self
+            .harness_string(harness, &stage.name, "component")?
+            .unwrap_or_else(|| stage.component.clone()))
+    }
+
     fn ensure_supported_fields(
         &self,
         target: &str,
@@ -2694,6 +2736,22 @@ impl<'a> TaskInterpreter<'a> {
             Some(Value::Int(value)) => Ok(Some(*value as f64)),
             Some(value) => Err(Error::TypeError {
                 expected: "float".to_string(),
+                actual: value.type_name().to_string(),
+            }),
+            None => Ok(None),
+        }
+    }
+
+    fn harness_bool(
+        &self,
+        harness: &ResolvedHarness,
+        target: &str,
+        field: &str,
+    ) -> Result<Option<bool>> {
+        match harness.field_value(target, field) {
+            Some(Value::Bool(value)) => Ok(Some(*value)),
+            Some(value) => Err(Error::TypeError {
+                expected: "bool".to_string(),
                 actual: value.type_name().to_string(),
             }),
             None => Ok(None),
@@ -5280,6 +5338,292 @@ mod tests {
         match output {
             Value::Struct { fields, .. } => {
                 assert_eq!(fields.get("count"), Some(&Value::Int(2)));
+            }
+            other => panic!("expected struct output, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_task_skips_disabled_stage_via_harness_override() {
+        let ir = ScaffoldIR {
+            tools: vec![
+                ToolIR {
+                    name: "seed".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::new(),
+                    },
+                    output: TypeIR::Int,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Expr {
+                            expr: Box::new(ExprIR::Literal {
+                                value: LiteralIR::Int { value: 1 },
+                            }),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+                ToolIR {
+                    name: "increment".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("value".to_string(), TypeIR::Int)]),
+                    },
+                    output: TypeIR::Int,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Expr {
+                            expr: Box::new(ExprIR::Binary {
+                                left: Box::new(ExprIR::Ident {
+                                    name: "value".to_string(),
+                                }),
+                                op: "+".to_string(),
+                                right: Box::new(ExprIR::Literal {
+                                    value: LiteralIR::Int { value: 1 },
+                                }),
+                            }),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+            ],
+            types: vec![TypeDefIR {
+                name: "CounterOutput".to_string(),
+                kind: TypeDefKindIR::Type,
+                definition: TypeIR::Struct {
+                    fields: HashMap::from([("count".to_string(), TypeIR::Int)]),
+                },
+            }],
+            tasks: vec![TaskIR {
+                name: "count_once".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::new(),
+                },
+                output: TypeIR::Named {
+                    name: "CounterOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "counter".to_string(),
+                    ty: TypeIR::Int,
+                }],
+                body: vec![
+                    TaskNodeIR::Stage(StageIR {
+                        name: "seed".to_string(),
+                        stage_kind: StageKindIR::Tool,
+                        component: "seed".to_string(),
+                        input: ExprIR::Record { fields: Vec::new() },
+                        output: "counter".to_string(),
+                        when: None,
+                    }),
+                    TaskNodeIR::Stage(StageIR {
+                        name: "bump".to_string(),
+                        stage_kind: StageKindIR::Tool,
+                        component: "increment".to_string(),
+                        input: ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "value".to_string(),
+                                value: ExprIR::Ident {
+                                    name: "counter".to_string(),
+                                },
+                            }],
+                        },
+                        output: "counter".to_string(),
+                        when: None,
+                    }),
+                ],
+                emit: vec![EmitFieldIR {
+                    name: "count".to_string(),
+                    value: ExprIR::Ident {
+                        name: "counter".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "disable_bump".to_string(),
+                task: "count_once".to_string(),
+                defaults: Vec::new(),
+                bindings: vec![scaffold_ir::TargetBindingIR {
+                    target: "bump".to_string(),
+                    bindings: vec![BindingIR {
+                        key: BindingPathIR {
+                            segments: vec!["enabled".to_string()],
+                        },
+                        value: ExprIR::Literal {
+                            value: LiteralIR::Bool { value: false },
+                        },
+                    }],
+                }],
+                tunables: Vec::new(),
+            }],
+            ..empty_ir()
+        };
+
+        let output = execute_task(
+            &ir,
+            "count_once",
+            Some("disable_bump"),
+            Value::Map(HashMap::new()),
+            Path::new("."),
+        )
+        .unwrap();
+
+        match output {
+            Value::Struct { fields, .. } => {
+                assert_eq!(fields.get("count"), Some(&Value::Int(1)));
+            }
+            other => panic!("expected struct output, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_task_swaps_stage_component_via_harness_override() {
+        let ir = ScaffoldIR {
+            tools: vec![
+                ToolIR {
+                    name: "seed".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::new(),
+                    },
+                    output: TypeIR::Int,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Expr {
+                            expr: Box::new(ExprIR::Literal {
+                                value: LiteralIR::Int { value: 2 },
+                            }),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+                ToolIR {
+                    name: "increment".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("value".to_string(), TypeIR::Int)]),
+                    },
+                    output: TypeIR::Int,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Expr {
+                            expr: Box::new(ExprIR::Binary {
+                                left: Box::new(ExprIR::Ident {
+                                    name: "value".to_string(),
+                                }),
+                                op: "+".to_string(),
+                                right: Box::new(ExprIR::Literal {
+                                    value: LiteralIR::Int { value: 1 },
+                                }),
+                            }),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+                ToolIR {
+                    name: "double".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("value".to_string(), TypeIR::Int)]),
+                    },
+                    output: TypeIR::Int,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Expr {
+                            expr: Box::new(ExprIR::Binary {
+                                left: Box::new(ExprIR::Ident {
+                                    name: "value".to_string(),
+                                }),
+                                op: "*".to_string(),
+                                right: Box::new(ExprIR::Literal {
+                                    value: LiteralIR::Int { value: 2 },
+                                }),
+                            }),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+            ],
+            types: vec![TypeDefIR {
+                name: "CounterOutput".to_string(),
+                kind: TypeDefKindIR::Type,
+                definition: TypeIR::Struct {
+                    fields: HashMap::from([("count".to_string(), TypeIR::Int)]),
+                },
+            }],
+            tasks: vec![TaskIR {
+                name: "count_once".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::new(),
+                },
+                output: TypeIR::Named {
+                    name: "CounterOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "counter".to_string(),
+                    ty: TypeIR::Int,
+                }],
+                body: vec![
+                    TaskNodeIR::Stage(StageIR {
+                        name: "seed".to_string(),
+                        stage_kind: StageKindIR::Tool,
+                        component: "seed".to_string(),
+                        input: ExprIR::Record { fields: Vec::new() },
+                        output: "counter".to_string(),
+                        when: None,
+                    }),
+                    TaskNodeIR::Stage(StageIR {
+                        name: "bump".to_string(),
+                        stage_kind: StageKindIR::Tool,
+                        component: "increment".to_string(),
+                        input: ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "value".to_string(),
+                                value: ExprIR::Ident {
+                                    name: "counter".to_string(),
+                                },
+                            }],
+                        },
+                        output: "counter".to_string(),
+                        when: None,
+                    }),
+                ],
+                emit: vec![EmitFieldIR {
+                    name: "count".to_string(),
+                    value: ExprIR::Ident {
+                        name: "counter".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "swap_bump".to_string(),
+                task: "count_once".to_string(),
+                defaults: Vec::new(),
+                bindings: vec![scaffold_ir::TargetBindingIR {
+                    target: "bump".to_string(),
+                    bindings: vec![BindingIR {
+                        key: BindingPathIR {
+                            segments: vec!["component".to_string()],
+                        },
+                        value: ExprIR::Literal {
+                            value: LiteralIR::String {
+                                value: "double".to_string(),
+                            },
+                        },
+                    }],
+                }],
+                tunables: Vec::new(),
+            }],
+            ..empty_ir()
+        };
+
+        let output = execute_task(
+            &ir,
+            "count_once",
+            Some("swap_bump"),
+            Value::Map(HashMap::new()),
+            Path::new("."),
+        )
+        .unwrap();
+
+        match output {
+            Value::Struct { fields, .. } => {
+                assert_eq!(fields.get("count"), Some(&Value::Int(4)));
             }
             other => panic!("expected struct output, got {:?}", other),
         }
