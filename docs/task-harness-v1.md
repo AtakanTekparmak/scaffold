@@ -296,6 +296,7 @@ harness answer_search for task answer_question {
             "draft_then_critique",
             "tree_search"
         ]
+        retrieve.component in components()
         write.prompt in variants("writer")
         review.enabled in [true, false]
         revise.tools subset_of [web_search, retrieve_notes]

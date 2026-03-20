@@ -3488,8 +3488,14 @@ impl<'a> TaskInterpreter<'a> {
             (TuneOperatorIR::In, FiniteDomainIR::Variants { name }) => {
                 self.expand_variants_domain(task, harness, target, field, name)
             }
+            (TuneOperatorIR::In, FiniteDomainIR::Components) => {
+                self.expand_components_domain(task, target, field)
+            }
             (TuneOperatorIR::SubsetOf, FiniteDomainIR::Variants { .. }) => Err(Error::Runtime(
                 "subset_of variants(...) is not supported".to_string(),
+            )),
+            (TuneOperatorIR::SubsetOf, FiniteDomainIR::Components) => Err(Error::Runtime(
+                "subset_of components() is not supported".to_string(),
             )),
         }
     }
@@ -3545,6 +3551,99 @@ impl<'a> TaskInterpreter<'a> {
                 target, field
             ))),
         }
+    }
+
+    fn expand_components_domain(
+        &self,
+        task: &TaskIR,
+        target: &str,
+        field: &str,
+    ) -> Result<Vec<Value>> {
+        if field != "component" {
+            return Err(Error::Runtime(format!(
+                "components() is only valid for stage.component, found '{}.{}'",
+                target, field
+            )));
+        }
+
+        let TaskTargetKindRuntime::Stage { kind, component } =
+            self.find_task_target(task, target)?
+        else {
+            return Err(Error::Runtime(format!(
+                "components() is only valid for stage targets, found loop '{}'",
+                target
+            )));
+        };
+
+        let (expected_input, expected_output) = self.component_signature(kind, component)?;
+        let values = self
+            .compatible_component_names(kind, &expected_input, &expected_output)?
+            .into_iter()
+            .map(Value::String)
+            .collect::<Vec<_>>();
+
+        if values.is_empty() {
+            return Err(Error::Runtime(format!(
+                "components() did not resolve any compatible {} components for stage '{}'",
+                self.stage_kind_label(kind),
+                target
+            )));
+        }
+
+        Ok(values)
+    }
+
+    fn component_signature(&self, kind: StageKindIR, component: &str) -> Result<(TypeIR, TypeIR)> {
+        match kind {
+            StageKindIR::Tool => {
+                let tool = self.find_tool(component)?;
+                Ok((tool.input.clone(), tool.output.clone()))
+            }
+            StageKindIR::Prompt => {
+                let prompt = self.find_prompt(component)?;
+                Ok((prompt.input.clone(), prompt.output.clone()))
+            }
+            StageKindIR::Agent => {
+                let agent = self.find_agent(component)?;
+                Ok((agent.input.clone(), agent.output.clone()))
+            }
+        }
+    }
+
+    fn compatible_component_names(
+        &self,
+        kind: StageKindIR,
+        expected_input: &TypeIR,
+        expected_output: &TypeIR,
+    ) -> Result<Vec<String>> {
+        let mut names = match kind {
+            StageKindIR::Tool => self
+                .ir
+                .tools
+                .iter()
+                .filter(|tool| &tool.input == expected_input && &tool.output == expected_output)
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+            StageKindIR::Prompt => self
+                .ir
+                .prompts
+                .iter()
+                .filter(|prompt| {
+                    &prompt.input == expected_input && &prompt.output == expected_output
+                })
+                .map(|prompt| prompt.name.clone())
+                .collect::<Vec<_>>(),
+            StageKindIR::Agent => self
+                .ir
+                .agents
+                .iter()
+                .filter(|agent| &agent.input == expected_input && &agent.output == expected_output)
+                .map(|agent| agent.name.clone())
+                .collect::<Vec<_>>(),
+        };
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     fn variant_group_names(&self, group: &str) -> Result<Vec<String>> {
@@ -6030,6 +6129,171 @@ mod tests {
             Some(&Value::String("formatter::shout".to_string()))
         );
         assert_eq!(report.backend, OptimizationBackendKind::Interpreter);
+        assert_eq!(report.best.train.primary, 1.0);
+    }
+
+    #[test]
+    fn optimize_objective_selects_best_stage_component() {
+        let ir = ScaffoldIR {
+            tools: vec![
+                ToolIR {
+                    name: "normalize_plain".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                    },
+                    output: TypeIR::String,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Ident {
+                            name: "text".to_string(),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+                ToolIR {
+                    name: "normalize_loud".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                    },
+                    output: TypeIR::String,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Shell {
+                            command: "printf '{text}' | tr '[:lower:]' '[:upper:]'".to_string(),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+            ],
+            types: vec![TypeDefIR {
+                name: "TaskOutput".to_string(),
+                kind: TypeDefKindIR::Type,
+                definition: TypeIR::Struct {
+                    fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                },
+            }],
+            tasks: vec![TaskIR {
+                name: "format_text".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::Named {
+                    name: "TaskOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "formatted".to_string(),
+                    ty: TypeIR::String,
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "format".to_string(),
+                    stage_kind: StageKindIR::Tool,
+                    component: "normalize_plain".to_string(),
+                    input: ExprIR::Record {
+                        fields: vec![ExprFieldIR {
+                            key: "text".to_string(),
+                            value: ExprIR::FieldAccess {
+                                base: Box::new(ExprIR::Ident {
+                                    name: "input".to_string(),
+                                }),
+                                field: "text".to_string(),
+                            },
+                        }],
+                    },
+                    output: "formatted".to_string(),
+                    when: None,
+                })],
+                emit: vec![EmitFieldIR {
+                    name: "answer".to_string(),
+                    value: ExprIR::Ident {
+                        name: "formatted".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "search".to_string(),
+                task: "format_text".to_string(),
+                defaults: Vec::new(),
+                bindings: Vec::new(),
+                tunables: vec![TunableIR {
+                    path: BindingPathIR {
+                        segments: vec!["format".to_string(), "component".to_string()],
+                    },
+                    operator: TuneOperatorIR::In,
+                    domain: FiniteDomainIR::Components,
+                }],
+            }],
+            objectives: vec![ObjectiveIR {
+                name: "quality".to_string(),
+                task: "format_text".to_string(),
+                harness: "search".to_string(),
+                dataset: scaffold_ir::DatasetSpecIR::Inline {
+                    cases: vec![scaffold_ir::InlineDatasetCaseIR {
+                        id: Some("one".to_string()),
+                        input: ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "text".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "hello".to_string(),
+                                    },
+                                },
+                            }],
+                        },
+                        expected: Some(ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "answer".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "HELLO".to_string(),
+                                    },
+                                },
+                            }],
+                        }),
+                    }],
+                },
+                repeats: Some(1),
+                constraints: Vec::new(),
+                checkers: Vec::new(),
+                judges: Vec::new(),
+                metrics: vec![MetricIR {
+                    name: "exact".to_string(),
+                    expr: ExprIR::Binary {
+                        left: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "output".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                        op: "==".to_string(),
+                        right: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "expected".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                    },
+                }],
+                score: ExprIR::Ident {
+                    name: "exact".to_string(),
+                },
+                split: None,
+                select: Some(SelectIR {
+                    primary: ExprIR::Ident {
+                        name: "exact".to_string(),
+                    },
+                    tie_breakers: Vec::new(),
+                }),
+            }],
+            ..empty_ir()
+        };
+
+        let report = optimize_objective(&ir, "quality", Path::new("."), 8).unwrap();
+
+        assert_eq!(report.evaluated_candidates, 2);
+        assert_eq!(
+            report.best.assignments.get("format.component"),
+            Some(&Value::String("normalize_loud".to_string()))
+        );
         assert_eq!(report.best.train.primary, 1.0);
     }
 

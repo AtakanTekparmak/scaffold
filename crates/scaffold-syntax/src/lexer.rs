@@ -139,6 +139,8 @@ pub enum Token {
     Spec,
     #[token("variants")]
     Variants,
+    #[token("components")]
+    Components,
     #[token("pure")]
     Pure,
     #[token("sequence")]
@@ -389,6 +391,7 @@ impl std::fmt::Display for Token {
             Token::Impl => write!(f, "impl"),
             Token::Spec => write!(f, "spec"),
             Token::Variants => write!(f, "variants"),
+            Token::Components => write!(f, "components"),
             Token::Pure => write!(f, "pure"),
             Token::Sequence => write!(f, "sequence"),
             Token::Parallel => write!(f, "parallel"),

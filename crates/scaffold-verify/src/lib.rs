@@ -934,6 +934,13 @@ impl<'a> ProgramVerifier<'a> {
                 ),
                 tune.span,
             ),
+            (TuneOperator::SubsetOf, FiniteDomain::Components) => self.error(
+                format!(
+                    "tune path '{}' uses subset_of with components(), but components() requires 'in'",
+                    path
+                ),
+                tune.span,
+            ),
             (_, FiniteDomain::List(values)) if values.is_empty() => self.error(
                 format!("tune path '{}' has an empty search domain", path),
                 tune.span,
@@ -942,6 +949,18 @@ impl<'a> ProgramVerifier<'a> {
                 "variants domain name must not be empty".to_string(),
                 tune.span,
             ),
+            (_, FiniteDomain::Components)
+                if tune.path.segments[1].node != "component"
+                    || !matches!(target_kind, TaskTargetKind::Stage(_)) =>
+            {
+                self.error(
+                    format!(
+                        "tune path '{}' uses components(), but components() is only valid for stage.component",
+                        path
+                    ),
+                    tune.span,
+                );
+            }
             (TuneOperator::SubsetOf, _) if spec.value_kind != HarnessFieldValueKind::ToolList => {
                 self.error(
                     format!(
@@ -1001,6 +1020,7 @@ impl<'a> ProgramVerifier<'a> {
                 }
             }
             (TuneOperator::In, FiniteDomain::Variants(_), HarnessFieldValueKind::TextSurface) => {}
+            (TuneOperator::In, FiniteDomain::Components, HarnessFieldValueKind::String) => {}
             _ => {}
         }
     }
@@ -1289,7 +1309,7 @@ impl<'a> ProgramVerifier<'a> {
         };
 
         if !candidate_sig.input.is_compatible_with(&expected_input)
-            || !candidate_sig.output.is_compatible_with(expected_output)
+            || !expected_output.is_compatible_with(&candidate_sig.output)
         {
             self.error(
                 format!(
@@ -1913,6 +1933,12 @@ mod tests {
                 template: "write"
             }
 
+            prompt write_notes_alt {
+                input: { question: string }
+                output: Notes
+                template: "rewrite"
+            }
+
             agent revise_notes {
                 input: Notes
                 output: Notes
@@ -2227,6 +2253,7 @@ mod tests {
                 }
                 tune {
                     write.enabled in [true, false]
+                    write.component in components()
                 }
             }
         "#;
@@ -2328,6 +2355,7 @@ mod tests {
                 }
                 tune {
                     write.temperature in ["hot"]
+                    write.temperature in components()
                     write.model in variants("writer")
                 }
             }
@@ -2342,6 +2370,9 @@ mod tests {
         assert!(result.errors.iter().any(|error| error
             .message
             .contains("'write.temperature' must be a static numeric expression")));
+        assert!(result.errors.iter().any(|error| error
+            .message
+            .contains("components() is only valid for stage.component")));
         assert!(result.errors.iter().any(|error| {
             error
                 .message

@@ -1724,6 +1724,7 @@ impl<'source> Parser<'source> {
                     values.first().map(|value| value.span).unwrap_or(path.span)
                 }
                 FiniteDomain::Variants(_) => path.span,
+                FiniteDomain::Components => path.span,
             });
             tune.push(TuneStmt {
                 path,
@@ -1766,6 +1767,13 @@ impl<'source> Parser<'source> {
             let name = self.parse_string()?;
             self.expect(Token::RParen)?;
             return Ok(FiniteDomain::Variants(name));
+        }
+
+        if self.check(&Token::Components) {
+            self.advance();
+            self.expect(Token::LParen)?;
+            self.expect(Token::RParen)?;
+            return Ok(FiniteDomain::Components);
         }
 
         self.expect(Token::LBracket)?;
@@ -2562,6 +2570,7 @@ harness baseline for task summarize {
     }
     tune {
         draft.model in ["gpt-5-mini", "gpt-5"]
+        draft.component in components()
         revise.max_iters in [1, 2, 3]
         draft.tools subset_of ["search", "critic"]
         draft.variant in variants("writer")
@@ -2614,7 +2623,8 @@ objective quality for task summarize {
             Declaration::Harness(harness) => {
                 assert_eq!(harness.name.node, "baseline");
                 assert_eq!(harness.binds.len(), 1);
-                assert_eq!(harness.tune.len(), 4);
+                assert_eq!(harness.tune.len(), 5);
+                assert!(matches!(harness.tune[1].domain, FiniteDomain::Components));
             }
             _ => panic!("expected harness declaration"),
         }

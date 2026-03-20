@@ -59,6 +59,7 @@ Execution Model
 - The runtime executes verified `task` IR directly instead of generating a temporary crate for inner-loop runs.
 - Harnesses are applied as typed runtime overlays on top of a task.
 - `scaffold optimize` evaluates objectives over datasets and searches the declared finite `harness.tune` space directly in the interpreter.
+- Harness search can include first-class structural domains such as `components()` for `stage.component`, alongside scalar domains, list domains, and `variants(...)`.
 - `scaffold optimize` now supports pluggable candidate-proposal backends. The default `interpreter` backend enumerates finite search spaces, while external backends like `dspy` can propose candidate assignments and let Scaffold evaluate them.
 - The recommended DSPy invocation is `--backend dspy --backend-command "uv run --python 3.11 --with 'dspy>=3' python tools/dspy_optimize.py"`. That path enables DSPy GEPA, and the backend inherits runtime config and `.env` provider credentials.
 - Objective expressions can inspect rollout telemetry through fields such as `rollout.duration_ms`, `rollout.stage_count`, `rollout.tool_call_count`, `rollout.prompt_call_count`, `rollout.agent_turn_count`, `rollout.loop_iteration_count`, and `rollout.trace`.
@@ -70,7 +71,7 @@ CLI Cheatsheet
 - `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
 - `scaffold run FILE --task TASK [--harness H] --input JSON` — execute a task directly from IR.
 - `scaffold evaluate FILE --objective OBJ [--assignments JSON] [--case-id ID]` — evaluate an objective with the harness defaults or explicit assignment overrides.
-- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|dspy] [--report-dir DIR] [--write-best FILE]` — optimize an objective, optionally persist candidate reports, and optionally freeze the best evolved harness into a runnable `.scaffold` file with resolved prompt/system text surfaces.
+- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|dspy] [--report-dir DIR] [--write-best FILE]` — optimize an objective, optionally persist candidate reports, and optionally freeze the best evolved harness into a runnable `.scaffold` file with resolved prompt/system text surfaces and structural stage choices.
 
 Repository Layout
 -----------------

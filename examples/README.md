@@ -3,7 +3,7 @@
 This directory contains a small, task-first example set for the current Scaffold architecture.
 
 - `tool_task.scaffold`: deterministic tool stages, nested tool composition, and an objective that optimizes over tool variants.
-- `component_swap.scaffold`: a deterministic structural-search example where optimization swaps a stage onto a different tool component and can be frozen back into a standalone scaffold.
+- `component_swap.scaffold`: a deterministic structural-search example where optimization uses `components()` to swap a stage onto a compatible tool and then freezes that choice back into a standalone scaffold.
 - `prompt_task.scaffold`: a single prompt stage with a typed harness and a simple objective.
 - `revision_loop.scaffold`: a bounded task loop with a pre-check `while:` guard, a carried typed artifact, and an objective over rollout quality.
 - `banking77_classification.scaffold`: a real Hugging Face Banking77 slice with prompt variants, system-prompt variants, and a harness/objective setup for comparing baseline vs optimized intent-classification accuracy.

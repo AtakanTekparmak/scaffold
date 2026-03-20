@@ -281,10 +281,14 @@ tune_operator
 
 finite_domain
     = list_literal
-    | variants_domain ;
+    | variants_domain
+    | components_domain ;
 
 variants_domain
     = "variants" "(" STRING ")" ;
+
+components_domain
+    = "components" "(" ")" ;
 ```
 
 Examples of legal binding paths:

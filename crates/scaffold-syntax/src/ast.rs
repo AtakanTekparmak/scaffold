@@ -321,6 +321,7 @@ pub enum TuneOperator {
 pub enum FiniteDomain {
     List(Vec<Spanned<Expr>>),
     Variants(String),
+    Components,
 }
 
 /// Objective declaration - evaluation and optimization contract

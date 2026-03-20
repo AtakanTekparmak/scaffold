@@ -832,6 +832,7 @@ impl Lowerer {
                 Ok(FiniteDomainIR::List { values: ir_values })
             }
             FiniteDomain::Variants(name) => Ok(FiniteDomainIR::Variants { name: name.clone() }),
+            FiniteDomain::Components => Ok(FiniteDomainIR::Components),
         }
     }
 

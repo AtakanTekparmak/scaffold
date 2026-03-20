@@ -94,7 +94,7 @@ pub enum TypeDefKindIR {
 }
 
 /// Type IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind")]
 pub enum TypeIR {
     Bool,
@@ -675,6 +675,7 @@ pub enum TuneOperatorIR {
 pub enum FiniteDomainIR {
     List { values: Vec<ExprIR> },
     Variants { name: String },
+    Components,
 }
 
 /// Objective definition IR

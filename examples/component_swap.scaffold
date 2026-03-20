@@ -53,7 +53,7 @@ task inspect_text {
 
 harness search_component for task inspect_text {
     tune {
-        normalize.component in ["normalize_plain", "normalize_loud"]
+        normalize.component in components()
     }
 }
 

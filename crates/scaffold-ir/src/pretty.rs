@@ -827,6 +827,7 @@ fn pp_finite_domain(domain: &FiniteDomainIR) -> String {
             format!("[{}]", items.join(", "))
         }
         FiniteDomainIR::Variants { name } => format!("variants(\"{}\")", escape_str(name)),
+        FiniteDomainIR::Components => "components()".to_string(),
     }
 }
 
