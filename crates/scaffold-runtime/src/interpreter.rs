@@ -4,7 +4,7 @@ use crate::config::config as runtime_config;
 use crate::error::{Error, Result};
 use crate::llm::{query_structured_with_config, LlmConfig};
 use crate::prompt::PromptManager;
-use crate::trace::{tracer, TaskStatus, TraceEvent};
+use crate::trace::{tracer, ObjectiveProgressPhase, TaskStatus, TraceEvent};
 use crate::value::{ResultValue, Value};
 use crate::{builtins, shell};
 use scaffold_ir::{
@@ -16,7 +16,7 @@ use scaffold_ir::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::RefCell;
-use std::collections::{hash_map::DefaultHasher, BTreeSet, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -144,6 +144,7 @@ impl ResolvedHarness {
 pub enum OptimizationBackendKind {
     #[default]
     Interpreter,
+    Evolutionary,
     Dspy,
 }
 
@@ -172,6 +173,16 @@ impl Default for OptimizationOptions {
 pub struct OptimizationTunableDomain {
     pub path: String,
     pub options: Vec<Value>,
+    #[serde(default)]
+    pub kind: OptimizationTunableKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizationTunableKind {
+    #[default]
+    Discrete,
+    PromptText,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +225,7 @@ pub struct ObjectiveOptimizationReport {
 pub struct ObjectiveOptimizationArtifacts {
     pub report: ObjectiveOptimizationReport,
     pub candidates: Vec<CandidateOptimizationReport>,
+    pub candidate_artifacts: Vec<CandidateOptimizationArtifacts>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,17 +245,73 @@ pub struct SplitEvaluationSummary {
     pub tie_breakers: Vec<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolloutArtifactReport {
+    pub split: String,
+    pub case_id: Option<String>,
+    pub repeat: u64,
+    pub input: Value,
+    pub expected: Value,
+    pub output: Value,
+    pub success: bool,
+    pub error: Option<String>,
+    pub metrics: HashMap<String, f64>,
+    pub score: f64,
+    pub primary: f64,
+    pub tie_breakers: Vec<f64>,
+    pub stage_graph: Vec<StageDependencyReport>,
+    pub stage_diagnostics: Vec<StageDiagnosticReport>,
+    pub rollout: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitEvaluationArtifacts {
+    pub summary: SplitEvaluationSummary,
+    pub rollouts: Vec<RolloutArtifactReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateOptimizationArtifacts {
+    pub assignments: HashMap<String, Value>,
+    pub train: SplitEvaluationArtifacts,
+    pub val: Option<SplitEvaluationArtifacts>,
+    pub test: Option<SplitEvaluationArtifacts>,
+}
+
 #[derive(Debug, Clone)]
 struct CandidateEvaluation {
     assignments: HashMap<String, Value>,
-    train: SplitEvaluationSummary,
-    val: Option<SplitEvaluationSummary>,
-    test: Option<SplitEvaluationSummary>,
+    train: SplitEvaluationArtifacts,
+    val: Option<SplitEvaluationArtifacts>,
+    test: Option<SplitEvaluationArtifacts>,
+}
+
+#[derive(Debug, Clone)]
+struct EvolutionaryArchiveEntry {
+    assignments: HashMap<String, Value>,
+    candidate: CandidateEvaluation,
+    novelty: f64,
+    island: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CandidateProgressContext {
+    index: usize,
+    total: usize,
 }
 
 impl CandidateEvaluation {
     fn to_report(&self) -> CandidateOptimizationReport {
         CandidateOptimizationReport {
+            assignments: self.assignments.clone(),
+            train: self.train.summary.clone(),
+            val: self.val.as_ref().map(|split| split.summary.clone()),
+            test: self.test.as_ref().map(|split| split.summary.clone()),
+        }
+    }
+
+    fn to_artifacts(&self) -> CandidateOptimizationArtifacts {
+        CandidateOptimizationArtifacts {
             assignments: self.assignments.clone(),
             train: self.train.clone(),
             val: self.val.clone(),
@@ -254,10 +322,80 @@ impl CandidateEvaluation {
 
 #[derive(Debug, Clone)]
 struct RolloutEvaluation {
+    split: String,
+    case_id: Option<String>,
+    repeat: u64,
+    input: Value,
+    expected: Value,
+    output: Value,
+    success: bool,
+    error: Option<String>,
     metrics: HashMap<String, f64>,
     score: f64,
     primary: f64,
     tie_breakers: Vec<f64>,
+    stage_graph: Vec<StageDependencyReport>,
+    stage_diagnostics: Vec<StageDiagnosticReport>,
+    rollout: serde_json::Value,
+}
+
+impl RolloutEvaluation {
+    fn to_report(&self) -> RolloutArtifactReport {
+        RolloutArtifactReport {
+            split: self.split.clone(),
+            case_id: self.case_id.clone(),
+            repeat: self.repeat,
+            input: self.input.clone(),
+            expected: self.expected.clone(),
+            output: self.output.clone(),
+            success: self.success,
+            error: self.error.clone(),
+            metrics: self.metrics.clone(),
+            score: self.score,
+            primary: self.primary,
+            tie_breakers: self.tie_breakers.clone(),
+            stage_graph: self.stage_graph.clone(),
+            stage_diagnostics: self.stage_diagnostics.clone(),
+            rollout: self.rollout.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageDependencyReport {
+    pub stage_name: String,
+    pub stage_kind: String,
+    pub component: String,
+    pub output_artifact: String,
+    pub input_artifacts: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub downstream: Vec<String>,
+    pub recurrent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageDiagnosticReport {
+    pub stage_name: String,
+    pub stage_kind: String,
+    pub component: String,
+    pub output_artifact: String,
+    pub input_artifacts: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub downstream: Vec<String>,
+    pub recurrent: bool,
+    pub executed: bool,
+    pub executions: u64,
+    pub ok_executions: u64,
+    pub error_executions: u64,
+    pub last_status: Option<String>,
+    pub total_duration_ms: f64,
+    pub average_duration_ms: f64,
+    pub errors: Vec<String>,
+    pub models: Vec<String>,
+    pub variants: Vec<String>,
+    pub prompt_hashes: Vec<String>,
+    pub system_prompt_hashes: Vec<String>,
+    pub downstream_failures: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +629,7 @@ impl<'a> TaskInterpreter<'a> {
 
     fn rollout_value(
         &self,
+        task: &TaskIR,
         telemetry: &RolloutTelemetry,
         success: bool,
         duration_ms: f64,
@@ -498,6 +637,8 @@ impl<'a> TaskInterpreter<'a> {
         case_id: Option<&str>,
         error: Option<&str>,
     ) -> Result<Value> {
+        let stage_graph = self.task_stage_graph(task);
+        let stage_diagnostics = self.stage_diagnostics(&stage_graph, telemetry);
         Ok(Value::Map(HashMap::from([
             ("success".to_string(), Value::Bool(success)),
             ("duration_ms".to_string(), Value::Float(duration_ms)),
@@ -537,12 +678,25 @@ impl<'a> TaskInterpreter<'a> {
                 "loop_iteration_count".to_string(),
                 Value::Int(telemetry.loop_iterations.len() as i64),
             ),
+            (
+                "stage_graph".to_string(),
+                serde_json::to_value(&stage_graph)
+                    .map(Value::from)
+                    .map_err(|e| Error::SerializationError(e.to_string()))?,
+            ),
+            (
+                "stage_diagnostics".to_string(),
+                serde_json::to_value(&stage_diagnostics)
+                    .map(Value::from)
+                    .map_err(|e| Error::SerializationError(e.to_string()))?,
+            ),
             ("trace".to_string(), self.telemetry_to_value(telemetry)?),
         ])))
     }
 
     fn refresh_rollout_artifact(
         &self,
+        task: &TaskIR,
         ctx: &mut ExecutionContext,
         success: bool,
         duration_ms: f64,
@@ -551,10 +705,260 @@ impl<'a> TaskInterpreter<'a> {
         error: Option<&str>,
     ) -> Result<()> {
         let telemetry = ctx.telemetry.borrow().clone();
-        let rollout =
-            self.rollout_value(&telemetry, success, duration_ms, repeat, case_id, error)?;
+        let rollout = self.rollout_value(
+            task,
+            &telemetry,
+            success,
+            duration_ms,
+            repeat,
+            case_id,
+            error,
+        )?;
         ctx.artifacts.insert("rollout".to_string(), rollout);
         Ok(())
+    }
+
+    fn task_stage_graph(&self, task: &TaskIR) -> Vec<StageDependencyReport> {
+        #[derive(Debug, Clone)]
+        struct StageStaticInfo {
+            stage_name: String,
+            stage_kind: String,
+            component: String,
+            output_artifact: String,
+            input_artifacts: BTreeSet<String>,
+            depends_on: BTreeSet<String>,
+            recurrent: bool,
+        }
+
+        fn collect_stage_defs<'a>(nodes: &'a [TaskNodeIR], stages: &mut Vec<&'a StageIR>) {
+            for node in nodes {
+                match node {
+                    TaskNodeIR::Stage(stage) => stages.push(stage),
+                    TaskNodeIR::Loop(loop_decl) => collect_stage_defs(&loop_decl.body, stages),
+                    TaskNodeIR::Branch(branch) => {
+                        collect_stage_defs(&branch.then_body, stages);
+                        collect_stage_defs(&branch.else_body, stages);
+                    }
+                }
+            }
+        }
+
+        fn collect_expr_artifacts(expr: &ExprIR, artifacts: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+            match expr {
+                ExprIR::Literal { .. } => {}
+                ExprIR::Ident { name } => {
+                    if artifacts.contains(name) {
+                        out.insert(name.clone());
+                    }
+                }
+                ExprIR::FieldAccess { base, .. } => collect_expr_artifacts(base, artifacts, out),
+                ExprIR::Binary { left, right, .. } => {
+                    collect_expr_artifacts(left, artifacts, out);
+                    collect_expr_artifacts(right, artifacts, out);
+                }
+                ExprIR::Call { args, .. } | ExprIR::ForeignCall { args, .. } => {
+                    for arg in args {
+                        collect_expr_artifacts(arg, artifacts, out);
+                    }
+                }
+                ExprIR::List { elements } => {
+                    for element in elements {
+                        collect_expr_artifacts(element, artifacts, out);
+                    }
+                }
+                ExprIR::Record { fields } => {
+                    for field in fields {
+                        collect_expr_artifacts(&field.value, artifacts, out);
+                    }
+                }
+            }
+        }
+
+        fn mark_downstream(
+            stage: &str,
+            adjacency: &HashMap<String, BTreeSet<String>>,
+            visited: &mut BTreeSet<String>,
+        ) {
+            if let Some(children) = adjacency.get(stage) {
+                for child in children {
+                    if visited.insert(child.clone()) {
+                        mark_downstream(child, adjacency, visited);
+                    }
+                }
+            }
+        }
+
+        let mut stages = Vec::new();
+        collect_stage_defs(&task.body, &mut stages);
+        if stages.is_empty() {
+            return Vec::new();
+        }
+
+        let artifact_names = task
+            .artifacts
+            .iter()
+            .map(|slot| slot.name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut producers = HashMap::<String, Vec<String>>::new();
+        for stage in &stages {
+            producers
+                .entry(stage.output.clone())
+                .or_default()
+                .push(stage.name.clone());
+        }
+
+        let mut infos = stages
+            .iter()
+            .map(|stage| {
+                let mut input_artifacts = BTreeSet::new();
+                collect_expr_artifacts(&stage.input, &artifact_names, &mut input_artifacts);
+                if let Some(when) = &stage.when {
+                    collect_expr_artifacts(when, &artifact_names, &mut input_artifacts);
+                }
+
+                let mut depends_on = BTreeSet::new();
+                let mut recurrent = false;
+                for artifact in &input_artifacts {
+                    if let Some(stage_names) = producers.get(artifact) {
+                        for stage_name in stage_names {
+                            if stage_name == &stage.name {
+                                recurrent = true;
+                            } else {
+                                depends_on.insert(stage_name.clone());
+                            }
+                        }
+                    }
+                }
+
+                StageStaticInfo {
+                    stage_name: stage.name.clone(),
+                    stage_kind: self.stage_kind_label(stage.stage_kind).to_string(),
+                    component: stage.component.clone(),
+                    output_artifact: stage.output.clone(),
+                    input_artifacts,
+                    depends_on,
+                    recurrent,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut adjacency = HashMap::<String, BTreeSet<String>>::new();
+        for info in &infos {
+            for dependency in &info.depends_on {
+                adjacency
+                    .entry(dependency.clone())
+                    .or_default()
+                    .insert(info.stage_name.clone());
+            }
+        }
+
+        infos.sort_by(|left, right| left.stage_name.cmp(&right.stage_name));
+        infos.into_iter()
+            .map(|info| {
+                let mut downstream = BTreeSet::new();
+                mark_downstream(&info.stage_name, &adjacency, &mut downstream);
+                StageDependencyReport {
+                    stage_name: info.stage_name,
+                    stage_kind: info.stage_kind,
+                    component: info.component,
+                    output_artifact: info.output_artifact,
+                    input_artifacts: info.input_artifacts.into_iter().collect(),
+                    depends_on: info.depends_on.into_iter().collect(),
+                    downstream: downstream.into_iter().collect(),
+                    recurrent: info.recurrent,
+                }
+            })
+            .collect()
+    }
+
+    fn stage_diagnostics(
+        &self,
+        stage_graph: &[StageDependencyReport],
+        telemetry: &RolloutTelemetry,
+    ) -> Vec<StageDiagnosticReport> {
+        let mut prompt_by_scope = HashMap::<String, Vec<&PromptCallTelemetry>>::new();
+        for call in &telemetry.prompt_calls {
+            prompt_by_scope
+                .entry(call.scope.clone())
+                .or_default()
+                .push(call);
+        }
+
+        let mut diagnostics = Vec::new();
+        for node in stage_graph {
+            let entries = telemetry
+                .stages
+                .iter()
+                .filter(|entry| entry.stage_name == node.stage_name)
+                .collect::<Vec<_>>();
+            let errors = entries
+                .iter()
+                .filter_map(|entry| entry.error.clone())
+                .collect::<BTreeSet<_>>();
+            let models = entries
+                .iter()
+                .filter_map(|entry| entry.model.clone())
+                .collect::<BTreeSet<_>>();
+            let variants = entries
+                .iter()
+                .filter_map(|entry| entry.variant.clone())
+                .collect::<BTreeSet<_>>();
+            let prompt_hashes = prompt_by_scope
+                .get(&node.stage_name)
+                .into_iter()
+                .flat_map(|calls| calls.iter())
+                .map(|call| call.prompt_hash.clone())
+                .collect::<BTreeSet<_>>();
+            let system_prompt_hashes = prompt_by_scope
+                .get(&node.stage_name)
+                .into_iter()
+                .flat_map(|calls| calls.iter())
+                .filter_map(|call| call.system_prompt_hash.clone())
+                .collect::<BTreeSet<_>>();
+            let downstream_failures = node
+                .downstream
+                .iter()
+                .filter(|stage_name| {
+                    telemetry
+                        .stages
+                        .iter()
+                        .any(|entry| &entry.stage_name == *stage_name && entry.status != "ok")
+                })
+                .count() as u64;
+            let total_duration_ms = entries.iter().map(|entry| entry.duration_ms).sum::<f64>();
+            let executions = entries.len() as u64;
+            let error_executions = entries.iter().filter(|entry| entry.status != "ok").count() as u64;
+            let ok_executions = executions.saturating_sub(error_executions);
+
+            diagnostics.push(StageDiagnosticReport {
+                stage_name: node.stage_name.clone(),
+                stage_kind: node.stage_kind.clone(),
+                component: node.component.clone(),
+                output_artifact: node.output_artifact.clone(),
+                input_artifacts: node.input_artifacts.clone(),
+                depends_on: node.depends_on.clone(),
+                downstream: node.downstream.clone(),
+                recurrent: node.recurrent,
+                executed: executions > 0,
+                executions,
+                ok_executions,
+                error_executions,
+                last_status: entries.last().map(|entry| entry.status.clone()),
+                total_duration_ms,
+                average_duration_ms: if executions > 0 {
+                    total_duration_ms / executions as f64
+                } else {
+                    0.0
+                },
+                errors: errors.into_iter().collect(),
+                models: models.into_iter().collect(),
+                variants: variants.into_iter().collect(),
+                prompt_hashes: prompt_hashes.into_iter().collect(),
+                system_prompt_hashes: system_prompt_hashes.into_iter().collect(),
+                downstream_failures,
+            });
+        }
+        diagnostics
     }
 
     fn stage_metadata(
@@ -2676,6 +3080,14 @@ impl<'a> TaskInterpreter<'a> {
         self.expect_string_list(value)
     }
 
+    fn assignments_json(&self, assignments: &HashMap<String, Value>) -> serde_json::Value {
+        let map = assignments
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::from(value.clone())))
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        serde_json::Value::Object(map)
+    }
+
     fn effective_stage_component(
         &self,
         stage: &StageIR,
@@ -2904,6 +3316,21 @@ impl<'a> TaskInterpreter<'a> {
                 objective.name
             )));
         }
+        let (train_cases, val_cases, test_cases) = self.partition_dataset(&dataset, objective);
+
+        if options.backend == OptimizationBackendKind::Evolutionary {
+            return self
+                .optimize_evolutionary(
+                    objective,
+                    task,
+                    harness,
+                    &train_cases,
+                    &val_cases,
+                    &test_cases,
+                    options,
+                )
+                .await;
+        }
 
         let OptimizationBackendResponse {
             assignments,
@@ -2912,11 +3339,30 @@ impl<'a> TaskInterpreter<'a> {
             .propose_candidate_assignments(objective, task, harness, &dataset, options)
             .await?;
         let evaluated_candidates = assignments.len();
-        let (train_cases, val_cases, test_cases) = self.partition_dataset(&dataset, objective);
 
         let mut best: Option<CandidateEvaluation> = None;
         let mut candidate_reports = Vec::with_capacity(evaluated_candidates);
-        for assignment in assignments {
+        let mut candidate_artifacts = Vec::with_capacity(evaluated_candidates);
+        for (candidate_index, assignment) in assignments.into_iter().enumerate() {
+            let progress = CandidateProgressContext {
+                index: candidate_index + 1,
+                total: evaluated_candidates,
+            };
+            tracer().record(TraceEvent::ObjectiveProgress {
+                objective_name: objective.name.clone(),
+                phase: ObjectiveProgressPhase::CandidateStarted,
+                split: None,
+                case_id: None,
+                repeat: None,
+                candidate_index: Some(progress.index),
+                candidate_total: Some(progress.total),
+                assignments: Some(self.assignments_json(&assignment)),
+                success: None,
+                score: None,
+                train_primary: None,
+                val_primary: None,
+                test_primary: None,
+            });
             let resolved = self.resolve_harness_with_assignments(
                 &objective.task,
                 &objective.harness,
@@ -2931,9 +3377,32 @@ impl<'a> TaskInterpreter<'a> {
                     &train_cases,
                     &val_cases,
                     &test_cases,
+                    Some(progress),
                 )
                 .await?;
+            tracer().record(TraceEvent::ObjectiveProgress {
+                objective_name: objective.name.clone(),
+                phase: ObjectiveProgressPhase::CandidateCompleted,
+                split: None,
+                case_id: None,
+                repeat: None,
+                candidate_index: Some(progress.index),
+                candidate_total: Some(progress.total),
+                assignments: Some(self.assignments_json(&assignment)),
+                success: None,
+                score: Some(candidate.train.summary.primary),
+                train_primary: Some(candidate.train.summary.primary),
+                val_primary: candidate
+                    .val
+                    .as_ref()
+                    .map(|summary| summary.summary.primary),
+                test_primary: candidate
+                    .test
+                    .as_ref()
+                    .map(|summary| summary.summary.primary),
+            });
             candidate_reports.push(candidate.to_report());
+            candidate_artifacts.push(candidate.to_artifacts());
             if best
                 .as_ref()
                 .map(|current| self.candidate_beats(&candidate, current))
@@ -2961,6 +3430,171 @@ impl<'a> TaskInterpreter<'a> {
                 best: best.to_report(),
             },
             candidates: candidate_reports,
+            candidate_artifacts,
+        })
+    }
+
+    async fn optimize_evolutionary(
+        &self,
+        objective: &ObjectiveIR,
+        task: &TaskIR,
+        harness: &HarnessIR,
+        train_cases: &[DatasetCase],
+        val_cases: &[DatasetCase],
+        test_cases: &[DatasetCase],
+        options: &OptimizationOptions,
+    ) -> Result<ObjectiveOptimizationArtifacts> {
+        let tunables = self.collect_tunable_domains(task, harness)?;
+        let has_dynamic_prompt_mutation = tunables
+            .iter()
+            .any(|tunable| tunable.kind == OptimizationTunableKind::PromptText);
+        let total_possible = self.evolutionary_search_space_upper_bound(&tunables);
+        let candidate_total = if has_dynamic_prompt_mutation {
+            options.max_candidates.max(1)
+        } else {
+            total_possible.min(options.max_candidates).max(1)
+        };
+        let island_count = tunables.len().clamp(1, 4).min(candidate_total);
+
+        let mut archive = Vec::new();
+        let mut best: Option<CandidateEvaluation> = None;
+        let mut candidate_reports = Vec::new();
+        let mut candidate_artifacts = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut frontier = VecDeque::from(self.seed_evolutionary_assignments(&tunables));
+
+        while candidate_reports.len() < options.max_candidates {
+            if frontier.is_empty() {
+                let offspring = self
+                    .propose_evolutionary_offspring(
+                        objective,
+                        task,
+                        harness,
+                        &tunables,
+                        &archive,
+                        &seen,
+                        island_count,
+                        options.max_candidates - candidate_reports.len(),
+                    )
+                    .await?;
+                if offspring.is_empty() {
+                    break;
+                }
+                frontier.extend(offspring);
+            }
+
+            let assignment = match frontier.pop_front() {
+                Some(assignment) => assignment,
+                None => continue,
+            };
+            let signature = self.assignment_signature(&assignment);
+            if !seen.insert(signature) {
+                continue;
+            }
+
+            let progress = CandidateProgressContext {
+                index: candidate_reports.len() + 1,
+                total: candidate_total,
+            };
+            tracer().record(TraceEvent::ObjectiveProgress {
+                objective_name: objective.name.clone(),
+                phase: ObjectiveProgressPhase::CandidateStarted,
+                split: None,
+                case_id: None,
+                repeat: None,
+                candidate_index: Some(progress.index),
+                candidate_total: Some(progress.total),
+                assignments: Some(self.assignments_json(&assignment)),
+                success: None,
+                score: None,
+                train_primary: None,
+                val_primary: None,
+                test_primary: None,
+            });
+
+            let resolved = self.resolve_harness_with_assignments(
+                &objective.task,
+                &objective.harness,
+                &assignment,
+            )?;
+            let candidate = self
+                .evaluate_candidate(
+                    objective,
+                    task,
+                    &resolved,
+                    &assignment,
+                    train_cases,
+                    val_cases,
+                    test_cases,
+                    Some(progress),
+                )
+                .await?;
+            tracer().record(TraceEvent::ObjectiveProgress {
+                objective_name: objective.name.clone(),
+                phase: ObjectiveProgressPhase::CandidateCompleted,
+                split: None,
+                case_id: None,
+                repeat: None,
+                candidate_index: Some(progress.index),
+                candidate_total: Some(progress.total),
+                assignments: Some(self.assignments_json(&assignment)),
+                success: None,
+                score: Some(candidate.train.summary.primary),
+                train_primary: Some(candidate.train.summary.primary),
+                val_primary: candidate
+                    .val
+                    .as_ref()
+                    .map(|summary| summary.summary.primary),
+                test_primary: candidate
+                    .test
+                    .as_ref()
+                    .map(|summary| summary.summary.primary),
+            });
+
+            let novelty = self.assignment_novelty(&tunables, &assignment, &archive);
+            let island = self.assignment_island(&assignment, island_count);
+            archive.push(EvolutionaryArchiveEntry {
+                assignments: assignment.clone(),
+                candidate: candidate.clone(),
+                novelty,
+                island,
+            });
+            candidate_reports.push(candidate.to_report());
+            candidate_artifacts.push(candidate.to_artifacts());
+            if best
+                .as_ref()
+                .map(|current| self.candidate_beats(&candidate, current))
+                .unwrap_or(true)
+            {
+                best = Some(candidate);
+            }
+        }
+
+        let evaluated_candidates = candidate_reports.len();
+        let truncated = if has_dynamic_prompt_mutation {
+            evaluated_candidates >= options.max_candidates
+        } else {
+            total_possible > evaluated_candidates
+        };
+        let best = best.ok_or_else(|| {
+            Error::Runtime(format!(
+                "objective '{}' did not yield any candidate evaluations",
+                objective.name
+            ))
+        })?;
+
+        Ok(ObjectiveOptimizationArtifacts {
+            report: ObjectiveOptimizationReport {
+                objective: objective.name.clone(),
+                task: objective.task.clone(),
+                harness: objective.harness.clone(),
+                backend: options.backend,
+                evaluated_candidates,
+                truncated,
+                best: best.to_report(),
+            },
+            candidates: candidate_reports,
+            candidate_artifacts,
         })
     }
 
@@ -3006,6 +3640,22 @@ impl<'a> TaskInterpreter<'a> {
         } else {
             self.partition_dataset(&filtered, objective)
         };
+        let progress = CandidateProgressContext { index: 1, total: 1 };
+        tracer().record(TraceEvent::ObjectiveProgress {
+            objective_name: objective.name.clone(),
+            phase: ObjectiveProgressPhase::CandidateStarted,
+            split: None,
+            case_id: None,
+            repeat: None,
+            candidate_index: Some(progress.index),
+            candidate_total: Some(progress.total),
+            assignments: Some(self.assignments_json(assignments)),
+            success: None,
+            score: None,
+            train_primary: None,
+            val_primary: None,
+            test_primary: None,
+        });
 
         let candidate = self
             .evaluate_candidate(
@@ -3016,14 +3666,36 @@ impl<'a> TaskInterpreter<'a> {
                 &train_cases,
                 &val_cases,
                 &test_cases,
+                Some(progress),
             )
             .await?;
+        tracer().record(TraceEvent::ObjectiveProgress {
+            objective_name: objective.name.clone(),
+            phase: ObjectiveProgressPhase::CandidateCompleted,
+            split: None,
+            case_id: None,
+            repeat: None,
+            candidate_index: Some(progress.index),
+            candidate_total: Some(progress.total),
+            assignments: Some(self.assignments_json(assignments)),
+            success: None,
+            score: Some(candidate.train.summary.primary),
+            train_primary: Some(candidate.train.summary.primary),
+            val_primary: candidate
+                .val
+                .as_ref()
+                .map(|summary| summary.summary.primary),
+            test_primary: candidate
+                .test
+                .as_ref()
+                .map(|summary| summary.summary.primary),
+        });
 
         Ok(CandidateOptimizationReport {
             assignments: candidate.assignments,
-            train: candidate.train,
-            val: candidate.val,
-            test: candidate.test,
+            train: candidate.train.summary,
+            val: candidate.val.map(|split| split.summary),
+            test: candidate.test.map(|split| split.summary),
         })
     }
 
@@ -3044,6 +3716,10 @@ impl<'a> TaskInterpreter<'a> {
                     truncated,
                 })
             }
+            OptimizationBackendKind::Evolutionary => Err(Error::Runtime(
+                "internal error: evolutionary optimization is evaluated directly, not via candidate proposal"
+                    .to_string(),
+            )),
             OptimizationBackendKind::Dspy => {
                 let tunables = self.collect_tunable_domains(task, harness)?;
                 let request = OptimizationBackendRequest {
@@ -3089,9 +3765,31 @@ impl<'a> TaskInterpreter<'a> {
                 Ok(OptimizationTunableDomain {
                     path: tunable.path.segments.join("."),
                     options: self.expand_tunable_domain(task, harness, tunable)?,
+                    kind: self.tunable_kind(task, tunable)?,
                 })
             })
             .collect()
+    }
+
+    fn tunable_kind(&self, task: &TaskIR, tunable: &TunableIR) -> Result<OptimizationTunableKind> {
+        let Some(target) = tunable.path.segments.first() else {
+            return Ok(OptimizationTunableKind::Discrete);
+        };
+        let Some(field) = tunable.path.segments.get(1) else {
+            return Ok(OptimizationTunableKind::Discrete);
+        };
+
+        let TaskTargetKindRuntime::Stage { kind, .. } = self.find_task_target(task, target)? else {
+            return Ok(OptimizationTunableKind::Discrete);
+        };
+
+        Ok(match (kind, field.as_str()) {
+            (StageKindIR::Prompt, "variant" | "system_prompt")
+            | (StageKindIR::Agent, "variant" | "system_prompt") => {
+                OptimizationTunableKind::PromptText
+            }
+            _ => OptimizationTunableKind::Discrete,
+        })
     }
 
     fn validate_proposed_assignments(
@@ -3154,6 +3852,8 @@ impl<'a> TaskInterpreter<'a> {
 
         let payload =
             serde_json::to_vec(request).map_err(|e| Error::SerializationError(e.to_string()))?;
+        let live_mode = std::env::var("SCAFFOLD_LIVE").is_ok()
+            || std::env::var("SCAFFOLD_TRACE_PRETTY").is_ok();
         let mut process = if cfg!(windows) {
             let mut command_process = Command::new("cmd");
             command_process
@@ -3161,8 +3861,12 @@ impl<'a> TaskInterpreter<'a> {
                 .arg(&command)
                 .current_dir(&working_dir)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stdout(Stdio::piped());
+            if live_mode {
+                command_process.stderr(Stdio::inherit());
+            } else {
+                command_process.stderr(Stdio::piped());
+            }
             self.configure_optimizer_backend_command_env(
                 &mut command_process,
                 &working_dir,
@@ -3176,8 +3880,12 @@ impl<'a> TaskInterpreter<'a> {
                 .arg(&command)
                 .current_dir(&working_dir)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stdout(Stdio::piped());
+            if live_mode {
+                command_process.stderr(Stdio::inherit());
+            } else {
+                command_process.stderr(Stdio::piped());
+            }
             self.configure_optimizer_backend_command_env(
                 &mut command_process,
                 &working_dir,
@@ -3452,6 +4160,659 @@ impl<'a> TaskInterpreter<'a> {
         Ok((candidates, truncated))
     }
 
+    fn evolutionary_search_space_upper_bound(
+        &self,
+        tunables: &[OptimizationTunableDomain],
+    ) -> usize {
+        tunables.iter().fold(1usize, |total, tunable| {
+            total.saturating_mul(tunable.options.len().saturating_add(1))
+        })
+    }
+
+    fn seed_evolutionary_assignments(
+        &self,
+        tunables: &[OptimizationTunableDomain],
+    ) -> Vec<HashMap<String, Value>> {
+        let mut seeds = vec![HashMap::new()];
+        for tunable in tunables {
+            for option in &tunable.options {
+                let mut assignment = HashMap::new();
+                assignment.insert(tunable.path.clone(), option.clone());
+                seeds.push(assignment);
+            }
+        }
+        seeds
+    }
+
+    async fn propose_evolutionary_offspring(
+        &self,
+        objective: &ObjectiveIR,
+        task: &TaskIR,
+        harness: &HarnessIR,
+        tunables: &[OptimizationTunableDomain],
+        archive: &[EvolutionaryArchiveEntry],
+        seen: &BTreeSet<String>,
+        island_count: usize,
+        limit: usize,
+    ) -> Result<Vec<HashMap<String, Value>>> {
+        if archive.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let parents = self.select_evolutionary_parents(archive, island_count);
+        let global_best = archive
+            .iter()
+            .max_by(|left, right| self.compare_archive_entries(left, right));
+        let mut proposals = Vec::new();
+        let mut proposal_signatures = BTreeSet::new();
+
+        for parent in parents {
+            for child in self.assignment_neighbors(&parent.assignments, tunables) {
+                if self.maybe_push_evolutionary_candidate(
+                    &child,
+                    seen,
+                    &mut proposal_signatures,
+                    &mut proposals,
+                    limit,
+                )? {
+                    return Ok(proposals);
+                }
+            }
+
+            if let Some(global_best) = global_best {
+                for child in [
+                    self.crossover_assignments(
+                        &parent.assignments,
+                        &global_best.assignments,
+                        tunables,
+                        false,
+                    ),
+                    self.crossover_assignments(
+                        &parent.assignments,
+                        &global_best.assignments,
+                        tunables,
+                        true,
+                    ),
+                ] {
+                    if self.maybe_push_evolutionary_candidate(
+                        &child,
+                        seen,
+                        &mut proposal_signatures,
+                        &mut proposals,
+                        limit,
+                    )? {
+                        return Ok(proposals);
+                    }
+                }
+            }
+
+            for tunable in tunables
+                .iter()
+                .filter(|tunable| tunable.kind == OptimizationTunableKind::PromptText)
+            {
+                if let Some(child) = self
+                    .mutate_prompt_text_assignment(objective, task, harness, tunable, parent)
+                    .await?
+                {
+                    if self.maybe_push_evolutionary_candidate(
+                        &child,
+                        seen,
+                        &mut proposal_signatures,
+                        &mut proposals,
+                        limit,
+                    )? {
+                        return Ok(proposals);
+                    }
+                }
+            }
+        }
+
+        Ok(proposals)
+    }
+
+    async fn mutate_prompt_text_assignment(
+        &self,
+        objective: &ObjectiveIR,
+        task: &TaskIR,
+        harness: &HarnessIR,
+        tunable: &OptimizationTunableDomain,
+        parent: &EvolutionaryArchiveEntry,
+    ) -> Result<Option<HashMap<String, Value>>> {
+        let Some((target, field)) = tunable.path.split_once('.') else {
+            return Ok(None);
+        };
+        if !matches!(field, "variant" | "system_prompt") {
+            return Ok(None);
+        }
+
+        let current_text = self.effective_text_surface_for_assignment(
+            task,
+            harness,
+            &parent.assignments,
+            target,
+            field,
+        )?;
+        if current_text.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let prompt =
+            self.build_prompt_mutation_request(objective, tunable, parent, target, &current_text);
+        let config =
+            self.prompt_mutation_config(task, harness, &parent.assignments, target, field)?;
+        let response = self
+            .query_structured_with_policy(&prompt, r#"{ "text": "string" }"#, &config, Some(45), 0)
+            .await?;
+        let Some(mutated_text) = self.extract_object_string_field(&response, "text") else {
+            return Ok(None);
+        };
+        if !self.validate_mutated_text_surface(field, &current_text, &mutated_text)? {
+            return Ok(None);
+        }
+
+        let mut child = parent.assignments.clone();
+        child.insert(tunable.path.clone(), Value::String(mutated_text));
+        Ok(Some(child))
+    }
+
+    fn prompt_mutation_config(
+        &self,
+        task: &TaskIR,
+        harness: &HarnessIR,
+        assignments: &HashMap<String, Value>,
+        target: &str,
+        field: &str,
+    ) -> Result<LlmConfig> {
+        let resolved =
+            self.resolve_harness_with_assignments(&task.name, &harness.name, assignments)?;
+        let mut config = LlmConfig::new()
+            .with_temperature(0.7)
+            .with_max_tokens(1200)
+            .with_system_prompt(format!(
+                "You improve one {} text surface inside a typed optimization loop. Preserve the interface exactly and return only JSON.",
+                if field == "variant" { "prompt template" } else { "system prompt" }
+            ));
+
+        if let Ok(model) = std::env::var("SCAFFOLD_OPTIMIZER_EDITOR_MODEL") {
+            if !model.trim().is_empty() {
+                config = config.with_model(model);
+                return Ok(config);
+            }
+        }
+
+        if let Some(model) = self.harness_string(&resolved, target, "model")? {
+            config = config.with_model(model);
+        }
+
+        Ok(config)
+    }
+
+    fn effective_text_surface_for_assignment(
+        &self,
+        task: &TaskIR,
+        harness: &HarnessIR,
+        assignments: &HashMap<String, Value>,
+        target: &str,
+        field: &str,
+    ) -> Result<String> {
+        let resolved =
+            self.resolve_harness_with_assignments(&task.name, &harness.name, assignments)?;
+        let TaskTargetKindRuntime::Stage { kind, component } =
+            self.find_task_target(task, target)?
+        else {
+            return Err(Error::Runtime(format!(
+                "text mutation is only supported for stage targets, found '{}'",
+                target
+            )));
+        };
+        let component = self
+            .harness_string(&resolved, target, "component")?
+            .unwrap_or_else(|| component.to_string());
+
+        match (kind, field) {
+            (StageKindIR::Prompt, "variant") => {
+                let prompt = self.find_prompt(&component)?;
+                self.effective_prompt_template(&resolved, target, prompt)
+            }
+            (StageKindIR::Prompt, "system_prompt") => {
+                let prompt = self.find_prompt(&component)?;
+                Ok(self
+                    .effective_system_prompt(&resolved, target, prompt.system.as_ref(), false)?
+                    .unwrap_or_default())
+            }
+            (StageKindIR::Agent, "variant" | "system_prompt") => {
+                let agent = self.find_agent(&component)?;
+                Ok(self
+                    .effective_system_prompt(&resolved, target, Some(&agent.system), true)?
+                    .unwrap_or_default())
+            }
+            _ => Err(Error::Runtime(format!(
+                "text mutation is not supported for '{}.{}'",
+                target, field
+            ))),
+        }
+    }
+
+    fn build_prompt_mutation_request(
+        &self,
+        objective: &ObjectiveIR,
+        tunable: &OptimizationTunableDomain,
+        parent: &EvolutionaryArchiveEntry,
+        target: &str,
+        current_text: &str,
+    ) -> String {
+        let field = tunable.path.split('.').nth(1).unwrap_or("text_surface");
+        let preserved_tags = self.template_tags(current_text);
+        let tag_guidance = if preserved_tags.is_empty() {
+            "Preserve the interface and keep the text focused.".to_string()
+        } else {
+            format!(
+                "Preserve these template tags exactly and do not add or remove tags:\n{}",
+                preserved_tags
+                    .iter()
+                    .map(|tag| format!("- {}", tag))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+
+        format!(
+            concat!(
+                "You are evolving one harness text surface for a fixed task/model evaluation.\n\n",
+                "Objective: {objective}\n",
+                "Target path: {path}\n",
+                "Surface kind: {field}\n\n",
+                "Current candidate score:\n",
+                "- train primary: {train:.3}\n",
+                "- val primary: {val:.3}\n",
+                "- test primary: {test:.3}\n\n",
+                "Observed stage-local rollout feedback:\n{feedback}\n\n",
+                "Current text:\n<<<TEXT\n{current}\nTEXT\n\n",
+                "Instructions:\n",
+                "- Make one small but meaningful improvement.\n",
+                "- Keep the same task intent and output contract.\n",
+                "- Prefer concrete reasoning guidance over stylistic churn.\n",
+                "- Do not add markdown fences or explanations.\n",
+                "- Return JSON only.\n",
+                "{tag_guidance}\n"
+            ),
+            objective = objective.name,
+            path = tunable.path,
+            field = field,
+            train = parent.candidate.train.summary.primary,
+            val = parent
+                .candidate
+                .val
+                .as_ref()
+                .map(|split| split.summary.primary)
+                .unwrap_or(0.0),
+            test = parent
+                .candidate
+                .test
+                .as_ref()
+                .map(|split| split.summary.primary)
+                .unwrap_or(0.0),
+            feedback = self.summarize_candidate_feedback_for_stage(parent, target),
+            current = current_text,
+            tag_guidance = tag_guidance,
+        )
+    }
+
+    fn summarize_candidate_feedback_for_stage(
+        &self,
+        parent: &EvolutionaryArchiveEntry,
+        target: &str,
+    ) -> String {
+        let mut lines = Vec::new();
+        for rollout in parent
+            .candidate
+            .train
+            .rollouts
+            .iter()
+            .chain(
+                parent
+                    .candidate
+                    .val
+                    .iter()
+                    .flat_map(|split| split.rollouts.iter()),
+            )
+            .chain(
+                parent
+                    .candidate
+                    .test
+                    .iter()
+                    .flat_map(|split| split.rollouts.iter()),
+            )
+            .take(8)
+        {
+            let case_id = rollout.case_id.as_deref().unwrap_or("unknown");
+            if let Some(stage) = rollout
+                .stage_diagnostics
+                .iter()
+                .find(|stage| stage.stage_name == target)
+            {
+                let metrics = rollout
+                    .metrics
+                    .iter()
+                    .map(|(name, value)| format!("{}={:.3}", name, value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut line = format!(
+                    "- {} / {}: stage={} executed={} last_status={} primary={:.3}",
+                    rollout.split,
+                    case_id,
+                    stage.stage_name,
+                    stage.executed,
+                    stage.last_status.as_deref().unwrap_or("not_run"),
+                    rollout.primary
+                );
+                if !stage.depends_on.is_empty() {
+                    line.push_str(&format!(" depends_on=[{}]", stage.depends_on.join(", ")));
+                }
+                if !stage.downstream.is_empty() {
+                    line.push_str(&format!(" downstream=[{}]", stage.downstream.join(", ")));
+                }
+                if stage.recurrent {
+                    line.push_str(" recurrent=true");
+                }
+                if stage.error_executions > 0 {
+                    line.push_str(&format!(" stage_errors={}", stage.errors.join(" | ")));
+                }
+                if stage.downstream_failures > 0 {
+                    line.push_str(&format!(
+                        " downstream_failures={}",
+                        stage.downstream_failures
+                    ));
+                }
+                if !metrics.is_empty() {
+                    line.push_str(&format!(" metrics=({})", metrics));
+                }
+                if let Some(error) = &rollout.error {
+                    line.push_str(&format!(" rollout_error={}", error));
+                }
+                lines.push(line);
+            }
+        }
+        if lines.is_empty() {
+            "- no stage-local rollout feedback available".to_string()
+        } else {
+            lines.join("\n")
+        }
+    }
+
+    fn extract_object_string_field(&self, value: &Value, field: &str) -> Option<String> {
+        match value {
+            Value::Map(fields) | Value::Struct { fields, .. } => fields
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+
+    fn validate_mutated_text_surface(
+        &self,
+        field: &str,
+        current_text: &str,
+        mutated_text: &str,
+    ) -> Result<bool> {
+        let current = current_text.trim();
+        let mutated = mutated_text.trim();
+        if mutated.is_empty() || mutated == current {
+            return Ok(false);
+        }
+
+        if self.template_tags(current_text) != self.template_tags(mutated_text) {
+            return Ok(false);
+        }
+
+        let manager = PromptManager::new();
+        let empty = Value::Map(HashMap::new());
+        let render_result = if field == "variant" {
+            manager.interpolate(mutated_text, &empty)
+        } else {
+            manager.render_inline(mutated_text, &empty)
+        };
+
+        match render_result {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn template_tags(&self, template: &str) -> Vec<String> {
+        let mut tags = Vec::new();
+        let bytes = template.as_bytes();
+        let mut index = 0usize;
+        while index + 1 < bytes.len() {
+            let open = if &bytes[index..index + 2] == b"{{" {
+                Some(("{{", "}}"))
+            } else if &bytes[index..index + 2] == b"{%" {
+                Some(("{%", "%}"))
+            } else {
+                None
+            };
+
+            let Some((_, close)) = open else {
+                index += 1;
+                continue;
+            };
+            let search_start = index + 2;
+            if let Some(relative_end) = template[search_start..].find(close) {
+                let end = search_start + relative_end + 2;
+                tags.push(template[index..end].to_string());
+                index = end;
+            } else {
+                break;
+            }
+        }
+        tags
+    }
+
+    fn maybe_push_evolutionary_candidate(
+        &self,
+        candidate: &HashMap<String, Value>,
+        seen: &BTreeSet<String>,
+        proposal_signatures: &mut BTreeSet<String>,
+        proposals: &mut Vec<HashMap<String, Value>>,
+        limit: usize,
+    ) -> Result<bool> {
+        let signature = self.assignment_signature(candidate);
+        if seen.contains(&signature) || !proposal_signatures.insert(signature) {
+            return Ok(false);
+        }
+        proposals.push(candidate.clone());
+        Ok(proposals.len() >= limit)
+    }
+
+    fn select_evolutionary_parents<'b>(
+        &self,
+        archive: &'b [EvolutionaryArchiveEntry],
+        island_count: usize,
+    ) -> Vec<&'b EvolutionaryArchiveEntry> {
+        let mut parents = Vec::new();
+        let mut parent_signatures = BTreeSet::new();
+
+        if let Some(global_best) = archive
+            .iter()
+            .max_by(|left, right| self.compare_archive_entries(left, right))
+        {
+            parent_signatures.insert(self.assignment_signature(&global_best.assignments));
+            parents.push(global_best);
+        }
+
+        for island in 0..island_count {
+            if let Some(best_island_entry) = archive
+                .iter()
+                .filter(|entry| entry.island == island)
+                .max_by(|left, right| self.compare_archive_entries(left, right))
+            {
+                let signature = self.assignment_signature(&best_island_entry.assignments);
+                if parent_signatures.insert(signature) {
+                    parents.push(best_island_entry);
+                }
+            }
+        }
+
+        if let Some(most_novel) = archive.iter().max_by(|left, right| {
+            left.novelty
+                .total_cmp(&right.novelty)
+                .then_with(|| self.compare_archive_entries(left, right))
+        }) {
+            let signature = self.assignment_signature(&most_novel.assignments);
+            if parent_signatures.insert(signature) {
+                parents.push(most_novel);
+            }
+        }
+
+        parents
+    }
+
+    fn assignment_neighbors(
+        &self,
+        assignments: &HashMap<String, Value>,
+        tunables: &[OptimizationTunableDomain],
+    ) -> Vec<HashMap<String, Value>> {
+        let mut neighbors = Vec::new();
+        for tunable in tunables {
+            if assignments.contains_key(&tunable.path) {
+                let mut removed = assignments.clone();
+                removed.remove(&tunable.path);
+                neighbors.push(removed);
+            }
+
+            for option in &tunable.options {
+                if assignments.get(&tunable.path) == Some(option) {
+                    continue;
+                }
+                let mut updated = assignments.clone();
+                updated.insert(tunable.path.clone(), option.clone());
+                neighbors.push(updated);
+            }
+        }
+        neighbors
+    }
+
+    fn crossover_assignments(
+        &self,
+        left: &HashMap<String, Value>,
+        right: &HashMap<String, Value>,
+        tunables: &[OptimizationTunableDomain],
+        swap_parity: bool,
+    ) -> HashMap<String, Value> {
+        let mut merged = HashMap::new();
+        for (index, tunable) in tunables.iter().enumerate() {
+            let use_right = (index % 2 == 0) == swap_parity;
+            let value = if use_right {
+                right.get(&tunable.path).or_else(|| left.get(&tunable.path))
+            } else {
+                left.get(&tunable.path).or_else(|| right.get(&tunable.path))
+            };
+            if let Some(value) = value {
+                merged.insert(tunable.path.clone(), value.clone());
+            }
+        }
+        merged
+    }
+
+    fn assignment_novelty(
+        &self,
+        tunables: &[OptimizationTunableDomain],
+        assignments: &HashMap<String, Value>,
+        archive: &[EvolutionaryArchiveEntry],
+    ) -> f64 {
+        if archive.is_empty() {
+            return 1.0;
+        }
+
+        let mut distances = archive
+            .iter()
+            .map(|entry| self.assignment_distance(tunables, assignments, &entry.assignments))
+            .collect::<Vec<_>>();
+        distances.sort_by(|left, right| left.total_cmp(right));
+        let k = distances.len().min(3);
+        distances.into_iter().take(k).sum::<f64>() / k as f64
+    }
+
+    fn assignment_distance(
+        &self,
+        tunables: &[OptimizationTunableDomain],
+        left: &HashMap<String, Value>,
+        right: &HashMap<String, Value>,
+    ) -> f64 {
+        if tunables.is_empty() {
+            return 0.0;
+        }
+
+        let differing = tunables
+            .iter()
+            .filter(|tunable| left.get(&tunable.path) != right.get(&tunable.path))
+            .count();
+        differing as f64 / tunables.len() as f64
+    }
+
+    fn assignment_island(
+        &self,
+        assignments: &HashMap<String, Value>,
+        island_count: usize,
+    ) -> usize {
+        if island_count <= 1 {
+            return 0;
+        }
+
+        let mut hasher = DefaultHasher::new();
+        self.assignment_signature(assignments).hash(&mut hasher);
+        (hasher.finish() as usize) % island_count
+    }
+
+    fn assignment_signature(&self, assignments: &HashMap<String, Value>) -> String {
+        let mut items = assignments
+            .iter()
+            .map(|(path, value)| format!("{}={}", path, self.canonical_value_string(value)))
+            .collect::<Vec<_>>();
+        items.sort();
+        items.join("\u{1f}")
+    }
+
+    fn canonical_value_string(&self, value: &Value) -> String {
+        match value {
+            Value::Null => "null".to_string(),
+            Value::Bool(value) => value.to_string(),
+            Value::Int(value) => value.to_string(),
+            Value::Float(value) => value.to_string(),
+            Value::String(value) => format!("{:?}", value),
+            Value::Bytes(bytes) => format!("bytes:{:?}", bytes),
+            Value::List(items) => format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(|item| self.canonical_value_string(item))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Value::Map(fields) => {
+                let mut entries = fields
+                    .iter()
+                    .map(|(key, value)| format!("{}:{}", key, self.canonical_value_string(value)))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                format!("{{{}}}", entries.join(","))
+            }
+            Value::Struct { type_name, fields } => {
+                let mut entries = fields
+                    .iter()
+                    .map(|(key, value)| format!("{}:{}", key, self.canonical_value_string(value)))
+                    .collect::<Vec<_>>();
+                entries.sort();
+                format!("{}{{{}}}", type_name, entries.join(","))
+            }
+            Value::Result(result) => match &**result {
+                ResultValue::Ok(value) => format!("ok({})", self.canonical_value_string(value)),
+                ResultValue::Err(value) => format!("err({})", self.canonical_value_string(value)),
+            },
+        }
+    }
+
     fn expand_tunable_domain(
         &self,
         task: &TaskIR,
@@ -3686,24 +5047,46 @@ impl<'a> TaskInterpreter<'a> {
         train_cases: &[DatasetCase],
         val_cases: &[DatasetCase],
         test_cases: &[DatasetCase],
+        candidate_progress: Option<CandidateProgressContext>,
     ) -> Result<CandidateEvaluation> {
         let train = self
-            .evaluate_split(objective, task, harness, train_cases)
+            .evaluate_split(
+                objective,
+                task,
+                harness,
+                "train",
+                train_cases,
+                candidate_progress,
+            )
             .await?;
         let val = if val_cases.is_empty() {
             None
         } else {
             Some(
-                self.evaluate_split(objective, task, harness, val_cases)
-                    .await?,
+                self.evaluate_split(
+                    objective,
+                    task,
+                    harness,
+                    "val",
+                    val_cases,
+                    candidate_progress,
+                )
+                .await?,
             )
         };
         let test = if test_cases.is_empty() {
             None
         } else {
             Some(
-                self.evaluate_split(objective, task, harness, test_cases)
-                    .await?,
+                self.evaluate_split(
+                    objective,
+                    task,
+                    harness,
+                    "test",
+                    test_cases,
+                    candidate_progress,
+                )
+                .await?,
             )
         };
 
@@ -3720,19 +5103,57 @@ impl<'a> TaskInterpreter<'a> {
         objective: &ObjectiveIR,
         task: &TaskIR,
         harness: &ResolvedHarness,
+        split_name: &str,
         cases: &[DatasetCase],
-    ) -> Result<SplitEvaluationSummary> {
+        candidate_progress: Option<CandidateProgressContext>,
+    ) -> Result<SplitEvaluationArtifacts> {
         let repeats = objective.repeats.unwrap_or(1).max(1);
         let mut rollouts = Vec::new();
         for case in cases {
             for repeat in 0..repeats {
-                rollouts.push(
-                    self.evaluate_rollout(objective, task, harness, case, repeat)
-                        .await?,
-                );
+                tracer().record(TraceEvent::ObjectiveProgress {
+                    objective_name: objective.name.clone(),
+                    phase: ObjectiveProgressPhase::RolloutStarted,
+                    split: Some(split_name.to_string()),
+                    case_id: case.id.clone(),
+                    repeat: Some(repeat),
+                    candidate_index: candidate_progress.map(|ctx| ctx.index),
+                    candidate_total: candidate_progress.map(|ctx| ctx.total),
+                    assignments: None,
+                    success: None,
+                    score: None,
+                    train_primary: None,
+                    val_primary: None,
+                    test_primary: None,
+                });
+                let rollout = self
+                    .evaluate_rollout(objective, task, harness, split_name, case, repeat)
+                    .await?;
+                tracer().record(TraceEvent::ObjectiveProgress {
+                    objective_name: objective.name.clone(),
+                    phase: ObjectiveProgressPhase::RolloutCompleted,
+                    split: Some(split_name.to_string()),
+                    case_id: case.id.clone(),
+                    repeat: Some(repeat),
+                    candidate_index: candidate_progress.map(|ctx| ctx.index),
+                    candidate_total: candidate_progress.map(|ctx| ctx.total),
+                    assignments: None,
+                    success: Some(rollout.success),
+                    score: Some(rollout.primary),
+                    train_primary: None,
+                    val_primary: None,
+                    test_primary: None,
+                });
+                rollouts.push(rollout);
             }
         }
-        self.summarize_rollouts(&rollouts)
+        Ok(SplitEvaluationArtifacts {
+            summary: self.summarize_rollouts(&rollouts)?,
+            rollouts: rollouts
+                .into_iter()
+                .map(|rollout| rollout.to_report())
+                .collect(),
+        })
     }
 
     async fn evaluate_rollout(
@@ -3740,6 +5161,7 @@ impl<'a> TaskInterpreter<'a> {
         objective: &ObjectiveIR,
         task: &TaskIR,
         harness: &ResolvedHarness,
+        split_name: &str,
         case: &DatasetCase,
         repeat: u64,
     ) -> Result<RolloutEvaluation> {
@@ -3760,6 +5182,7 @@ impl<'a> TaskInterpreter<'a> {
                 Some(error.to_string()),
             ),
         };
+        let output_value = output.clone();
 
         let mut artifacts = HashMap::new();
         artifacts.insert("expected".to_string(), case.expected.clone());
@@ -3770,6 +5193,7 @@ impl<'a> TaskInterpreter<'a> {
             telemetry,
         };
         self.refresh_rollout_artifact(
+            task,
             &mut ctx,
             success,
             duration_ms,
@@ -3781,6 +5205,7 @@ impl<'a> TaskInterpreter<'a> {
         let mut metrics = HashMap::new();
         let constraints_ok = self
             .evaluate_named_rollout_signals(
+                task,
                 &objective.constraints,
                 &mut ctx,
                 &mut metrics,
@@ -3794,6 +5219,7 @@ impl<'a> TaskInterpreter<'a> {
             )
             .await?;
         self.evaluate_named_rollout_signals(
+            task,
             &objective.checkers,
             &mut ctx,
             &mut metrics,
@@ -3807,6 +5233,7 @@ impl<'a> TaskInterpreter<'a> {
         )
         .await?;
         self.evaluate_named_rollout_signals(
+            task,
             &objective.judges,
             &mut ctx,
             &mut metrics,
@@ -3820,6 +5247,7 @@ impl<'a> TaskInterpreter<'a> {
         )
         .await?;
         self.evaluate_named_rollout_signals(
+            task,
             &objective.metrics,
             &mut ctx,
             &mut metrics,
@@ -3834,6 +5262,7 @@ impl<'a> TaskInterpreter<'a> {
         .await?;
 
         self.refresh_rollout_artifact(
+            task,
             &mut ctx,
             success,
             duration_ms,
@@ -3860,16 +5289,37 @@ impl<'a> TaskInterpreter<'a> {
             tie_breakers = vec![penalty; tie_breakers.len()];
         }
 
+        let rollout = ctx
+            .artifacts
+            .get("rollout")
+            .cloned()
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        let stage_graph = self.task_stage_graph(task);
+        let stage_diagnostics = self.stage_diagnostics(&stage_graph, &ctx.telemetry.borrow());
+
         Ok(RolloutEvaluation {
+            split: split_name.to_string(),
+            case_id: case.id.clone(),
+            repeat,
+            input: case.input.clone(),
+            expected: case.expected.clone(),
+            output: output_value,
+            success,
+            error,
             metrics,
             score,
             primary,
             tie_breakers,
+            stage_graph,
+            stage_diagnostics,
+            rollout,
         })
     }
 
     async fn evaluate_named_rollout_signals(
         &self,
+        task: &TaskIR,
         decls: &[scaffold_ir::MetricIR],
         ctx: &mut ExecutionContext,
         metrics: &mut HashMap<String, f64>,
@@ -3883,7 +5333,7 @@ impl<'a> TaskInterpreter<'a> {
     ) -> Result<bool> {
         let mut all_passed = true;
         for decl in decls {
-            self.refresh_rollout_artifact(ctx, success, duration_ms, repeat, case_id, error)?;
+            self.refresh_rollout_artifact(task, ctx, success, duration_ms, repeat, case_id, error)?;
             let value = self.eval_objective_expr(&decl.expr, ctx).await?;
             if require_bool {
                 match value {
@@ -4000,9 +5450,22 @@ impl<'a> TaskInterpreter<'a> {
         candidate: &CandidateEvaluation,
         current: &CandidateEvaluation,
     ) -> bool {
-        self.compare_summary(&candidate.train, &current.train)
+        self.compare_summary(&candidate.train.summary, &current.train.summary)
             .then_with(|| self.compare_assignments(&candidate.assignments, &current.assignments))
             .is_gt()
+    }
+
+    fn compare_archive_entries(
+        &self,
+        left: &EvolutionaryArchiveEntry,
+        right: &EvolutionaryArchiveEntry,
+    ) -> std::cmp::Ordering {
+        self.compare_summary(
+            &left.candidate.train.summary,
+            &right.candidate.train.summary,
+        )
+        .then_with(|| left.novelty.total_cmp(&right.novelty))
+        .then_with(|| self.compare_assignments(&left.assignments, &right.assignments))
     }
 
     fn compare_summary(
@@ -4033,11 +5496,11 @@ impl<'a> TaskInterpreter<'a> {
     ) -> std::cmp::Ordering {
         let mut left_items = left
             .iter()
-            .map(|(key, value)| (key.clone(), value.to_string()))
+            .map(|(key, value)| (key.clone(), self.canonical_value_string(value)))
             .collect::<Vec<_>>();
         let mut right_items = right
             .iter()
-            .map(|(key, value)| (key.clone(), value.to_string()))
+            .map(|(key, value)| (key.clone(), self.canonical_value_string(value)))
             .collect::<Vec<_>>();
         left_items.sort();
         right_items.sort();
@@ -6298,6 +7761,354 @@ mod tests {
     }
 
     #[test]
+    fn optimize_objective_evolutionary_selects_best_stage_component() {
+        let ir = ScaffoldIR {
+            tools: vec![
+                ToolIR {
+                    name: "normalize_plain".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                    },
+                    output: TypeIR::String,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Ident {
+                            name: "text".to_string(),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+                ToolIR {
+                    name: "normalize_loud".to_string(),
+                    input: TypeIR::Struct {
+                        fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                    },
+                    output: TypeIR::String,
+                    implementation: Some(ToolImplIR::Expr {
+                        expr: ToolExprIR::Shell {
+                            command: "printf '{text}' | tr '[:lower:]' '[:upper:]'".to_string(),
+                        },
+                    }),
+                    spec: None,
+                    variants: Vec::new(),
+                },
+            ],
+            types: vec![TypeDefIR {
+                name: "TaskOutput".to_string(),
+                kind: TypeDefKindIR::Type,
+                definition: TypeIR::Struct {
+                    fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                },
+            }],
+            tasks: vec![TaskIR {
+                name: "format_text".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::Named {
+                    name: "TaskOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "formatted".to_string(),
+                    ty: TypeIR::String,
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "format".to_string(),
+                    stage_kind: StageKindIR::Tool,
+                    component: "normalize_plain".to_string(),
+                    input: ExprIR::Record {
+                        fields: vec![ExprFieldIR {
+                            key: "text".to_string(),
+                            value: ExprIR::FieldAccess {
+                                base: Box::new(ExprIR::Ident {
+                                    name: "input".to_string(),
+                                }),
+                                field: "text".to_string(),
+                            },
+                        }],
+                    },
+                    output: "formatted".to_string(),
+                    when: None,
+                })],
+                emit: vec![EmitFieldIR {
+                    name: "answer".to_string(),
+                    value: ExprIR::Ident {
+                        name: "formatted".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "search".to_string(),
+                task: "format_text".to_string(),
+                defaults: Vec::new(),
+                bindings: Vec::new(),
+                tunables: vec![TunableIR {
+                    path: BindingPathIR {
+                        segments: vec!["format".to_string(), "component".to_string()],
+                    },
+                    operator: TuneOperatorIR::In,
+                    domain: FiniteDomainIR::Components,
+                }],
+            }],
+            objectives: vec![ObjectiveIR {
+                name: "quality".to_string(),
+                task: "format_text".to_string(),
+                harness: "search".to_string(),
+                dataset: scaffold_ir::DatasetSpecIR::Inline {
+                    cases: vec![scaffold_ir::InlineDatasetCaseIR {
+                        id: Some("one".to_string()),
+                        input: ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "text".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "hello".to_string(),
+                                    },
+                                },
+                            }],
+                        },
+                        expected: Some(ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "answer".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "HELLO".to_string(),
+                                    },
+                                },
+                            }],
+                        }),
+                    }],
+                },
+                repeats: Some(1),
+                constraints: Vec::new(),
+                checkers: Vec::new(),
+                judges: Vec::new(),
+                metrics: vec![MetricIR {
+                    name: "exact".to_string(),
+                    expr: ExprIR::Binary {
+                        left: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "output".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                        op: "==".to_string(),
+                        right: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "expected".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                    },
+                }],
+                score: ExprIR::Ident {
+                    name: "exact".to_string(),
+                },
+                split: None,
+                select: Some(SelectIR {
+                    primary: ExprIR::Ident {
+                        name: "exact".to_string(),
+                    },
+                    tie_breakers: Vec::new(),
+                }),
+            }],
+            ..empty_ir()
+        };
+
+        let report = optimize_objective_with_options(
+            &ir,
+            "quality",
+            Path::new("."),
+            OptimizationOptions {
+                backend: OptimizationBackendKind::Evolutionary,
+                max_candidates: 8,
+                backend_command: None,
+                source_file: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.backend, OptimizationBackendKind::Evolutionary);
+        assert!(report.evaluated_candidates >= 2);
+        assert_eq!(
+            report.best.assignments.get("format.component"),
+            Some(&Value::String("normalize_loud".to_string()))
+        );
+        assert_eq!(report.best.train.primary, 1.0);
+    }
+
+    #[test]
+    fn optimize_objective_exposes_rollout_artifacts() {
+        let ir = ScaffoldIR {
+            tools: vec![ToolIR {
+                name: "formatter".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::String,
+                implementation: Some(ToolImplIR::Expr {
+                    expr: ToolExprIR::Ident {
+                        name: "text".to_string(),
+                    },
+                }),
+                spec: None,
+                variants: vec![
+                    ToolVariantIR {
+                        name: "plain".to_string(),
+                        implementation: ToolImplIR::Expr {
+                            expr: ToolExprIR::Ident {
+                                name: "text".to_string(),
+                            },
+                        },
+                    },
+                    ToolVariantIR {
+                        name: "shout".to_string(),
+                        implementation: ToolImplIR::Expr {
+                            expr: ToolExprIR::Shell {
+                                command: "printf '{text}' | tr '[:lower:]' '[:upper:]'".to_string(),
+                            },
+                        },
+                    },
+                ],
+            }],
+            types: vec![TypeDefIR {
+                name: "TaskOutput".to_string(),
+                kind: TypeDefKindIR::Type,
+                definition: TypeIR::Struct {
+                    fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                },
+            }],
+            tasks: vec![TaskIR {
+                name: "format_text".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("text".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::Named {
+                    name: "TaskOutput".to_string(),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "formatted".to_string(),
+                    ty: TypeIR::String,
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "format".to_string(),
+                    stage_kind: StageKindIR::Tool,
+                    component: "formatter".to_string(),
+                    input: ExprIR::Ident {
+                        name: "input".to_string(),
+                    },
+                    output: "formatted".to_string(),
+                    when: None,
+                })],
+                emit: vec![EmitFieldIR {
+                    name: "answer".to_string(),
+                    value: ExprIR::Ident {
+                        name: "formatted".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "search".to_string(),
+                task: "format_text".to_string(),
+                defaults: Vec::new(),
+                bindings: Vec::new(),
+                tunables: vec![TunableIR {
+                    path: BindingPathIR {
+                        segments: vec!["format".to_string(), "variant".to_string()],
+                    },
+                    operator: TuneOperatorIR::In,
+                    domain: FiniteDomainIR::Variants {
+                        name: "formatter".to_string(),
+                    },
+                }],
+            }],
+            objectives: vec![ObjectiveIR {
+                name: "quality".to_string(),
+                task: "format_text".to_string(),
+                harness: "search".to_string(),
+                dataset: scaffold_ir::DatasetSpecIR::Inline {
+                    cases: vec![scaffold_ir::InlineDatasetCaseIR {
+                        id: Some("one".to_string()),
+                        input: ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "text".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "hello".to_string(),
+                                    },
+                                },
+                            }],
+                        },
+                        expected: Some(ExprIR::Record {
+                            fields: vec![ExprFieldIR {
+                                key: "answer".to_string(),
+                                value: ExprIR::Literal {
+                                    value: LiteralIR::String {
+                                        value: "HELLO".to_string(),
+                                    },
+                                },
+                            }],
+                        }),
+                    }],
+                },
+                repeats: Some(1),
+                constraints: Vec::new(),
+                checkers: Vec::new(),
+                judges: Vec::new(),
+                metrics: vec![MetricIR {
+                    name: "exact".to_string(),
+                    expr: ExprIR::Binary {
+                        left: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "output".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                        op: "==".to_string(),
+                        right: Box::new(ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "expected".to_string(),
+                            }),
+                            field: "answer".to_string(),
+                        }),
+                    },
+                }],
+                score: ExprIR::Ident {
+                    name: "exact".to_string(),
+                },
+                split: None,
+                select: Some(SelectIR {
+                    primary: ExprIR::Ident {
+                        name: "exact".to_string(),
+                    },
+                    tie_breakers: Vec::new(),
+                }),
+            }],
+            ..empty_ir()
+        };
+
+        let artifacts = optimize_objective_with_artifacts(
+            &ir,
+            "quality",
+            Path::new("."),
+            OptimizationOptions {
+                backend: OptimizationBackendKind::Interpreter,
+                max_candidates: 8,
+                backend_command: None,
+                source_file: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(artifacts.candidate_artifacts.len(), 2);
+        let rollout = &artifacts.candidate_artifacts[0].train.rollouts[0];
+        assert_eq!(rollout.split, "train");
+        assert_eq!(rollout.case_id.as_deref(), Some("one"));
+        assert!(rollout.rollout.get("trace").is_some());
+        assert_eq!(rollout.metrics.get("exact"), Some(&0.0));
+    }
+
+    #[test]
     fn optimize_objective_accepts_external_backend_proposals() {
         let ir = ScaffoldIR {
             tools: vec![ToolIR {
@@ -6808,5 +8619,224 @@ mod tests {
             Some(&1.0)
         );
         assert_eq!(report.best.train.score, 1.25);
+    }
+
+    #[test]
+    fn evolutionary_search_can_mutate_prompt_text_surfaces() {
+        let _guard = llm_mock_guard();
+        clear_mock_structured_sequence();
+        set_mock_structured_sequence(vec![json!({
+            "text": "Solve carefully.\nQuestion: {{ question }}\nReturn only the answer."
+        })]);
+
+        let ir = ScaffoldIR {
+            prompts: vec![PromptIR {
+                name: "answer".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("question".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::Struct {
+                    fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                },
+                template: StringOrFileIR::Literal {
+                    value: "Question: {{ question }}".to_string(),
+                },
+                system: None,
+            }],
+            tasks: vec![TaskIR {
+                name: "solve".to_string(),
+                input: TypeIR::Struct {
+                    fields: HashMap::from([("question".to_string(), TypeIR::String)]),
+                },
+                output: TypeIR::Struct {
+                    fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                },
+                artifacts: vec![ArtifactSlotIR {
+                    name: "draft".to_string(),
+                    ty: TypeIR::Struct {
+                        fields: HashMap::from([("answer".to_string(), TypeIR::String)]),
+                    },
+                }],
+                body: vec![TaskNodeIR::Stage(StageIR {
+                    name: "solve".to_string(),
+                    stage_kind: StageKindIR::Prompt,
+                    component: "answer".to_string(),
+                    input: ExprIR::Ident {
+                        name: "input".to_string(),
+                    },
+                    output: "draft".to_string(),
+                    when: None,
+                })],
+                emit: vec![EmitFieldIR {
+                    name: "answer".to_string(),
+                    value: ExprIR::FieldAccess {
+                        base: Box::new(ExprIR::Ident {
+                            name: "draft".to_string(),
+                        }),
+                        field: "answer".to_string(),
+                    },
+                }],
+            }],
+            harnesses: vec![HarnessIR {
+                name: "search".to_string(),
+                task: "solve".to_string(),
+                defaults: Vec::new(),
+                bindings: vec![scaffold_ir::TargetBindingIR {
+                    target: "solve".to_string(),
+                    bindings: vec![BindingIR {
+                        key: BindingPathIR {
+                            segments: vec!["variant".to_string()],
+                        },
+                        value: ExprIR::Literal {
+                            value: LiteralIR::String {
+                                value: "Question: {{ question }}".to_string(),
+                            },
+                        },
+                    }],
+                }],
+                tunables: vec![TunableIR {
+                    path: BindingPathIR {
+                        segments: vec!["solve".to_string(), "variant".to_string()],
+                    },
+                    operator: TuneOperatorIR::In,
+                    domain: FiniteDomainIR::List {
+                        values: vec![ExprIR::Literal {
+                            value: LiteralIR::String {
+                                value: "Question: {{ question }}".to_string(),
+                            },
+                        }],
+                    },
+                }],
+            }],
+            objectives: vec![ObjectiveIR {
+                name: "quality".to_string(),
+                task: "solve".to_string(),
+                harness: "search".to_string(),
+                dataset: DatasetSpecIR::Inline { cases: Vec::new() },
+                repeats: Some(1),
+                constraints: Vec::new(),
+                checkers: Vec::new(),
+                judges: Vec::new(),
+                metrics: Vec::new(),
+                score: ExprIR::Literal {
+                    value: LiteralIR::Float { value: 0.0 },
+                },
+                split: None,
+                select: Some(SelectIR {
+                    primary: ExprIR::Literal {
+                        value: LiteralIR::Float { value: 0.0 },
+                    },
+                    tie_breakers: Vec::new(),
+                }),
+            }],
+            ..empty_ir()
+        };
+
+        let interpreter = TaskInterpreter::new(&ir, Path::new("."));
+        let task = &ir.tasks[0];
+        let harness = &ir.harnesses[0];
+        let objective = &ir.objectives[0];
+        let tunables = interpreter.collect_tunable_domains(task, harness).unwrap();
+        assert_eq!(tunables[0].kind, OptimizationTunableKind::PromptText);
+
+        let archive = vec![EvolutionaryArchiveEntry {
+            assignments: HashMap::new(),
+            candidate: CandidateEvaluation {
+                assignments: HashMap::new(),
+                train: SplitEvaluationArtifacts {
+                    summary: SplitEvaluationSummary {
+                        rollouts: 1,
+                        metrics: HashMap::from([("exact_outputs".to_string(), 0.0)]),
+                        score: 0.0,
+                        primary: 0.0,
+                        tie_breakers: vec![1.0],
+                    },
+                    rollouts: vec![RolloutArtifactReport {
+                        split: "train".to_string(),
+                        case_id: Some("case-1".to_string()),
+                        repeat: 0,
+                        input: Value::Map(HashMap::from([(
+                            "question".to_string(),
+                            Value::String("What is 2+2?".to_string()),
+                        )])),
+                        expected: Value::Map(HashMap::new()),
+                        output: Value::Map(HashMap::new()),
+                        success: true,
+                        error: None,
+                        metrics: HashMap::from([
+                            ("exact_outputs".to_string(), 0.0),
+                            ("output_count".to_string(), 1.0),
+                        ]),
+                        score: 0.0,
+                        primary: 0.0,
+                        tie_breakers: vec![1.0],
+                        stage_graph: vec![StageDependencyReport {
+                            stage_name: "solve".to_string(),
+                            stage_kind: "prompt".to_string(),
+                            component: "answer".to_string(),
+                            output_artifact: "draft".to_string(),
+                            input_artifacts: Vec::new(),
+                            depends_on: Vec::new(),
+                            downstream: Vec::new(),
+                            recurrent: false,
+                        }],
+                        stage_diagnostics: vec![StageDiagnosticReport {
+                            stage_name: "solve".to_string(),
+                            stage_kind: "prompt".to_string(),
+                            component: "answer".to_string(),
+                            output_artifact: "draft".to_string(),
+                            input_artifacts: Vec::new(),
+                            depends_on: Vec::new(),
+                            downstream: Vec::new(),
+                            recurrent: false,
+                            executed: true,
+                            executions: 1,
+                            ok_executions: 1,
+                            error_executions: 0,
+                            last_status: Some("ok".to_string()),
+                            total_duration_ms: 1.0,
+                            average_duration_ms: 1.0,
+                            errors: Vec::new(),
+                            models: vec!["gpt-5-mini".to_string()],
+                            variants: vec!["Question: {{ question }}".to_string()],
+                            prompt_hashes: Vec::new(),
+                            system_prompt_hashes: Vec::new(),
+                            downstream_failures: 0,
+                        }],
+                        rollout: json!({ "trace": {} }),
+                    }],
+                },
+                val: None,
+                test: None,
+            },
+            novelty: 1.0,
+            island: 0,
+        }];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let proposals = runtime
+            .block_on(interpreter.propose_evolutionary_offspring(
+                objective,
+                task,
+                harness,
+                &tunables,
+                &archive,
+                &BTreeSet::new(),
+                1,
+                8,
+            ))
+            .unwrap();
+        clear_mock_structured_sequence();
+
+        assert!(proposals.iter().any(|candidate| {
+            candidate.get("solve.variant")
+                == Some(&Value::String(
+                    "Solve carefully.\nQuestion: {{ question }}\nReturn only the answer."
+                        .to_string(),
+                ))
+        }));
     }
 }

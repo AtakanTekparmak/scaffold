@@ -19,11 +19,13 @@ use scaffold_ir::{
     pretty_print, to_json, AgentIR, BindingIR, BindingPathIR, ExprIR, HarnessIR, Lowerer, PromptIR,
     ScaffoldIR, StageKindIR, StringOrFileIR, TaskIR, TaskNodeIR,
 };
+use scaffold_runtime::trace::init_tracer;
 use scaffold_runtime::{
     evaluate_objective_candidate as evaluate_ir_objective_candidate,
     execute_task as execute_ir_task, optimize_objective_with_artifacts as optimize_ir_objective,
-    CandidateOptimizationReport, ObjectiveOptimizationArtifacts, OptimizationBackendKind,
-    OptimizationOptions,
+    CandidateOptimizationArtifacts, CandidateOptimizationReport, ObjectiveOptimizationArtifacts,
+    OptimizationBackendKind, OptimizationOptions, RolloutArtifactReport, SplitEvaluationArtifacts,
+    TraceFormat, TraceLevel, TraceOutput, TracerConfig,
 };
 use scaffold_syntax::parse;
 use scaffold_types::check;
@@ -40,6 +42,7 @@ struct Cli {
 #[derive(Clone, Debug, ValueEnum)]
 enum OptimizeBackend {
     Interpreter,
+    Evolutionary,
     Dspy,
 }
 
@@ -107,6 +110,10 @@ enum Commands {
         /// Config file to load into the runtime
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Show live human-readable trace logs on stderr
+        #[arg(long)]
+        live: bool,
     },
 
     /// Optimize an objective by searching its declared harness space
@@ -150,6 +157,10 @@ enum Commands {
         /// Write a self-contained scaffold file with the best harness materialized
         #[arg(long)]
         write_best: Option<PathBuf>,
+
+        /// Show live human-readable trace logs on stderr
+        #[arg(long)]
+        live: bool,
     },
 
     /// Evaluate an objective with the harness defaults or explicit assignments
@@ -177,6 +188,10 @@ enum Commands {
         /// Config file to load into the runtime
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Show live human-readable trace logs on stderr
+        #[arg(long)]
+        live: bool,
     },
 
     #[command(hide = true, name = "internal-evaluate-candidate")]
@@ -220,6 +235,7 @@ fn main() -> ExitCode {
             verbose,
             verify,
             config,
+            live,
         } => cmd_run(
             &file,
             task.as_deref(),
@@ -228,6 +244,7 @@ fn main() -> ExitCode {
             verbose,
             verify,
             config.as_deref(),
+            live,
         ),
         Commands::Optimize {
             file,
@@ -240,6 +257,7 @@ fn main() -> ExitCode {
             backend_command,
             report_dir,
             write_best,
+            live,
         } => cmd_optimize(
             &file,
             objective.as_deref(),
@@ -251,6 +269,7 @@ fn main() -> ExitCode {
             backend_command.as_deref(),
             report_dir.as_deref(),
             write_best.as_deref(),
+            live,
         ),
         Commands::Evaluate {
             file,
@@ -259,6 +278,7 @@ fn main() -> ExitCode {
             case_id,
             verify,
             config,
+            live,
         } => cmd_evaluate(
             &file,
             objective.as_deref(),
@@ -266,6 +286,7 @@ fn main() -> ExitCode {
             case_id.as_deref(),
             verify,
             config.as_deref(),
+            live,
         ),
         Commands::InternalEvaluateCandidate {
             file,
@@ -283,6 +304,27 @@ fn main() -> ExitCode {
             config.as_deref(),
         ),
     }
+}
+
+fn should_enable_live_tracing(flag: bool) -> bool {
+    flag || std::env::var("SCAFFOLD_LIVE").is_ok()
+}
+
+fn maybe_enable_live_tracing(flag: bool) {
+    if !should_enable_live_tracing(flag) {
+        return;
+    }
+
+    std::env::set_var("SCAFFOLD_LIVE", "1");
+    std::env::set_var("SCAFFOLD_TRACE", "1");
+    std::env::set_var("SCAFFOLD_TRACE_PRETTY", "1");
+    init_tracer(TracerConfig {
+        enabled: true,
+        output: TraceOutput::Stderr,
+        include_bodies: std::env::var("SCAFFOLD_TRACE_BODIES").is_ok(),
+        min_level: TraceLevel::Info,
+        format: TraceFormat::Pretty,
+    });
 }
 
 fn cmd_check(file: &PathBuf, verbose: bool) -> ExitCode {
@@ -466,7 +508,9 @@ fn cmd_run(
     verbose: bool,
     verify_enabled: bool,
     config: Option<&Path>,
+    live: bool,
 ) -> ExitCode {
+    maybe_enable_live_tracing(live);
     let input_json = match parse_run_input(input_str) {
         Ok(value) => value,
         Err(code) => return code,
@@ -565,7 +609,9 @@ fn cmd_optimize(
     backend_command: Option<&str>,
     report_dir: Option<&Path>,
     write_best: Option<&Path>,
+    live: bool,
 ) -> ExitCode {
+    maybe_enable_live_tracing(live);
     let ir = match parse_typecheck_lower(file, verify_enabled) {
         Ok(ir) => ir,
         Err(code) => return code,
@@ -631,6 +677,7 @@ fn cmd_optimize(
     let options = OptimizationOptions {
         backend: match backend {
             OptimizeBackend::Interpreter => OptimizationBackendKind::Interpreter,
+            OptimizeBackend::Evolutionary => OptimizationBackendKind::Evolutionary,
             OptimizeBackend::Dspy => OptimizationBackendKind::Dspy,
         },
         max_candidates,
@@ -696,7 +743,9 @@ fn write_optimization_report_dir(
     let report_path = report_dir.join("report.json");
     let best_candidate_path = report_dir.join("best.candidate.json");
     let best_assignments_path = report_dir.join("best.assignments.json");
+    let best_artifacts_path = report_dir.join("best.artifacts.json");
     let candidates_path = report_dir.join("candidates.jsonl");
+    let candidates_dir = report_dir.join("candidates");
 
     let report_json = serde_json::to_string_pretty(&artifacts.report)
         .map_err(|error| format!("failed to serialize report.json: {}", error))?;
@@ -723,6 +772,22 @@ fn write_optimization_report_dir(
         )
     })?;
 
+    if let Some(best_artifacts) = artifacts
+        .candidate_artifacts
+        .iter()
+        .find(|candidate| candidate.assignments == artifacts.report.best.assignments)
+    {
+        let best_artifacts_json = serde_json::to_string_pretty(best_artifacts)
+            .map_err(|error| format!("failed to serialize best.artifacts.json: {}", error))?;
+        fs::write(&best_artifacts_path, best_artifacts_json).map_err(|error| {
+            format!(
+                "failed to write {}: {}",
+                best_artifacts_path.display(),
+                error
+            )
+        })?;
+    }
+
     let mut candidates_jsonl = String::new();
     for (index, candidate) in artifacts.candidates.iter().enumerate() {
         let line = candidate_report_line(index, candidate)
@@ -733,7 +798,121 @@ fn write_optimization_report_dir(
     fs::write(&candidates_path, candidates_jsonl)
         .map_err(|error| format!("failed to write {}: {}", candidates_path.display(), error))?;
 
+    fs::create_dir_all(&candidates_dir).map_err(|error| {
+        format!(
+            "failed to create candidate report directory {}: {}",
+            candidates_dir.display(),
+            error
+        )
+    })?;
+    for (index, (candidate, detail)) in artifacts
+        .candidates
+        .iter()
+        .zip(artifacts.candidate_artifacts.iter())
+        .enumerate()
+    {
+        write_candidate_artifact_dir(&candidates_dir, index, candidate, detail)?;
+    }
+
     Ok(fs::canonicalize(report_dir).unwrap_or_else(|_| report_dir.to_path_buf()))
+}
+
+fn write_candidate_artifact_dir(
+    candidates_dir: &Path,
+    index: usize,
+    candidate: &CandidateOptimizationReport,
+    detail: &CandidateOptimizationArtifacts,
+) -> Result<(), String> {
+    let candidate_dir = candidates_dir.join(format!("{:03}", index));
+    fs::create_dir_all(&candidate_dir).map_err(|error| {
+        format!(
+            "failed to create candidate directory {}: {}",
+            candidate_dir.display(),
+            error
+        )
+    })?;
+
+    let summary_path = candidate_dir.join("summary.json");
+    let artifacts_path = candidate_dir.join("artifacts.json");
+    let summary_json = serde_json::to_string_pretty(candidate)
+        .map_err(|error| format!("failed to serialize {}: {}", summary_path.display(), error))?;
+    fs::write(&summary_path, summary_json)
+        .map_err(|error| format!("failed to write {}: {}", summary_path.display(), error))?;
+
+    let artifacts_json = serde_json::to_string_pretty(detail).map_err(|error| {
+        format!(
+            "failed to serialize {}: {}",
+            artifacts_path.display(),
+            error
+        )
+    })?;
+    fs::write(&artifacts_path, artifacts_json)
+        .map_err(|error| format!("failed to write {}: {}", artifacts_path.display(), error))?;
+
+    let rollouts_dir = candidate_dir.join("rollouts");
+    write_split_rollouts(&rollouts_dir, &detail.train)?;
+    if let Some(split) = &detail.val {
+        write_split_rollouts(&rollouts_dir, split)?;
+    }
+    if let Some(split) = &detail.test {
+        write_split_rollouts(&rollouts_dir, split)?;
+    }
+
+    Ok(())
+}
+
+fn write_split_rollouts(
+    rollouts_dir: &Path,
+    split: &SplitEvaluationArtifacts,
+) -> Result<(), String> {
+    for (index, rollout) in split.rollouts.iter().enumerate() {
+        write_rollout_file(rollouts_dir, index, rollout)?;
+    }
+    Ok(())
+}
+
+fn write_rollout_file(
+    rollouts_dir: &Path,
+    index: usize,
+    rollout: &RolloutArtifactReport,
+) -> Result<(), String> {
+    let split_dir = rollouts_dir.join(&rollout.split);
+    fs::create_dir_all(&split_dir).map_err(|error| {
+        format!(
+            "failed to create rollout directory {}: {}",
+            split_dir.display(),
+            error
+        )
+    })?;
+
+    let case_label = rollout
+        .case_id
+        .as_deref()
+        .map(sanitize_path_fragment)
+        .unwrap_or_else(|| format!("case-{:03}", index));
+    let file_name = format!("{}--repeat-{}.json", case_label, rollout.repeat);
+    let rollout_path = split_dir.join(file_name);
+    let rollout_json = serde_json::to_string_pretty(rollout)
+        .map_err(|error| format!("failed to serialize {}: {}", rollout_path.display(), error))?;
+    fs::write(&rollout_path, rollout_json)
+        .map_err(|error| format!("failed to write {}: {}", rollout_path.display(), error))?;
+    Ok(())
+}
+
+fn sanitize_path_fragment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "case".to_string()
+    } else {
+        out
+    }
 }
 
 fn candidate_report_line(
@@ -1236,7 +1415,9 @@ fn cmd_evaluate(
     case_id: Option<&str>,
     verify_enabled: bool,
     config: Option<&Path>,
+    live: bool,
 ) -> ExitCode {
+    maybe_enable_live_tracing(live);
     let ir = match parse_typecheck_lower(file, verify_enabled) {
         Ok(ir) => ir,
         Err(code) => return code,
@@ -1302,6 +1483,7 @@ fn cmd_internal_evaluate_candidate(
     verify_enabled: bool,
     config: Option<&Path>,
 ) -> ExitCode {
+    maybe_enable_live_tracing(false);
     let ir = match parse_typecheck_lower(file, verify_enabled) {
         Ok(ir) => ir,
         Err(code) => return code,

@@ -1,0 +1,75 @@
+type Grid = list<list<int>>
+type ExamplePair = { input: Grid, output: Grid }
+type ArcTaskInput = {
+    task_id: string,
+    train_examples: list<ExamplePair>,
+    test_inputs: list<Grid>,
+}
+type ArcTaskOutput = {
+    outputs: list<Grid>,
+}
+
+prompt solve_arc_task {
+    input: ArcTaskInput
+    output: ArcTaskOutput
+    template: file("prompts/arc_agi2_solver/naive.txt")
+}
+
+task solve_arc_task {
+    input: ArcTaskInput
+    output: ArcTaskOutput
+
+    artifacts {
+        draft: ArcTaskOutput
+    }
+
+    stage solve using prompt solve_arc_task {
+        in: input
+        out: draft
+    }
+
+    emit {
+        outputs: draft.outputs
+    }
+}
+
+harness arc_solver_minimax_m25 for task solve_arc_task {
+    defaults {
+        model: "minimax/minimax-m2.5"
+    }
+
+    bind solve {
+        variant: variant("arc_agi2_solver", "naive")
+        system_prompt: variant("arc_agi2_system", "baseline")
+        temperature: 0.0
+    }
+
+    tune {
+        solve.variant in variants("arc_agi2_solver")
+        solve.system_prompt in [
+            variant("arc_agi2_system", "baseline"),
+            variant("arc_agi2_system", "deliberate"),
+            variant("arc_agi2_system", "strict_json")
+        ]
+        solve.temperature in [0.0, 0.2]
+    }
+}
+
+objective arc_public_mini_single_model for task solve_arc_task {
+    dataset: file("datasets/arc_agi2_mini.jsonl")
+    harness: arc_solver_minimax_m25
+    repeats: 1
+    constraint output_count = len(output.outputs) == len(expected.outputs)
+    checker exact_outputs = output.outputs == expected.outputs
+    metric non_empty = len(output.outputs) > 0
+    score = exact_outputs
+    split {
+        train: 0.5
+        val: 0.25
+        test: 0.25
+    }
+    select {
+        primary: exact_outputs
+        tie_breakers: [non_empty]
+    }
+}

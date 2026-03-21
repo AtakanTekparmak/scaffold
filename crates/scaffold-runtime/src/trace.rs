@@ -8,8 +8,9 @@
 //!
 //! # Usage
 //!
-//! Enable tracing with `SCAFFOLD_TRACE=1` or `--trace` flag.
-//! Traces are emitted as JSONL to stderr or a file.
+//! Enable tracing with `SCAFFOLD_TRACE=1` for JSONL, or `SCAFFOLD_TRACE_PRETTY=1`
+//! / `--live` for human-readable progress logs.
+//! Traces are emitted to stderr or a file.
 //!
 //! ```ignore
 //! use scaffold_runtime::trace::{Tracer, TraceEvent};
@@ -19,6 +20,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,17 +48,33 @@ pub struct TracerConfig {
     pub include_bodies: bool,
     /// Minimum event level to record
     pub min_level: TraceLevel,
+    /// Output format
+    pub format: TraceFormat,
 }
 
 impl Default for TracerConfig {
     fn default() -> Self {
+        let trace_format = match std::env::var("SCAFFOLD_TRACE_FORMAT") {
+            Ok(value) if value.eq_ignore_ascii_case("pretty") => TraceFormat::Pretty,
+            _ if std::env::var("SCAFFOLD_TRACE_PRETTY").is_ok() => TraceFormat::Pretty,
+            _ => TraceFormat::Json,
+        };
         Self {
-            enabled: std::env::var("SCAFFOLD_TRACE").is_ok(),
+            enabled: std::env::var("SCAFFOLD_TRACE").is_ok()
+                || matches!(trace_format, TraceFormat::Pretty),
             output: TraceOutput::Stderr,
             include_bodies: true,
             min_level: TraceLevel::Info,
+            format: trace_format,
         }
     }
+}
+
+/// Trace output formatting
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceFormat {
+    Json,
+    Pretty,
 }
 
 /// Trace output destination
@@ -162,6 +180,43 @@ pub enum TraceEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         tags: Option<std::collections::HashMap<String, String>>,
     },
+    /// Objective evaluation or optimization progress
+    ObjectiveProgress {
+        objective_name: String,
+        phase: ObjectiveProgressPhase,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        split: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        case_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repeat: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        candidate_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        candidate_total: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assignments: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        success: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        score: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        train_primary: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        val_primary: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_primary: Option<f64>,
+    },
+}
+
+/// Objective progress phase
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveProgressPhase {
+    CandidateStarted,
+    CandidateCompleted,
+    RolloutStarted,
+    RolloutCompleted,
 }
 
 /// Task completion status
@@ -272,15 +327,17 @@ impl Tracer {
             }
         }
 
-        // Serialize to JSONL
-        let json = match serde_json::to_string(record) {
-            Ok(j) => j,
-            Err(_) => return,
+        let rendered = match self.config.format {
+            TraceFormat::Json => match serde_json::to_string(record) {
+                Ok(json) => json,
+                Err(_) => return,
+            },
+            TraceFormat::Pretty => self.format_pretty(record),
         };
 
         match &self.config.output {
             TraceOutput::Stderr => {
-                eprintln!("{}", json);
+                eprintln!("{}", rendered);
             }
             TraceOutput::File(path) => {
                 use std::io::Write;
@@ -289,12 +346,207 @@ impl Tracer {
                     .append(true)
                     .open(path)
                 {
-                    let _ = writeln!(file, "{}", json);
+                    let _ = writeln!(file, "{}", rendered);
                 }
             }
             TraceOutput::Memory => {
                 // Already stored above
             }
+        }
+    }
+
+    fn format_pretty(&self, record: &TraceRecord) -> String {
+        let level = match record.level {
+            TraceLevel::Debug => "debug",
+            TraceLevel::Info => "info",
+            TraceLevel::Warn => "warn",
+            TraceLevel::Error => "error",
+        };
+        let duration = record
+            .duration_ms
+            .map(|ms| format!(" in {}ms", ms))
+            .unwrap_or_default();
+
+        match &record.event {
+            TraceEvent::PromptExecution {
+                prompt_name,
+                input,
+                output,
+                error,
+            } => {
+                if let Some(error) = error {
+                    format!("[{level}] prompt {prompt_name} failed{duration}: {error}")
+                } else if output.is_some() {
+                    let mut line = format!("[{level}] prompt {prompt_name} completed{duration}");
+                    if self.config.include_bodies {
+                        if let Some(output) = output {
+                            write!(&mut line, " output={}", summarize_json(output, 160)).ok();
+                        }
+                    }
+                    line
+                } else {
+                    let mut line = format!("[{level}] prompt {prompt_name} started");
+                    if self.config.include_bodies {
+                        if let Some(input) = input {
+                            write!(&mut line, " input={}", summarize_json(input, 160)).ok();
+                        }
+                    }
+                    line
+                }
+            }
+            TraceEvent::LlmCall {
+                model,
+                prompt,
+                response,
+                error,
+                ..
+            } => {
+                if let Some(error) = error {
+                    format!("[{level}] llm {model} failed{duration}: {error}")
+                } else if response.is_some() {
+                    let mut line = format!("[{level}] llm {model} completed{duration}");
+                    if self.config.include_bodies {
+                        if let Some(response) = response {
+                            write!(&mut line, " response={}", summarize_text(response, 160)).ok();
+                        }
+                    }
+                    line
+                } else {
+                    let mut line = format!("[{level}] llm {model} started");
+                    if self.config.include_bodies {
+                        if let Some(prompt) = prompt {
+                            write!(&mut line, " prompt={}", summarize_text(prompt, 160)).ok();
+                        }
+                    }
+                    line
+                }
+            }
+            TraceEvent::ToolCall {
+                tool_name,
+                input,
+                output,
+                error,
+            } => {
+                if let Some(error) = error {
+                    format!("[{level}] tool {tool_name} failed{duration}: {error}")
+                } else if output.is_some() {
+                    let mut line = format!("[{level}] tool {tool_name} completed{duration}");
+                    if self.config.include_bodies {
+                        if let Some(output) = output {
+                            write!(&mut line, " output={}", summarize_json(output, 160)).ok();
+                        }
+                    }
+                    line
+                } else {
+                    let mut line = format!("[{level}] tool {tool_name} started");
+                    if self.config.include_bodies {
+                        if let Some(input) = input {
+                            write!(&mut line, " input={}", summarize_json(input, 160)).ok();
+                        }
+                    }
+                    line
+                }
+            }
+            TraceEvent::AgentTurn {
+                agent_name,
+                turn_number,
+                completed,
+                ..
+            } => {
+                if completed.is_some() || record.duration_ms.is_some() {
+                    format!("[{level}] agent {agent_name} turn {turn_number} completed{duration}")
+                } else {
+                    format!("[{level}] agent {agent_name} turn {turn_number} started")
+                }
+            }
+            TraceEvent::TaskComplete {
+                task_name,
+                status,
+                reward,
+                error,
+            } => {
+                let status = match status {
+                    TaskStatus::Completed => "completed",
+                    TaskStatus::Failed => "failed",
+                    TaskStatus::Timeout => "timed_out",
+                    TaskStatus::Skipped => "skipped",
+                };
+                let mut line = format!("[{level}] task {task_name} {status}");
+                if let Some(reward) = reward {
+                    write!(&mut line, " reward={reward:.3}").ok();
+                }
+                if let Some(error) = error {
+                    write!(&mut line, ": {error}").ok();
+                }
+                line
+            }
+            TraceEvent::Metric { name, value, .. } => {
+                format!("[{level}] metric {name}={}", summarize_metric(value))
+            }
+            TraceEvent::ObjectiveProgress {
+                objective_name,
+                phase,
+                split,
+                case_id,
+                repeat,
+                candidate_index,
+                candidate_total,
+                assignments,
+                success,
+                score,
+                train_primary,
+                val_primary,
+                test_primary,
+            } => match phase {
+                ObjectiveProgressPhase::CandidateStarted => {
+                    let label = candidate_label(*candidate_index, *candidate_total);
+                    let assignments = assignments
+                        .as_ref()
+                        .map(summarize_assignments)
+                        .unwrap_or_else(|| "{}".to_string());
+                    format!(
+                        "[{level}] optimize {objective_name} {label} started assignments={assignments}"
+                    )
+                }
+                ObjectiveProgressPhase::CandidateCompleted => {
+                    let label = candidate_label(*candidate_index, *candidate_total);
+                    let mut line = format!("[{level}] optimize {objective_name} {label} completed");
+                    if let Some(score) = score {
+                        write!(&mut line, " score={score:.3}").ok();
+                    }
+                    if let Some(train) = train_primary {
+                        write!(&mut line, " train={train:.3}").ok();
+                    }
+                    if let Some(val) = val_primary {
+                        write!(&mut line, " val={val:.3}").ok();
+                    }
+                    if let Some(test) = test_primary {
+                        write!(&mut line, " test={test:.3}").ok();
+                    }
+                    line
+                }
+                ObjectiveProgressPhase::RolloutStarted => format!(
+                    "[{level}] rollout {objective_name} split={} case={} repeat={}",
+                    split.as_deref().unwrap_or("unknown"),
+                    case_id.as_deref().unwrap_or("<none>"),
+                    repeat.unwrap_or(0)
+                ),
+                ObjectiveProgressPhase::RolloutCompleted => {
+                    let mut line = format!(
+                        "[{level}] rollout {objective_name} split={} case={} repeat={}",
+                        split.as_deref().unwrap_or("unknown"),
+                        case_id.as_deref().unwrap_or("<none>"),
+                        repeat.unwrap_or(0)
+                    );
+                    if let Some(success) = success {
+                        write!(&mut line, " success={success}").ok();
+                    }
+                    if let Some(score) = score {
+                        write!(&mut line, " primary={score:.3}").ok();
+                    }
+                    line
+                }
+            },
         }
     }
 
@@ -355,6 +607,52 @@ fn current_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn summarize_text(text: &str, max_len: usize) -> String {
+    let squashed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if squashed.len() <= max_len {
+        squashed
+    } else {
+        format!("{}...", &squashed[..max_len])
+    }
+}
+
+fn summarize_json(value: &serde_json::Value, max_len: usize) -> String {
+    summarize_text(&value.to_string(), max_len)
+}
+
+fn summarize_metric(value: &MetricValue) -> String {
+    match value {
+        MetricValue::Counter(v) => v.to_string(),
+        MetricValue::Gauge(v) => format!("{v:.3}"),
+        MetricValue::Histogram(values) => format!("hist[{}]", values.len()),
+    }
+}
+
+fn candidate_label(index: Option<usize>, total: Option<usize>) -> String {
+    match (index, total) {
+        (Some(index), Some(total)) => format!("candidate {index}/{total}"),
+        (Some(index), None) => format!("candidate {index}"),
+        _ => "candidate".to_string(),
+    }
+}
+
+fn summarize_assignments(value: &serde_json::Value) -> String {
+    if let serde_json::Value::Object(map) = value {
+        let mut parts = map
+            .iter()
+            .map(|(key, value)| format!("{key}={}", summarize_json(value, 48)))
+            .collect::<Vec<_>>();
+        parts.sort();
+        if parts.is_empty() {
+            "{}".to_string()
+        } else {
+            parts.join(", ")
+        }
+    } else {
+        summarize_json(value, 120)
+    }
+}
+
 /// Convenience macro for tracing LLM calls
 #[macro_export]
 macro_rules! trace_llm {
@@ -389,7 +687,7 @@ mod tests {
 
     #[test]
     fn test_tracer_disabled_by_default() {
-        let tracer = Tracer::new();
+        let _tracer = Tracer::new();
         // Without SCAFFOLD_TRACE env var, tracing should be disabled
         // (depends on env during test)
     }
@@ -401,6 +699,7 @@ mod tests {
             output: TraceOutput::Memory,
             include_bodies: true,
             min_level: TraceLevel::Debug,
+            format: TraceFormat::Json,
         });
 
         tracer.record(TraceEvent::ToolCall {

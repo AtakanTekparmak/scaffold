@@ -60,9 +60,10 @@ Execution Model
 - Harnesses are applied as typed runtime overlays on top of a task.
 - `scaffold optimize` evaluates objectives over datasets and searches the declared finite `harness.tune` space directly in the interpreter.
 - Harness search can include first-class structural domains such as `components()` for `stage.component`, alongside scalar domains, list domains, and `variants(...)`.
-- `scaffold optimize` now supports pluggable candidate-proposal backends. The default `interpreter` backend enumerates finite search spaces, while external backends like `dspy` can propose candidate assignments and let Scaffold evaluate them.
+- `scaffold optimize` now supports pluggable optimization backends. `interpreter` enumerates finite search spaces, `evolutionary` performs archive-backed novelty-aware search over typed harness assignments, and external backends like `dspy` can propose candidate assignments while Scaffold stays the evaluator of record.
 - The recommended DSPy invocation is `--backend dspy --backend-command "uv run --python 3.11 --with 'dspy>=3' python tools/dspy_optimize.py"`. That path enables DSPy GEPA, and the backend inherits runtime config and `.env` provider credentials.
-- Objective expressions can inspect rollout telemetry through fields such as `rollout.duration_ms`, `rollout.stage_count`, `rollout.tool_call_count`, `rollout.prompt_call_count`, `rollout.agent_turn_count`, `rollout.loop_iteration_count`, and `rollout.trace`.
+- Objective expressions can inspect rollout telemetry through fields such as `rollout.duration_ms`, `rollout.stage_count`, `rollout.tool_call_count`, `rollout.prompt_call_count`, `rollout.agent_turn_count`, `rollout.loop_iteration_count`, `rollout.stage_graph`, `rollout.stage_diagnostics`, and `rollout.trace`.
+- Use `--live` for `run`, `evaluate`, and `optimize` to stream human-readable progress logs to stderr. For raw JSONL traces, use `SCAFFOLD_TRACE=1`; for pretty traces via env, use `SCAFFOLD_TRACE_PRETTY=1`.
 
 CLI Cheatsheet
 --------------
@@ -70,8 +71,8 @@ CLI Cheatsheet
 - `scaffold parse FILE` — syntax only (for debugging).
 - `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
 - `scaffold run FILE --task TASK [--harness H] --input JSON` — execute a task directly from IR.
-- `scaffold evaluate FILE --objective OBJ [--assignments JSON] [--case-id ID]` — evaluate an objective with the harness defaults or explicit assignment overrides.
-- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|dspy] [--report-dir DIR] [--write-best FILE]` — optimize an objective, optionally persist candidate reports, and optionally freeze the best evolved harness into a runnable `.scaffold` file with resolved prompt/system text surfaces and structural stage choices.
+- `scaffold evaluate FILE --objective OBJ [--assignments JSON] [--case-id ID] [--live]` — evaluate an objective with the harness defaults or explicit assignment overrides.
+- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|evolutionary|dspy] [--report-dir DIR] [--write-best FILE] [--live]` — optimize an objective, optionally persist candidate summaries plus per-candidate rollout artifacts including stage graphs and stage diagnostics, optionally stream live progress logs, and optionally freeze the best evolved harness into a runnable `.scaffold` file with resolved prompt/system text surfaces and structural stage choices.
 
 Repository Layout
 -----------------

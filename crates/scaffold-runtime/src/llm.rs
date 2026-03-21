@@ -339,17 +339,26 @@ pub async fn query_structured_with_config(
     );
 
     let response = query_with_config(&structured_prompt, llm_config).await?;
-
-    // Try to extract JSON if wrapped in markdown code blocks
-    let json_str = extract_json(&response);
-
-    // Parse into serde_json::Value first
-    let json_value: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-        Error::Runtime(format!(
-            "Failed to parse LLM response as JSON: {}. Response was: {}",
-            e, response
-        ))
-    })?;
+    let json_value = match parse_json_with_repairs(&response) {
+        Ok(value) => value,
+        Err(initial_error) => {
+            let repair_prompt = format!(
+                "Repair the following malformed JSON so it becomes valid JSON matching this schema.\n\
+                 Preserve the exact intended content as much as possible.\n\
+                 Return ONLY valid JSON, with no markdown or explanation.\n\n\
+                 Schema:\n{}\n\n\
+                 Malformed JSON:\n{}",
+                schema, response
+            );
+            let repaired_response = query_with_config(&repair_prompt, llm_config).await?;
+            parse_json_with_repairs(&repaired_response).map_err(|repair_error| {
+                Error::Runtime(format!(
+                    "Failed to parse LLM response as JSON: {}. Failed to repair malformed JSON: {}. Response was: {}",
+                    initial_error, repair_error, response
+                ))
+            })?
+        }
+    };
 
     // Convert to our Value type
     Ok(json_to_value(json_value))
@@ -395,6 +404,195 @@ fn extract_json(response: &str) -> &str {
 
     // Return as-is if no code blocks found
     trimmed
+}
+
+fn parse_json_with_repairs(response: &str) -> std::result::Result<serde_json::Value, String> {
+    let mut attempts = Vec::new();
+    let primary = extract_balanced_json_candidate(response)
+        .unwrap_or_else(|| extract_json(response).trim().to_string());
+    push_json_attempt(&mut attempts, primary);
+
+    let mut index = 0;
+    let mut last_error = None;
+    while index < attempts.len() {
+        let candidate = attempts[index].clone();
+        match serde_json::from_str::<serde_json::Value>(&candidate) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                push_json_attempt(&mut attempts, strip_trailing_commas(&candidate));
+                if let Some(closed) = close_json_delimiters(&candidate) {
+                    push_json_attempt(&mut attempts, closed);
+                }
+                if let Some(closed) = close_json_delimiters(&strip_trailing_commas(&candidate)) {
+                    push_json_attempt(&mut attempts, closed);
+                }
+            }
+        }
+        index += 1;
+    }
+
+    Err(last_error.unwrap_or_else(|| "response was empty".to_string()))
+}
+
+fn push_json_attempt(attempts: &mut Vec<String>, candidate: String) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !attempts.iter().any(|existing| existing == trimmed) {
+        attempts.push(trimmed.to_string());
+    }
+}
+
+fn extract_balanced_json_candidate(response: &str) -> Option<String> {
+    let trimmed = response.trim();
+    let start = trimmed.find(|ch| ['{', '['].contains(&ch))?;
+    let slice = &trimmed[start..];
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (idx, ch) in slice.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    break;
+                }
+                if stack.is_empty() {
+                    return Some(slice[..=idx].trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(slice.trim().to_string())
+}
+
+fn close_json_delimiters(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut repaired = String::with_capacity(trimmed.len() + 8);
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in trimmed.chars() {
+        if in_string {
+            repaired.push(ch);
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                repaired.push(ch);
+            }
+            '{' => {
+                stack.push('}');
+                repaired.push(ch);
+            }
+            '[' => {
+                stack.push(']');
+                repaired.push(ch);
+            }
+            '}' | ']' => {
+                while let Some(expected) = stack.pop() {
+                    if expected == ch {
+                        repaired.push(ch);
+                        break;
+                    }
+                    repaired.push(expected);
+                }
+            }
+            _ => repaired.push(ch),
+        }
+    }
+
+    if in_string {
+        repaired.push('"');
+    }
+    while let Some(ch) = stack.pop() {
+        repaired.push(ch);
+    }
+    Some(repaired)
+}
+
+fn strip_trailing_commas(candidate: &str) -> String {
+    let mut out = String::with_capacity(candidate.len());
+    let chars = candidate.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else {
+                match ch {
+                    '\\' => escape = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+            }
+            index += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            ',' => {
+                let mut lookahead = index + 1;
+                while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                    lookahead += 1;
+                }
+                if lookahead < chars.len() && matches!(chars[lookahead], ']' | '}') {
+                    index += 1;
+                    continue;
+                }
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+        index += 1;
+    }
+
+    out
 }
 
 /// Convert serde_json::Value to our Value type
@@ -590,5 +788,35 @@ mod tests {
         assert!(error
             .to_string()
             .contains("LLM response did not contain any text content"));
+    }
+
+    #[test]
+    fn parse_json_with_repairs_closes_missing_delimiters() {
+        let parsed = parse_json_with_repairs(r#"{"outputs":[[[1,2],[3,4]]}"#).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "outputs": [[[1, 2], [3, 4]]]
+            })
+        );
+    }
+
+    #[test]
+    fn parse_json_with_repairs_strips_trailing_commas() {
+        let parsed = parse_json_with_repairs(r#"{"outputs":[[[1,2],[3,4]],],"score":1,}"#).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "outputs": [[[1, 2], [3, 4]]],
+                "score": 1
+            })
+        );
+    }
+
+    #[test]
+    fn parse_json_with_repairs_extracts_json_from_surrounding_text() {
+        let parsed =
+            parse_json_with_repairs(r#"Here is the answer: {"answer":"Paris"} Thanks!"#).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "answer": "Paris" }));
     }
 }

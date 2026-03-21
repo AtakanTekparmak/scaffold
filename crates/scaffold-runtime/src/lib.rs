@@ -48,10 +48,11 @@ pub use error::{Error, Result};
 pub use interpreter::{
     evaluate_objective_candidate, execute_task, optimize_objective,
     optimize_objective_with_artifacts, optimize_objective_with_options,
-    CandidateOptimizationReport, ObjectiveOptimizationArtifacts, ObjectiveOptimizationReport,
-    OptimizationBackendKind, OptimizationBackendRequest, OptimizationBackendResponse,
-    OptimizationDatasetCase, OptimizationOptions, OptimizationTunableDomain,
-    SplitEvaluationSummary,
+    CandidateOptimizationArtifacts, CandidateOptimizationReport, ObjectiveOptimizationArtifacts,
+    ObjectiveOptimizationReport, OptimizationBackendKind, OptimizationBackendRequest,
+    OptimizationBackendResponse, OptimizationDatasetCase, OptimizationOptions,
+    OptimizationTunableDomain, RolloutArtifactReport, SplitEvaluationArtifacts,
+    SplitEvaluationSummary, StageDependencyReport, StageDiagnosticReport,
 };
 pub use llm::{
     query as llm_query, query_structured, query_structured_with_config, query_with_config,
@@ -62,7 +63,10 @@ pub use rig::completion::request::ToolDefinition;
 pub use state::{ExecutionState, StateCheckpoint};
 pub use task::{Deadline, FailureStrategy, SubgoalResult, TaskContext};
 pub use tool::ToolError;
-pub use trace::{tracer, TraceEvent, TraceLevel, TraceOutput, TraceRecord, Tracer, TracerConfig};
+pub use trace::{
+    tracer, ObjectiveProgressPhase, TraceEvent, TraceFormat, TraceLevel, TraceOutput, TraceRecord,
+    Tracer, TracerConfig,
+};
 pub use value::{ResultValue, Value};
 
 // Re-export rig types for generated code
