@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 scaffold-syntax.workspace = true
 scaffold-types.workspace = true
+scaffold-ir.workspace = true
 petgraph.workspace = true
 ariadne.workspace = true

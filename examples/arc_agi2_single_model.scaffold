@@ -8,11 +8,27 @@ type ArcTaskInput = {
 type ArcTaskOutput = {
     outputs: list<Grid>,
 }
+type ArcRevisionInput = {
+    task: ArcTaskInput,
+    draft: ArcTaskOutput,
+}
 
 prompt solve_arc_task {
     input: ArcTaskInput
     output: ArcTaskOutput
     template: file("prompts/arc_agi2_solver/naive.txt")
+}
+
+prompt review_arc_task {
+    input: ArcRevisionInput
+    output: ArcTaskOutput
+    template: file("prompts/arc_agi2_review/checklist.txt")
+}
+
+prompt repair_arc_task {
+    input: ArcRevisionInput
+    output: ArcTaskOutput
+    template: file("prompts/arc_agi2_repair/json_guard.txt")
 }
 
 task solve_arc_task {
@@ -28,19 +44,43 @@ task solve_arc_task {
         out: draft
     }
 
+    stage review using prompt review_arc_task {
+        in: { task: input, draft: draft }
+        out: draft
+    }
+
+    stage repair using prompt repair_arc_task {
+        in: { task: input, draft: draft }
+        out: draft
+    }
+
     emit {
         outputs: draft.outputs
     }
 }
 
-harness arc_solver_minimax_m25 for task solve_arc_task {
+harness arc_solver_gpt5mini for task solve_arc_task {
     defaults {
-        model: "minimax/minimax-m2.5"
+        model: "gpt-5-mini"
     }
 
     bind solve {
         variant: variant("arc_agi2_solver", "naive")
         system_prompt: variant("arc_agi2_system", "baseline")
+        temperature: 0.0
+    }
+
+    bind review {
+        enabled: false
+        variant: variant("arc_agi2_review", "checklist")
+        system_prompt: variant("arc_agi2_system", "deliberate")
+        temperature: 0.0
+    }
+
+    bind repair {
+        enabled: false
+        variant: variant("arc_agi2_repair", "json_guard")
+        system_prompt: variant("arc_agi2_system", "strict_json")
         temperature: 0.0
     }
 
@@ -52,12 +92,28 @@ harness arc_solver_minimax_m25 for task solve_arc_task {
             variant("arc_agi2_system", "strict_json")
         ]
         solve.temperature in [0.0, 0.2]
+        review.enabled in [true, false]
+        review.variant in variants("arc_agi2_review")
+        review.system_prompt in [
+            variant("arc_agi2_system", "baseline"),
+            variant("arc_agi2_system", "deliberate"),
+            variant("arc_agi2_system", "strict_json")
+        ]
+        review.temperature in [0.0, 0.2]
+        repair.enabled in [true, false]
+        repair.variant in variants("arc_agi2_repair")
+        repair.system_prompt in [
+            variant("arc_agi2_system", "baseline"),
+            variant("arc_agi2_system", "deliberate"),
+            variant("arc_agi2_system", "strict_json")
+        ]
+        repair.temperature in [0.0, 0.2]
     }
 }
 
 objective arc_public_mini_single_model for task solve_arc_task {
     dataset: file("datasets/arc_agi2_mini.jsonl")
-    harness: arc_solver_minimax_m25
+    harness: arc_solver_gpt5mini
     repeats: 1
     constraint output_count = len(output.outputs) == len(expected.outputs)
     checker exact_outputs = output.outputs == expected.outputs

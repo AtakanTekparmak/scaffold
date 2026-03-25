@@ -1,43 +1,33 @@
-//! Scaffold Runtime Library
+//! Scaffold v2 Runtime Library
 //!
-//! This crate provides the runtime support for scaffold programs.
+//! This crate provides the runtime support for executing scaffold v2 programs.
 //!
-//! # Types
+//! # Architecture
 //!
-//! - [`Value`] - Dynamic value type for runtime data
-//! - [`ExecutionState`] - State management during task execution
-//! - [`TaskContext`] - Context passed to task execution
+//! - [`executor::GraphExecutor`] — walks IR graph statements, dispatches nodes
+//! - [`node_runner`] — runs individual nodes (prompt, tool, agent, verify)
+//! - [`scope::Scope`] — variable binding management with parent chain
+//! - [`value::Value`] — dynamic value type for runtime data
 //!
 //! # Configuration
 //!
 //! API keys and settings can be configured via:
 //! - Environment variables (OPENAI_API_KEY, ANTHROPIC_API_KEY)
 //! - Config file (~/.scaffold/config.toml)
-//!
-//! # Example
-//!
-//! ```ignore
-//! use scaffold_runtime::prelude::*;
-//!
-//! // Execute a shell command
-//! let output = scaffold_runtime::shell::execute("echo hello")?;
-//!
-//! // Query an LLM
-//! let response = scaffold_runtime::llm_query("What is 2+2?").await?;
-//! ```
 
 pub mod agent_convos;
 pub mod builtins;
 pub mod config;
 pub mod error;
-pub mod interpreter;
+pub mod executor;
 pub mod llm;
+pub mod mutations;
+pub mod node_runner;
+pub mod optimizer;
 pub mod parse;
 pub mod prompt;
+pub mod scope;
 pub mod shell;
-pub mod state;
-pub mod task;
-pub mod tool;
 pub mod trace;
 pub mod value;
 
@@ -45,42 +35,25 @@ pub mod value;
 pub use agent_convos::maybe_log_agent_conversation;
 pub use config::{config, Config};
 pub use error::{Error, Result};
-pub use interpreter::{
-    evaluate_objective_candidate, execute_task, optimize_objective,
-    optimize_objective_with_artifacts, optimize_objective_with_options,
-    CandidateOptimizationArtifacts, CandidateOptimizationReport, ObjectiveOptimizationArtifacts,
-    ObjectiveOptimizationReport, OptimizationBackendKind, OptimizationBackendRequest,
-    OptimizationBackendResponse, OptimizationDatasetCase, OptimizationOptions,
-    OptimizationTunableDomain, RolloutArtifactReport, SplitEvaluationArtifacts,
-    SplitEvaluationSummary, StageDependencyReport, StageDiagnosticReport,
-};
+pub use executor::GraphExecutor;
+pub use mutations::Mutation;
+pub use optimizer::{optimize, OptimizationBackend, OptimizationOptions, OptimizationReport};
 pub use llm::{
     query as llm_query, query_structured, query_structured_with_config, query_with_config,
     query_with_model, Agent, AgentBuilder, LlmBackend, LlmConfig,
 };
 pub use prompt::PromptManager;
-pub use rig::completion::request::ToolDefinition;
-pub use state::{ExecutionState, StateCheckpoint};
-pub use task::{Deadline, FailureStrategy, SubgoalResult, TaskContext};
-pub use tool::ToolError;
+pub use scope::Scope;
 pub use trace::{
     tracer, ObjectiveProgressPhase, TraceEvent, TraceFormat, TraceLevel, TraceOutput, TraceRecord,
     Tracer, TracerConfig,
 };
 pub use value::{ResultValue, Value};
 
-// Re-export rig types for generated code
-pub use rig;
-
 /// Prelude module for common imports
 pub mod prelude {
     pub use crate::error::{Error, Result};
-    pub use crate::state::ExecutionState;
-    pub use crate::task::{Deadline, FailureStrategy, SubgoalResult, TaskContext};
-    pub use crate::tool::ToolError;
+    pub use crate::executor::GraphExecutor;
+    pub use crate::scope::Scope;
     pub use crate::value::Value;
-    pub use rig::completion::request::ToolDefinition;
-
-    // Re-export rig tool trait for implementations
-    pub use rig::tool::Tool;
 }

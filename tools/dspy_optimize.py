@@ -32,6 +32,15 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def live_enabled() -> bool:
+    return os.getenv("SCAFFOLD_LIVE") == "1"
+
+
+def live_log(message: str) -> None:
+    if live_enabled():
+        print(f"[live] {message}", file=sys.stderr, flush=True)
+
+
 def load_request() -> dict[str, Any]:
     try:
         return json.load(sys.stdin)
@@ -314,9 +323,32 @@ def evaluate_candidate_with_scaffold(
     if os.getenv("SCAFFOLD_CONFIG_PATH"):
         command.extend(["--config", os.environ["SCAFFOLD_CONFIG_PATH"]])
 
+    cwd = os.getenv("SCAFFOLD_WORKSPACE_DIR") or None
+    if live_enabled():
+        live_log(
+            "scoring candidate"
+            + (f" for case {case_id}" if case_id else "")
+            + f" with assignments {json.dumps(candidate, sort_keys=True)}"
+        )
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            check=False,
+        )
+        stdout = completed.stdout or ""
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"Scaffold candidate evaluation failed with exit code {completed.returncode}: "
+                f"{stdout.strip() or '<empty>'}"
+            )
+        return json.loads(stdout)
+
     completed = subprocess.run(
         command,
-        cwd=os.getenv("SCAFFOLD_WORKSPACE_DIR") or None,
+        cwd=cwd,
         capture_output=True,
         text=True,
         check=False,
@@ -363,6 +395,7 @@ def propose_with_gepa(dspy: Any, request: dict[str, Any]) -> list[dict[str, Any]
     trainset = build_gepa_examples(dspy, request)
     if not trainset:
         return []
+    live_log(f"GEPA optimizing {request['objective_name']} over {len(trainset)} training focus items")
 
     def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
         del trace, pred_name, pred_trace
@@ -378,6 +411,11 @@ def propose_with_gepa(dspy: Any, request: dict[str, Any]) -> list[dict[str, Any]
 
         candidate = candidates[0]
         case_id = getattr(gold, "case_id", None)
+        live_log(
+            "GEPA evaluating proposal"
+            + (f" on {case_id}" if case_id else "")
+            + f": {json.dumps(candidate, sort_keys=True)}"
+        )
         try:
             report = evaluate_candidate_with_scaffold(request, candidate, case_id)
         except Exception as exc:

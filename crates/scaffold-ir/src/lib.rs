@@ -1,20 +1,14 @@
-//! Intermediate Representation (IR) for the Scaffold DSL
+//! Scaffold v2 Intermediate Representation
 //!
-//! This crate provides:
 //! - IR structure definitions
 //! - AST-to-IR lowering
 //! - JSON serialization/deserialization
-//! - JSON Schema generation
+//! - Pretty printing (IR → scaffold source)
 
 pub mod ir;
 pub mod pretty;
-pub mod schema;
 pub mod serialize;
 
 pub use ir::*;
 pub use pretty::pretty_print;
-pub use schema::{
-    type_to_json_schema, type_to_json_schema_compact, type_to_json_schema_string,
-    types_to_json_schema_document,
-};
-pub use serialize::{from_json, to_json, to_json_compact, LowerError, Lowerer};
+pub use serialize::{from_json, lower, to_json, to_json_compact, LowerError, Lowerer};

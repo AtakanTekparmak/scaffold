@@ -180,7 +180,7 @@ scaffold evaluate example.scaffold --objective answer_quality --assignments '{"w
 scaffold optimize example.scaffold --objective answer_quality
 
 # Optimize and persist the winning harness patch plus candidate summaries and rollout artifacts
-# (including stage graphs and stage diagnostics)
+# (including stage graphs, stage diagnostics, and lineage visualizer files)
 scaffold optimize example.scaffold --objective answer_quality --report-dir runs/answer_quality
 
 # Optimize and freeze the best evolved harness into a runnable scaffold file
@@ -190,7 +190,11 @@ scaffold optimize example.scaffold --objective answer_quality --write-best outpu
 scaffold optimize example.scaffold --objective answer_quality --backend dspy --backend-command "uv run --python 3.11 --with 'dspy>=3' python tools/dspy_optimize.py"
 
 # Or use Scaffold's built-in evolutionary backend for archive-backed typed search
+# with lineage-tracked MAP-Elites-style mutation chains and a narrow editable optimizer policy
 scaffold optimize example.scaffold --objective answer_quality --backend evolutionary --max-candidates 16
+
+# Stop early once the weighted split-aware primary reaches a target threshold
+scaffold optimize example.scaffold --objective answer_quality --backend evolutionary --max-candidates 16 --early-stop-primary-threshold 0.9
 
 # Rebuild the cheap ARC-AGI-2 mini slice
 python3 tools/snapshot_arc_agi2.py --preset mini

@@ -6,6 +6,5 @@ edition.workspace = true
 [dependencies]
 scaffold-syntax.workspace = true
 scaffold-types.workspace = true
-scaffold-verify.workspace = true
 serde.workspace = true
 serde_json.workspace = true

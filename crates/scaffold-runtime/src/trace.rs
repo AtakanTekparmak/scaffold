@@ -125,6 +125,18 @@ pub enum TraceEvent {
     LlmCall {
         model: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        graph_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        split: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        case_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repeat: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         response: Option<String>,
@@ -134,6 +146,25 @@ pub enum TraceEvent {
         output_tokens: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// LLM call heartbeat while waiting for a response
+    LlmHeartbeat {
+        model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graph_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        split: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        case_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repeat: Option<u64>,
+        elapsed_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
     },
     /// Tool execution
     ToolCall {
@@ -156,7 +187,17 @@ pub enum TraceEvent {
     },
     /// Prompt execution
     PromptExecution {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        graph_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step_name: Option<String>,
         prompt_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        split: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        case_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repeat: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,7 +207,7 @@ pub enum TraceEvent {
     },
     /// Task/subgoal completion
     TaskComplete {
-        task_name: String,
+        graph_name: String,
         status: TaskStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         reward: Option<f64>,
@@ -215,6 +256,7 @@ pub enum TraceEvent {
 pub enum ObjectiveProgressPhase {
     CandidateStarted,
     CandidateCompleted,
+    EarlyStopped,
     RolloutStarted,
     RolloutCompleted,
 }
@@ -369,15 +411,40 @@ impl Tracer {
 
         match &record.event {
             TraceEvent::PromptExecution {
+                graph_name,
+                step_name,
                 prompt_name,
+                split,
+                case_id,
+                repeat,
                 input,
                 output,
                 error,
             } => {
                 if let Some(error) = error {
-                    format!("[{level}] prompt {prompt_name} failed{duration}: {error}")
+                    format!(
+                        "[{level}] prompt {prompt_name} failed{duration}{}: {error}",
+                        summarize_execution_context(
+                            graph_name.as_deref(),
+                            step_name.as_deref(),
+                            Some(prompt_name),
+                            split.as_deref(),
+                            case_id.as_deref(),
+                            *repeat,
+                        )
+                    )
                 } else if output.is_some() {
-                    let mut line = format!("[{level}] prompt {prompt_name} completed{duration}");
+                    let mut line = format!(
+                        "[{level}] prompt {prompt_name} completed{duration}{}",
+                        summarize_execution_context(
+                            graph_name.as_deref(),
+                            step_name.as_deref(),
+                            Some(prompt_name),
+                            split.as_deref(),
+                            case_id.as_deref(),
+                            *repeat,
+                        )
+                    );
                     if self.config.include_bodies {
                         if let Some(output) = output {
                             write!(&mut line, " output={}", summarize_json(output, 160)).ok();
@@ -385,7 +452,17 @@ impl Tracer {
                     }
                     line
                 } else {
-                    let mut line = format!("[{level}] prompt {prompt_name} started");
+                    let mut line = format!(
+                        "[{level}] prompt {prompt_name} started{}",
+                        summarize_execution_context(
+                            graph_name.as_deref(),
+                            step_name.as_deref(),
+                            Some(prompt_name),
+                            split.as_deref(),
+                            case_id.as_deref(),
+                            *repeat,
+                        )
+                    );
                     if self.config.include_bodies {
                         if let Some(input) = input {
                             write!(&mut line, " input={}", summarize_json(input, 160)).ok();
@@ -396,15 +473,41 @@ impl Tracer {
             }
             TraceEvent::LlmCall {
                 model,
+                graph_name,
+                step_name,
+                prompt_name,
+                split,
+                case_id,
+                repeat,
                 prompt,
                 response,
                 error,
                 ..
             } => {
                 if let Some(error) = error {
-                    format!("[{level}] llm {model} failed{duration}: {error}")
+                    format!(
+                        "[{level}] llm {model} failed{duration}{}: {error}",
+                        summarize_execution_context(
+                            graph_name.as_deref(),
+                            step_name.as_deref(),
+                            prompt_name.as_deref(),
+                            split.as_deref(),
+                            case_id.as_deref(),
+                            *repeat,
+                        )
+                    )
                 } else if response.is_some() {
-                    let mut line = format!("[{level}] llm {model} completed{duration}");
+                    let mut line = format!(
+                        "[{level}] llm {model} completed{duration}{}",
+                        summarize_execution_context(
+                            graph_name.as_deref(),
+                            step_name.as_deref(),
+                            prompt_name.as_deref(),
+                            split.as_deref(),
+                            case_id.as_deref(),
+                            *repeat,
+                        )
+                    );
                     if self.config.include_bodies {
                         if let Some(response) = response {
                             write!(&mut line, " response={}", summarize_text(response, 160)).ok();
@@ -412,7 +515,17 @@ impl Tracer {
                     }
                     line
                 } else {
-                    let mut line = format!("[{level}] llm {model} started");
+                    let mut line = format!(
+                        "[{level}] llm {model} started{}",
+                        summarize_execution_context(
+                            graph_name.as_deref(),
+                            step_name.as_deref(),
+                            prompt_name.as_deref(),
+                            split.as_deref(),
+                            case_id.as_deref(),
+                            *repeat,
+                        )
+                    );
                     if self.config.include_bodies {
                         if let Some(prompt) = prompt {
                             write!(&mut line, " prompt={}", summarize_text(prompt, 160)).ok();
@@ -420,6 +533,34 @@ impl Tracer {
                     }
                     line
                 }
+            }
+            TraceEvent::LlmHeartbeat {
+                model,
+                graph_name,
+                step_name,
+                prompt_name,
+                split,
+                case_id,
+                repeat,
+                elapsed_ms,
+                timeout_secs,
+            } => {
+                let mut line = format!(
+                    "[{level}] llm {model} still running after {}s{}",
+                    elapsed_ms / 1000,
+                    summarize_execution_context(
+                        graph_name.as_deref(),
+                        step_name.as_deref(),
+                        prompt_name.as_deref(),
+                        split.as_deref(),
+                        case_id.as_deref(),
+                        *repeat,
+                    )
+                );
+                if let Some(timeout_secs) = timeout_secs {
+                    write!(&mut line, " (timeout={}s)", timeout_secs).ok();
+                }
+                line
             }
             TraceEvent::ToolCall {
                 tool_name,
@@ -460,7 +601,7 @@ impl Tracer {
                 }
             }
             TraceEvent::TaskComplete {
-                task_name,
+                graph_name,
                 status,
                 reward,
                 error,
@@ -471,7 +612,7 @@ impl Tracer {
                     TaskStatus::Timeout => "timed_out",
                     TaskStatus::Skipped => "skipped",
                 };
-                let mut line = format!("[{level}] task {task_name} {status}");
+                let mut line = format!("[{level}] task {graph_name} {status}");
                 if let Some(reward) = reward {
                     write!(&mut line, " reward={reward:.3}").ok();
                 }
@@ -525,6 +666,24 @@ impl Tracer {
                     }
                     line
                 }
+                ObjectiveProgressPhase::EarlyStopped => {
+                    let label = candidate_label(*candidate_index, *candidate_total);
+                    let mut line =
+                        format!("[{level}] optimize {objective_name} {label} early-stopped");
+                    if let Some(score) = score {
+                        write!(&mut line, " score={score:.3}").ok();
+                    }
+                    if let Some(train) = train_primary {
+                        write!(&mut line, " train={train:.3}").ok();
+                    }
+                    if let Some(val) = val_primary {
+                        write!(&mut line, " val={val:.3}").ok();
+                    }
+                    if let Some(test) = test_primary {
+                        write!(&mut line, " test={test:.3}").ok();
+                    }
+                    line
+                }
                 ObjectiveProgressPhase::RolloutStarted => format!(
                     "[{level}] rollout {objective_name} split={} case={} repeat={}",
                     split.as_deref().unwrap_or("unknown"),
@@ -560,6 +719,46 @@ impl Tracer {
         if let Ok(mut records) = self.records.lock() {
             records.clear();
         }
+    }
+}
+
+fn summarize_execution_context(
+    graph_name: Option<&str>,
+    step_name: Option<&str>,
+    prompt_name: Option<&str>,
+    split: Option<&str>,
+    case_id: Option<&str>,
+    repeat: Option<u64>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(graph_name) = graph_name {
+        if !graph_name.is_empty() {
+            parts.push(format!("graph={graph_name}"));
+        }
+    }
+    if let Some(step_name) = step_name {
+        if !step_name.is_empty() {
+            parts.push(format!("step={step_name}"));
+        }
+    }
+    if let Some(prompt_name) = prompt_name {
+        if !prompt_name.is_empty() {
+            parts.push(format!("prompt={prompt_name}"));
+        }
+    }
+    if let Some(split) = split {
+        parts.push(format!("split={split}"));
+    }
+    if let Some(case_id) = case_id {
+        parts.push(format!("case={case_id}"));
+    }
+    if let Some(repeat) = repeat {
+        parts.push(format!("repeat={repeat}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" "))
     }
 }
 
@@ -659,6 +858,12 @@ macro_rules! trace_llm {
     ($model:expr, $prompt:expr) => {
         $crate::trace::tracer().record($crate::trace::TraceEvent::LlmCall {
             model: $model.to_string(),
+            graph_name: None,
+            step_name: None,
+            prompt_name: None,
+            split: None,
+            case_id: None,
+            repeat: None,
             prompt: Some($prompt.to_string()),
             response: None,
             input_tokens: None,
@@ -725,6 +930,12 @@ mod tests {
             parent_span_id: None,
             event: TraceEvent::LlmCall {
                 model: "gpt-4".to_string(),
+                graph_name: None,
+                step_name: None,
+                prompt_name: None,
+                split: None,
+                case_id: None,
+                repeat: None,
                 prompt: Some("Hello".to_string()),
                 response: Some("Hi there!".to_string()),
                 input_tokens: Some(10),

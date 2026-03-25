@@ -5,6 +5,10 @@ use std::process::{Command, Stdio};
 
 /// Execute a shell command and return its output
 ///
+/// Respects the `SCAFFOLD_SHELL_TIMEOUT_SECS` environment variable.
+/// When set to a positive integer, shell commands will be killed after
+/// that many seconds. When unset or zero, commands run without a timeout.
+///
 /// # Arguments
 /// * `command` - The shell command to execute
 ///
@@ -19,6 +23,15 @@ use std::process::{Command, Stdio};
 /// assert!(output.contains("hello"));
 /// ```
 pub fn execute(command: &str) -> Result<String> {
+    let timeout_secs = std::env::var("SCAFFOLD_SHELL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|v| *v > 0);
+
+    if let Some(secs) = timeout_secs {
+        return execute_with_timeout(command, secs * 1000);
+    }
+
     let output = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -59,28 +72,74 @@ pub fn execute_bytes(command: &str) -> Result<Vec<u8>> {
     }
 }
 
-/// Execute a shell command with a timeout
+/// Execute a shell command with a timeout (in milliseconds).
+///
+/// Spawns the command as a child process and waits up to `timeout_ms`.
+/// If the timeout expires, the child is killed before returning an error.
 pub fn execute_with_timeout(command: &str, timeout_ms: u64) -> Result<String> {
-    use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    let command = command.to_string();
-    let handle = thread::spawn(move || execute(&command));
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-    // Simple timeout implementation
-    let timeout = Duration::from_millis(timeout_ms);
-    let start = std::time::Instant::now();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     loop {
-        if handle.is_finished() {
-            return handle
-                .join()
-                .map_err(|_| Error::Runtime("thread panicked".to_string()))?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = Vec::new();
+                        std::io::Read::read_to_end(&mut s, &mut buf).ok();
+                        buf
+                    })
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = Vec::new();
+                        std::io::Read::read_to_end(&mut s, &mut buf).ok();
+                        buf
+                    })
+                    .unwrap_or_default();
+
+                if status.success() {
+                    return Ok(String::from_utf8_lossy(&stdout).to_string());
+                } else {
+                    let stderr_str = String::from_utf8_lossy(&stderr);
+                    return Err(Error::ActionFailed {
+                        action: "shell".to_string(),
+                        message: format!("command failed: {}", stderr_str),
+                    });
+                }
+            }
+            Ok(None) => {
+                // Still running — check deadline
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap zombie
+                    return Err(Error::Timeout(format!(
+                        "shell command timed out after {}s",
+                        timeout_ms / 1000
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Runtime(format!("failed to wait on child: {}", e)));
+            }
         }
-        if start.elapsed() > timeout {
-            return Err(Error::Timeout("shell command".to_string()));
-        }
-        thread::sleep(Duration::from_millis(10));
     }
 }
 

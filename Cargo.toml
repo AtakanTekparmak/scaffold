@@ -3,15 +3,14 @@ resolver = "2"
 members = [
     "crates/scaffold-syntax",
     "crates/scaffold-types",
-    "crates/scaffold-verify",
     "crates/scaffold-ir",
+    "crates/scaffold-verify",
     "crates/scaffold-runtime",
-    "crates/scaffold-codegen",
     "crates/scaffold-cli",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["andthattoo", "claude"]
 license = "MIT"
@@ -36,13 +35,9 @@ clap = { version = "4.4", features = ["derive"] }
 # Internal crates
 scaffold-syntax = { path = "crates/scaffold-syntax" }
 scaffold-types = { path = "crates/scaffold-types" }
-scaffold-verify = { path = "crates/scaffold-verify" }
 scaffold-ir = { path = "crates/scaffold-ir" }
+scaffold-verify = { path = "crates/scaffold-verify" }
 scaffold-runtime = { path = "crates/scaffold-runtime" }
-scaffold-codegen = { path = "crates/scaffold-codegen" }
 
-# Code generation
-proc-macro2 = "1.0"
-quote = "1.0"
-heck = "0.5"
+# Error handling
 thiserror = "1.0"

@@ -1,41 +1,37 @@
-//! Error types for the scaffold runtime
+//! Error types for the scaffold v2 runtime
 
 use thiserror::Error;
 
 /// Runtime error types
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Timeout expired during subgoal execution
-    #[error("timeout expired in subgoal '{0}'")]
+    /// Timeout expired during execution
+    #[error("timeout expired in '{0}'")]
     Timeout(String),
 
-    /// Unknown action requested
-    #[error("unknown action: {0}")]
-    UnknownAction(String),
+    /// Unknown node or graph
+    #[error("unknown node or graph: {0}")]
+    UnknownNode(String),
 
-    /// Action execution failed
-    #[error("action '{action}' failed: {message}")]
-    ActionFailed { action: String, message: String },
+    /// Node execution failed
+    #[error("node '{node}' failed: {message}")]
+    NodeFailed { node: String, message: String },
 
-    /// Precondition not satisfied
-    #[error("precondition failed for subgoal '{0}'")]
-    PreconditionFailed(String),
+    /// Step execution failed
+    #[error("step '{step}' failed: {message}")]
+    StepFailed { step: String, message: String },
 
-    /// Postcondition not satisfied
-    #[error("postcondition failed for subgoal '{0}'")]
-    PostconditionFailed(String),
-
-    /// Task execution aborted
-    #[error("task aborted: {0}")]
+    /// Graph execution aborted
+    #[error("graph aborted: {0}")]
     Aborted(String),
 
     /// Maximum retries exceeded
-    #[error("max retries ({count}) exceeded for subgoal '{subgoal}'")]
-    MaxRetriesExceeded { subgoal: String, count: u64 },
+    #[error("max retries ({count}) exceeded for step '{step}'")]
+    MaxRetriesExceeded { step: String, count: u64 },
 
-    /// State access error
-    #[error("state error: {0}")]
-    StateError(String),
+    /// Scope/variable access error
+    #[error("scope error: {0}")]
+    ScopeError(String),
 
     /// Type conversion error
     #[error("type error: expected {expected}, got {actual}")]
@@ -61,13 +57,29 @@ pub enum Error {
     #[error("parse error: {0}")]
     ParseError(String),
 
-    /// Loop break control flow (not a real error)
-    #[error("break")]
-    LoopBreak,
+    /// Template rendering error
+    #[error("template error: {0}")]
+    TemplateError(String),
 
-    /// Loop continue control flow (not a real error)
-    #[error("continue")]
-    LoopContinue,
+    /// Verify gate failed
+    #[error("verification failed: {0}")]
+    VerifyFailed(String),
+
+    /// Expression evaluation error
+    #[error("expression error: {0}")]
+    ExprError(String),
+
+    /// Shell command failed
+    #[error("shell command failed: {0}")]
+    ShellFailed(String),
+
+    /// Action failed (used by builtins and shell)
+    #[error("{action} failed: {message}")]
+    ActionFailed { action: String, message: String },
+
+    /// Emit missing (graph completed without emit)
+    #[error("graph completed without emit")]
+    NoEmit,
 }
 
 /// Result type alias using runtime Error
