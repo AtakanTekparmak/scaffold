@@ -1,116 +1,74 @@
-Scaffold Lang
-=============
+Scaffold
+========
 
---WIP--
+A typed DSL and runtime for building, evaluating, and optimizing LLM computation graphs.
 
-Design Reset
-------------
-- Active design direction: [docs/topology-synthesis-v2.md](/Users/kayaomers/Documents/firstbatch/scaffold/docs/topology-synthesis-v2.md)
-- The current task/harness implementation should be treated as a legacy prototype, not the target architecture.
-- The target architecture is graph-first, topology-synthesizing, and hierarchical.
-
-Purpose
--------
-- A typed DSL and runtime for LLM-authored automation that remains verifiable, analyzable, and safe to execute.
-- Guarantees that generation mistakes are caught at compile time via parsing, typing and verification — not at runtime.
-- Long-term goal: synthesize typed computation graphs, not just tune overlays on fixed task graphs.
-
-Why not “just Python”
----------------------
-- Python accepts any syntactically valid program, but it does not encode scaffold semantics. An LLM can produce Python that runs yet violates the intended pipeline/tool contracts.
-- Scaffold encodes those contracts in the language: typed I/O, restricted forms, analyzable control flow, and declared interfaces for tools/prompts/agents/pipelines.
-- Errors surface at compile time:
-  - Unknown tool/prompt/agent references
-  - Type mismatches across steps and fields
-  - Invalid field access or binding names
-  - Ill‑typed pre/postconditions and agent expressions
+Overview
+--------
+Scaffold provides a language for defining typed computation graphs that wire together LLM prompts, tools, and control flow. Programs are verified at compile time (parsing, type-checking, static analysis) and executed by a built-in interpreter. An evolutionary optimizer with an optional LLM-guided meta-agent searches over graph structure and prompt content to maximize objective scores on datasets.
 
 Core Concepts
 -------------
-- Types: Primitive, struct, list, map, option, result, and named aliases. Used everywhere for I/O and validation.
-- Artifacts: Typed task-flow slots that make intermediate state explicit and verifiable.
-- Tasks: The execution unit. A task wires stages, loops, branches, and emits a typed final output.
-- Harnesses: Typed overlays on tasks that bind or tune execution fields like model, temperature, and loop bounds.
-- Objectives: Evaluation contracts for future optimization/search over harness space.
-- Tools, prompts, and agents: Reusable typed components that tasks invoke as stages.
+- **Types**: Primitive, struct, list, map, option, and named aliases. Used everywhere for I/O validation.
+- **Nodes**: Typed components — `prompt`, `tool`, `agent`, `verify` — with declared input/output types.
+- **Graphs**: Computation graphs that wire nodes via steps, loops, conditionals, parallel fan-out, and emit.
+- **Objectives**: Evaluation contracts that bind a graph to a dataset with checkers, metrics, and a score expression.
+- **Topology**: Structural mutation rules (insert/remove steps, verify wrappers, component swaps) that the optimizer explores.
+- **Meta-agent**: An LLM-guided mutation proposer that analyzes the optimization archive and proposes targeted mutations instead of random search.
 
-What Scaffold Guarantee
------------------
-- Parse‑time safety: The grammar only admits the constructs we support. No implicit execution of arbitrary host code.
-- Type‑time safety: A checker validates every declaration and expression with a global type environment.
-- Verify‑time checks: Optional static analyses (bounds, reachability/deadlock) reject ill‑formed orchestrations.
-- Runtime safety: The interpreter continues to validate inputs, outputs, and stage wiring at execution time.
+What Scaffold Guarantees
+------------------------
+- **Parse-time safety**: The grammar only admits supported constructs.
+- **Type-time safety**: A checker validates every declaration and expression.
+- **Verify-time checks**: Optional static analyses (bounds, reachability) reject ill-formed orchestrations.
+- **Runtime safety**: The interpreter validates inputs, outputs, and step wiring at execution time.
 
-Workflow
---------
-- Author: Write a `.scaffold` file using typed components plus first-class tasks and harnesses.
-- Check: `scaffold check file.scaffold` — parse + type + verification errors are surfaced with spans.
-- Compile: `scaffold compile file.scaffold -o output.json` — lower the verified program to serializable IR.
-- Run: `scaffold run file.scaffold --task answer_question --input '{"..."}'` — execute a task directly from IR.
-- Harnessed run: `scaffold run file.scaffold --task answer_question --harness baseline --input '{"..."}'` — execute the same task with a typed harness overlay.
+CLI
+---
+```
+scaffold check FILE                     # parse + type check + verify
+scaffold compile FILE [-o ir.json]      # lower to IR JSON
+scaffold run FILE                       # execute the default graph
+scaffold evaluate FILE --objective OBJ  # evaluate on dataset
+scaffold optimize FILE --objective OBJ  # evolutionary optimization
+  --max-candidates N                    # evolutionary generations
+  --meta-model MODEL                    # enable LLM-guided meta-agent
+  --concurrency N                       # parallel case evaluation
+  --live                                # TUI visualization
+  --report-dir DIR                      # persist reports
+  --write-best FILE                     # freeze best candidate
+```
 
-Compile‑Time Constraints (Examples)
------------------------------------
-- Undefined references:
-  - Agents: tools listed must exist.
-  - Pipelines: steps must resolve to a known tool or prompt when called.
-- Type mismatches:
-  - Pipeline steps must pass arguments that match the callee’s input type.
-  - Field access must target declared fields of a struct‑typed value.
-  - Pre/postconditions must be boolean; reward/done expressions must type‑check.
+Optimization
+------------
+The optimizer runs in three phases:
 
-Execution Model
----------------
-- `scaffold run` is interpreter-first and task-centric.
-- The runtime executes verified `task` IR directly instead of generating a temporary crate for inner-loop runs.
-- Harnesses are applied as typed runtime overlays on top of a task.
-- `scaffold optimize` evaluates objectives over datasets and searches the declared finite `harness.tune` space directly in the interpreter.
-- Harness search can include first-class structural domains such as `components()` for `stage.component`, alongside scalar domains, list domains, and `variants(...)`.
-- `scaffold optimize` now supports pluggable optimization backends. `interpreter` enumerates finite search spaces, `evolutionary` performs archive-backed novelty-aware MAP-Elites-style search with lineage-tracked mutations over typed harness assignments and a narrow editable optimizer policy (parent selection, branching, exploration, pruning), and external backends like `dspy` can propose candidate assignments while Scaffold stays the evaluator of record.
-- The recommended DSPy invocation is `--backend dspy --backend-command "uv run --python 3.11 --with 'dspy>=3' python tools/dspy_optimize.py"`. That path enables DSPy GEPA, and the backend inherits runtime config and `.env` provider credentials.
-- Objective expressions can inspect rollout telemetry through fields such as `rollout.duration_ms`, `rollout.stage_count`, `rollout.tool_call_count`, `rollout.prompt_call_count`, `rollout.agent_turn_count`, `rollout.loop_iteration_count`, `rollout.stage_graph`, `rollout.stage_diagnostics`, and `rollout.trace`.
-- Use `--live` for `run`, `evaluate`, and `optimize` to stream human-readable progress logs to stderr. For raw JSONL traces, use `SCAFFOLD_TRACE=1`; for pretty traces via env, use `SCAFFOLD_TRACE_PRETTY=1`.
+1. **Seeding** — evaluate the original graph as baseline.
+2. **Tunable sweep** — enumerate all declared parameter combinations (skipped when meta-agent is active).
+3. **Evolutionary** — mutate parent candidates via topology changes and content rewrites.
 
-CLI Cheatsheet
---------------
-- `scaffold check FILE` — parse + type check + verify a scaffold file.
-- `scaffold parse FILE` — syntax only (for debugging).
-- `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
-- `scaffold run FILE --task TASK [--harness H] --input JSON` — execute a task directly from IR.
-- `scaffold evaluate FILE --objective OBJ [--assignments JSON] [--case-id ID] [--live]` — evaluate an objective with the harness defaults or explicit assignment overrides.
-- `scaffold optimize FILE --objective OBJ [--max-candidates N] [--backend interpreter|evolutionary|dspy] [--early-stop-primary-threshold X] [--report-dir DIR] [--write-best FILE] [--live]` — optimize an objective, optionally stop early once the weighted split-aware primary reaches a threshold, persist candidate summaries plus per-candidate rollout artifacts including lineage, optimizer-policy metadata, archive-cell metadata, stage graphs, and stage diagnostics, plus `lineage.json`, `lineage.mmd`, and a browsable `lineage.html` visualizer, optionally stream live progress logs, and optionally freeze the best evolved harness into a runnable `.scaffold` file with resolved prompt/system text surfaces and structural stage choices.
+**Meta-agent** (`--meta-model`): Instead of random mutations, an LLM analyzes the archive (scores, failures, templates) and proposes targeted mutations. Content rewrites use an instructions-only approach that mechanically preserves data bindings and format blocks from the original template.
+
+**Hierarchical optimization**: Objectives with `sub` blocks optimize sub-graphs first, freeze the best results into the IR, then optimize the parent graph.
 
 Repository Layout
 -----------------
-- `crates/scaffold-syntax` — lexer/parser for the DSL.
-- `crates/scaffold-types` — type checker and type environment.
-- `crates/scaffold-verify` — static analyses (bounds, reachability, deadlock).
-- `crates/scaffold-ir` — serializable IR for types, components, tasks, harnesses, and objectives.
-- `crates/scaffold-runtime` — interpreter/runtime utilities (LLM, prompt manager, task execution, error, value, tracing).
-- `crates/scaffold-codegen` — retained for future export/deployment work, not the primary execution path.
-- `crates/scaffold-cli` — command line interface providing `scaffold`.
+- `crates/scaffold-syntax` — lexer/parser for the DSL
+- `crates/scaffold-types` — type checker and type environment
+- `crates/scaffold-verify` — static analyses (bounds, reachability, deadlock)
+- `crates/scaffold-ir` — serializable IR and pretty-printer
+- `crates/scaffold-runtime` — interpreter, LLM integration, optimizer, meta-agent
+- `crates/scaffold-cli` — CLI binary with TUI visualization
+
+Examples
+--------
+- `examples/long_memory_oracle_mini.scaffold` — hierarchical memory retrieval benchmark
+- `examples/aider_polyglot.scaffold` — Aider polyglot coding benchmark (Python)
 
 For LLMs
 --------
-- Read the authoring guide: `docs/LLM_GUIDE.md` for exact syntax, patterns, and constraints to generate correct scaffolds.
-
-Design Principles
------------------
-- Constrain the representation so an LLM can reliably produce correct scaffolds and failures are detectable early.
-- Keep semantics explicit and analyzable: typed I/O everywhere, named interfaces, finite control constructs.
-- Prefer clear, small, composable primitives (tools/prompts) over unconstrained general‑purpose code.
-- Make execution semantics interpreter-first so the language meaning is not defined by generated code.
-- Treat the current task/harness surface as transitional. The target system should evolve typed topology directly.
-
-Status
-------
-- Parser, type checker, verifier, IR, runtime interpreter, and task-centric CLI are integrated.
-- Task/harness/objective syntax is present, task execution runs directly from IR, and optimization is available from the CLI with pluggable proposal backends.
-- The active redesign focus is topology synthesis. See [docs/topology-synthesis-v2.md](/Users/kayaomers/Documents/firstbatch/scaffold/docs/topology-synthesis-v2.md).
-- `examples/` now contains a task-first starter set including tool stages, prompt+harness usage, a bounded revision loop, a Banking77 experiment, and an ARC-AGI-2 benchmark track with both mini and larger whole-task exact slices.
-- Ongoing: broaden interpreter coverage for remaining legacy tool constructs such as `pipe`/`foreign`, add richer evaluator provenance and judge policies, and revisit codegen as an export path on top of the new semantics.
+Read the authoring guide: `docs/LLM_GUIDE.md` for syntax, patterns, and constraints to generate correct scaffolds.
 
 Contributing
 ------------
-- Please open issues/PRs with clear problem statements and repros.
-- Keep additions aligned with the core goal: verifiable, analyzable scaffolds authored by LLMs.
+Please open issues/PRs with clear problem statements and repros.

@@ -391,7 +391,7 @@ impl PrettyPrinter {
     }
 }
 
-fn format_type(ty: &TypeIR) -> String {
+pub fn format_type(ty: &TypeIR) -> String {
     match ty {
         TypeIR::Bool => "bool".to_string(),
         TypeIR::Int => "int".to_string(),
@@ -429,7 +429,7 @@ fn format_step_arg(arg: &StepArgIR) -> String {
     }
 }
 
-fn format_expr(expr: &ExprIR) -> String {
+pub fn format_expr(expr: &ExprIR) -> String {
     match expr {
         ExprIR::LitInt { value } => value.to_string(),
         ExprIR::LitFloat { value } => format!("{}", value),

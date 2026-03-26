@@ -95,6 +95,18 @@ pub async fn query_with_model(model: &str, prompt: &str) -> Result<String> {
     query_with_config(prompt, &config).await
 }
 
+/// Default LLM request timeout in seconds.
+const DEFAULT_LLM_TIMEOUT_SECS: u64 = 120;
+
+/// Resolve the LLM request timeout from env or default.
+fn llm_timeout() -> std::time::Duration {
+    let secs = std::env::var("SCAFFOLD_LLM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LLM_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Query an LLM with full configuration
 pub async fn query_with_config(prompt: &str, llm_config: &LlmConfig) -> Result<String> {
     // Check for mock mode (for testing)
@@ -102,6 +114,17 @@ pub async fn query_with_config(prompt: &str, llm_config: &LlmConfig) -> Result<S
         return Ok(format!("Mock LLM response for: {}", prompt));
     }
 
+    let timeout = llm_timeout();
+    match tokio::time::timeout(timeout, query_with_config_inner(prompt, llm_config)).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::Timeout(format!(
+            "LLM request timed out after {}s",
+            timeout.as_secs()
+        ))),
+    }
+}
+
+async fn query_with_config_inner(prompt: &str, llm_config: &LlmConfig) -> Result<String> {
     let model = llm_config
         .model
         .as_deref()

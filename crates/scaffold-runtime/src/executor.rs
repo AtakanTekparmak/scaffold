@@ -855,6 +855,22 @@ fn eval_builtin_call(name: &str, args: &[Value]) -> Result<Value> {
                 _ => Err(Error::ExprError("values() requires a map".into())),
             }
         }
+        "json_parse" => {
+            if args.len() != 1 {
+                return Err(Error::ExprError(
+                    "json_parse() takes exactly 1 argument".into(),
+                ));
+            }
+            match &args[0] {
+                Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(json) => Ok(Value::from(json)),
+                    Err(e) => Err(Error::ExprError(format!("json_parse: {}", e))),
+                },
+                _ => Err(Error::ExprError(
+                    "json_parse() requires a string argument".into(),
+                )),
+            }
+        }
         _ => Err(Error::ExprError(format!("unknown function: {}", name))),
     }
 }

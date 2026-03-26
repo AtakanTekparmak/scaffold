@@ -13,7 +13,7 @@ pub fn render_chart<'a>(state: &'a AppState) -> Chart<'a> {
     };
 
     let datasets = vec![Dataset::default()
-        .name("score")
+        .name("best")
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(Color::Cyan))
@@ -34,7 +34,7 @@ pub fn render_chart<'a>(state: &'a AppState) -> Chart<'a> {
     Chart::new(datasets)
         .block(
             Block::default()
-                .title(format!(" Score Progression  [phase: {}] ", state.current_phase))
+                .title(format!(" Best Score  [phase: {}] ", state.current_phase))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )

@@ -213,8 +213,12 @@ impl AppState {
                     is_best: false,
                 });
 
+                let best_so_far = self.score_history
+                    .last()
+                    .map(|&(_, prev_best)| prev_best.max(score))
+                    .unwrap_or(score);
                 self.score_history
-                    .push((candidate_id as f64, score));
+                    .push((candidate_id as f64, best_so_far));
 
                 self.update_best();
 

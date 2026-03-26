@@ -3,3 +3,17 @@ Cargo.lock
 target
 generated
 scaffold.toml
+
+# Local artifacts
+.DS_Store
+runs/
+outputs/
+assertion.log
+openai_usage.log
+
+# Python
+__pycache__/
+*.pyc
+
+# External repos (cloned for benchmarks)
+polyglot-benchmark/

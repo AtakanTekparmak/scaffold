@@ -157,6 +157,10 @@ pub struct Candidate {
     pub meta_reasoning: Option<String>,
     /// Per-case evaluation results (for meta-agent learning).
     pub case_results: Vec<CaseResult>,
+    /// Total dataset cases evaluated.
+    pub total_cases: usize,
+    /// Number of cases that passed the primary checker.
+    pub cases_passed: usize,
 }
 
 /// The optimization archive.
@@ -222,6 +226,13 @@ pub struct OptimizationReport {
     pub best_score: Option<f64>,
     pub best_candidate_id: Option<usize>,
     pub candidate_scores: Vec<CandidateScore>,
+    /// Best candidate's overrides (rewritten prompts, config changes).
+    /// Persisted so the winning changes are inspectable after the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_overrides: Option<HashMap<String, serde_json::Value>>,
+    /// Best candidate's per-metric scores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_metric_scores: Option<HashMap<String, f64>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -236,10 +247,11 @@ pub struct CandidateScore {
     pub meta_reasoning: Option<String>,
 }
 
-/// Result of optimizing a single objective (report + best graph).
+/// Result of optimizing a single objective (report + best graph + overrides).
 pub struct OptimizationResult {
     pub report: OptimizationReport,
     pub best_graph: Option<GraphIR>,
+    pub best_overrides: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Hierarchical optimization report.
@@ -377,6 +389,13 @@ pub async fn optimize_hierarchical(
             }
             // Collect step names that call this sub's graph for auto-preserve
             collect_steps_calling_graph(&working_ir, &objective.graph, &sub.graph, &mut frozen_step_names);
+        }
+
+        // Bake sub-objective's best overrides into the IR node configs.
+        // This ensures the parent phase starts with the sub's optimized
+        // prompts/configs as the new defaults, rather than losing them.
+        if let Some(overrides) = result.best_overrides {
+            bake_overrides_into_ir(&mut working_ir, &overrides);
         }
     }
 
@@ -556,9 +575,12 @@ async fn optimize_and_extract(
     }
 
     let best_graph = archive.best().map(|c| c.graph.clone());
+    let best_overrides = archive.best()
+        .map(|c| c.overrides.clone())
+        .filter(|o| !o.is_empty());
     let report = build_report(objective, &archive, options)?;
 
-    Ok(OptimizationResult { report, best_graph })
+    Ok(OptimizationResult { report, best_graph, best_overrides })
 }
 
 /// Collect step names in parent_graph that call the given sub_graph.
@@ -596,6 +618,58 @@ fn collect_steps_calling_graph_in_body(
                 collect_steps_calling_graph_in_body(&p.body, sub_graph_name, step_names);
             }
             _ => {}
+        }
+    }
+}
+
+/// Bake runtime overrides into the IR node configs so they become the new defaults.
+///
+/// Override keys follow the pattern `"node_name.field"` where field is one of:
+/// template, system, shell, temperature, model, max_tokens.
+fn bake_overrides_into_ir(ir: &mut ScaffoldIR, overrides: &HashMap<String, serde_json::Value>) {
+    use scaffold_ir::ir::StringOrFileIR;
+
+    for (key, value) in overrides {
+        let parts: Vec<&str> = key.splitn(2, '.').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (node_name, field) = (parts[0], parts[1]);
+
+        if let Some(node) = ir.nodes.iter_mut().find(|n| n.name == node_name) {
+            match field {
+                "template" => {
+                    if let Some(s) = value.as_str() {
+                        node.config.template = Some(StringOrFileIR::Literal {
+                            value: s.to_string(),
+                        });
+                    }
+                }
+                "system" => {
+                    if let Some(s) = value.as_str() {
+                        node.config.system = Some(StringOrFileIR::Literal {
+                            value: s.to_string(),
+                        });
+                    }
+                }
+                "shell" => {
+                    if let Some(s) = value.as_str() {
+                        node.config.shell = Some(s.to_string());
+                    }
+                }
+                "temperature" => {
+                    node.config.temperature = value.as_f64();
+                }
+                "model" => {
+                    if let Some(s) = value.as_str() {
+                        node.config.model = Some(s.to_string());
+                    }
+                }
+                "max_tokens" => {
+                    node.config.max_tokens = value.as_u64();
+                }
+                _ => {} // Unknown field, skip
+            }
         }
     }
 }
@@ -694,7 +768,7 @@ async fn evaluate_candidate(
     dataset: &[DatasetCase],
     options: &OptimizationOptions,
     display_id: usize,
-) -> Result<(f64, HashMap<String, f64>, Vec<CaseResult>)> {
+) -> Result<(f64, HashMap<String, f64>, Vec<CaseResult>, usize, usize)> {
     use futures::stream::{self, StreamExt};
 
     // Build a modified IR with the candidate's graph
@@ -710,7 +784,7 @@ async fn evaluate_candidate(
 
     let case_count = dataset.len();
     if case_count == 0 {
-        return Ok((0.0, HashMap::new(), vec![]));
+        return Ok((0.0, HashMap::new(), vec![], 0, 0));
     }
 
     let concurrency = options.concurrency.max(1);
@@ -734,6 +808,7 @@ async fn evaluate_candidate(
     let mut checker_totals: HashMap<String, f64> = HashMap::new();
     let mut case_results: Vec<CaseResult> = Vec::with_capacity(case_count);
     let mut completed = 0usize;
+    let mut cases_passed = 0usize;
 
     // Run cases concurrently with controlled parallelism.
     // buffer_unordered polls up to `concurrency` futures at once on the
@@ -772,13 +847,26 @@ async fn evaluate_candidate(
                 let p = if primary_checker.is_some() { primary_pass } else { all_pass };
                 (p, bits)
             }
-            Err(_) => {
+            Err(e) => {
+                // Log graph execution errors so template / rendering failures
+                // are visible instead of silently scoring 0.
+                emit(options, OptEvent::Log {
+                    message: format!(
+                        "Case {} execution error: {}",
+                        case.id.as_deref().unwrap_or("?"),
+                        e,
+                    ),
+                });
                 let bits: Vec<_> = objective.checkers.iter()
                     .map(|c| (c.name.clone(), false))
                     .collect();
                 (false, bits)
             }
         };
+
+        if passed {
+            cases_passed += 1;
+        }
 
         // Only store failed cases (capped) — these are what the meta-agent learns from.
         if !passed && case_results.len() < 30 {
@@ -817,7 +905,7 @@ async fn evaluate_candidate(
         _ => 0.0,
     };
 
-    Ok((score, metric_avgs, case_results))
+    Ok((score, metric_avgs, case_results, case_count, cases_passed))
 }
 
 /// Evaluate a checker expression with `output` and `expected` in scope.
@@ -883,10 +971,12 @@ async fn run_grid_search_into(
             children_count: 0,
             meta_reasoning: None,
             case_results: vec![],
+            total_cases: 0,
+            cases_passed: 0,
         };
 
         let cand_id = archive.candidates.len();
-        let (score, metrics, cases) = evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id).await?;
+        let (score, metrics, cases, total, passed) = evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id).await?;
         let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
 
         emit(options, OptEvent::CandidateEvaluated {
@@ -912,6 +1002,8 @@ async fn run_grid_search_into(
             score: Some(score),
             metric_scores: metrics,
             case_results: cases,
+            total_cases: total,
+            cases_passed: passed,
             ..candidate
         });
     }
@@ -1014,15 +1106,19 @@ async fn run_evolutionary_into(
         children_count: 0,
         meta_reasoning: None,
         case_results: vec![],
+        total_cases: 0,
+        cases_passed: 0,
     };
 
     let next_id = archive.candidates.len();
-    let (seed_score, seed_metrics, seed_cases) =
+    let (seed_score, seed_metrics, seed_cases, seed_total, seed_passed) =
         evaluate_candidate(ir, objective, &seed, dataset, options, next_id).await?;
     let seed_id = archive.add(Candidate {
         score: Some(seed_score),
         metric_scores: seed_metrics,
         case_results: seed_cases,
+        total_cases: seed_total,
+        cases_passed: seed_passed,
         ..seed
     });
 
@@ -1075,15 +1171,19 @@ async fn run_evolutionary_into(
             children_count: 0,
             meta_reasoning: None,
             case_results: vec![],
+            total_cases: 0,
+            cases_passed: 0,
         };
         let tunable_id = archive.candidates.len();
-        let (score, metrics, cases) = evaluate_candidate(ir, objective, &candidate, dataset, options, tunable_id).await?;
+        let (score, metrics, cases, total, passed) = evaluate_candidate(ir, objective, &candidate, dataset, options, tunable_id).await?;
         let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
 
         archive.add(Candidate {
             score: Some(score),
             metric_scores: metrics.clone(),
             case_results: cases,
+            total_cases: total,
+            cases_passed: passed,
             ..candidate
         });
 
@@ -1148,8 +1248,10 @@ async fn run_evolutionary_into(
     while successful_generations < max_generations && total_attempts < max_attempts {
         total_attempts += 1;
 
-        // Select parent (sigmoid+novelty weighting) — clone needed data to release borrow
-        let parent = select_parent(archive, &mut rng);
+        // Select parent — use novelty weighting only for random mutations;
+        // meta-agent provides its own diversity through LLM reasoning.
+        let use_novelty = options.meta_model.is_none();
+        let parent = select_parent(archive, &mut rng, use_novelty);
         if parent.is_none() {
             break;
         }
@@ -1185,6 +1287,34 @@ async fn run_evolutionary_into(
                             ),
                         },
                     );
+                    // Log the full content of rewrite mutations for debugging
+                    match &proposal.mutation {
+                        Mutation::RewritePrompt { node, new_template } => {
+                            emit(options, OptEvent::Log {
+                                message: format!(
+                                    "Rewrite template for '{}' ({} chars):\n{}",
+                                    node, new_template.len(), new_template
+                                ),
+                            });
+                        }
+                        Mutation::RewriteSystem { node, new_system } => {
+                            emit(options, OptEvent::Log {
+                                message: format!(
+                                    "Rewrite system for '{}' ({} chars):\n{}",
+                                    node, new_system.len(), new_system
+                                ),
+                            });
+                        }
+                        Mutation::RewriteShell { node, new_shell } => {
+                            emit(options, OptEvent::Log {
+                                message: format!(
+                                    "Rewrite shell for '{}' ({} chars):\n{}",
+                                    node, new_shell.len(), new_shell
+                                ),
+                            });
+                        }
+                        _ => {}
+                    }
                     (Some(proposal.mutation), Some(proposal.reasoning))
                 }
                 Err(e) => {
@@ -1261,10 +1391,12 @@ async fn run_evolutionary_into(
                     children_count: 0,
                     meta_reasoning,
                     case_results: vec![],
+                    total_cases: 0,
+                    cases_passed: 0,
                 };
 
                 let cand_id = archive.candidates.len();
-                let (score, metrics, cases) =
+                let (score, metrics, cases, total, passed) =
                     evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id).await?;
 
                 successful_generations += 1;
@@ -1299,6 +1431,8 @@ async fn run_evolutionary_into(
                     score: Some(score),
                     metric_scores: metrics,
                     case_results: cases,
+                    total_cases: total,
+                    cases_passed: passed,
                     ..candidate
                 });
 
@@ -1340,12 +1474,14 @@ async fn run_evolutionary_into(
     Ok(())
 }
 
-/// Select a parent using sigmoid+novelty weighted selection (Algorithm 2, DGM-H).
+/// Select a parent using sigmoid-weighted selection (Algorithm 2, DGM-H).
 ///
 /// High-scoring candidates are preferred via a sigmoid transform around the
-/// dynamic midpoint (average of top-3 scores). Candidates that have already
-/// been selected many times are down-weighted by a novelty bonus `1/(1+children)`.
-fn select_parent<'a>(archive: &'a Archive, rng: &mut SimpleRng) -> Option<&'a Candidate> {
+/// dynamic midpoint (average of top-3 scores). When `use_novelty` is true,
+/// candidates that have already been selected many times are down-weighted
+/// by a novelty bonus `1/(1+children)`. When the meta-agent is active,
+/// novelty is disabled since the LLM provides its own diversity.
+fn select_parent<'a>(archive: &'a Archive, rng: &mut SimpleRng, use_novelty: bool) -> Option<&'a Candidate> {
     let evaluated: Vec<&Candidate> = archive
         .candidates
         .iter()
@@ -1362,14 +1498,18 @@ fn select_parent<'a>(archive: &'a Archive, rng: &mut SimpleRng) -> Option<&'a Ca
     let m = 3.min(scores.len());
     let alpha_mid: f64 = scores[..m].iter().sum::<f64>() / m as f64;
 
-    // Sigmoid transform + novelty bonus
+    // Sigmoid transform, with optional novelty bonus
     let lambda = 10.0;
     let weights: Vec<f64> = evaluated
         .iter()
         .map(|c| {
             let si = 1.0 / (1.0 + (-lambda * (c.score.unwrap() - alpha_mid)).exp());
-            let hi = 1.0 / (1.0 + c.children_count as f64);
-            si * hi
+            if use_novelty {
+                let hi = 1.0 / (1.0 + c.children_count as f64);
+                si * hi
+            } else {
+                si
+            }
         })
         .collect();
 
@@ -1519,13 +1659,15 @@ fn build_report(
                 mutations: c
                     .mutations
                     .iter()
-                    .map(|m| format!("{:?}", m))
+                    .map(|m| m.short_label())
                     .collect(),
                 node_count: c.descriptor.node_count,
                 verify_count: c.descriptor.verify_count,
                 meta_reasoning: c.meta_reasoning.clone(),
             })
             .collect(),
+        best_overrides: best.map(|c| c.overrides.clone()).filter(|o| !o.is_empty()),
+        best_metric_scores: best.map(|c| c.metric_scores.clone()).filter(|m| !m.is_empty()),
     };
 
     // Write report to directory if configured
@@ -1538,6 +1680,28 @@ fn build_report(
         std::fs::write(dir.join("report.json"), report_json).map_err(|e| {
             Error::Runtime(format!("failed to write report: {}", e))
         })?;
+
+        // Write best candidate details (full mutations + overrides with rewritten prompts)
+        if let Some(best) = best {
+            let mutations_json: Vec<serde_json::Value> = best.mutations.iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect();
+            let best_detail = serde_json::json!({
+                "id": best.id,
+                "parent_id": best.parent_id,
+                "score": best.score,
+                "metric_scores": best.metric_scores,
+                "mutations": mutations_json,
+                "overrides": best.overrides,
+                "meta_reasoning": best.meta_reasoning,
+                "cases_passed": best.cases_passed,
+                "total_cases": best.total_cases,
+            });
+            let best_json = serde_json::to_string_pretty(&best_detail).unwrap_or_default();
+            std::fs::write(dir.join("best_candidate.json"), best_json).map_err(|e| {
+                Error::Runtime(format!("failed to write best candidate: {}", e))
+            })?;
+        }
     }
 
     // Write best candidate IR if configured
@@ -1550,6 +1714,13 @@ fn build_report(
             std::fs::write(path, json).map_err(|e| {
                 Error::Runtime(format!("failed to write best candidate: {}", e))
             })?;
+
+            // Write overrides alongside (same dir, .overrides.json suffix)
+            if !best.overrides.is_empty() {
+                let overrides_path = path.with_extension("overrides.json");
+                let overrides_json = serde_json::to_string_pretty(&best.overrides).unwrap_or_default();
+                let _ = std::fs::write(overrides_path, overrides_json);
+            }
         }
     }
 
@@ -1683,6 +1854,8 @@ mod tests {
             children_count: 0,
             meta_reasoning: None,
             case_results: vec![],
+            total_cases: 0,
+            cases_passed: 0,
         });
 
         archive.add(Candidate {
@@ -1702,6 +1875,8 @@ mod tests {
             children_count: 0,
             meta_reasoning: None,
             case_results: vec![],
+            total_cases: 0,
+            cases_passed: 0,
         });
 
         let best = archive.best().unwrap();
