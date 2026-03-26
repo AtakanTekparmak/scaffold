@@ -233,6 +233,25 @@ pub struct ObjectiveDecl {
     pub select: Option<SelectDecl>,
     pub tunables: Vec<TuneStmt>,
     pub topology: Option<TopologyDecl>,
+    pub subs: Vec<SubObjectiveDecl>,
+    pub span: Span,
+}
+
+/// A sub-objective declaration nested inside an objective.
+/// Flat — sub blocks cannot contain their own sub blocks.
+pub struct SubObjectiveDecl {
+    pub name: Ident,
+    pub graph: Ident,
+    pub dataset: DatasetSpec,
+    pub checkers: Vec<CheckerDecl>,
+    pub judges: Vec<JudgeDecl>,
+    pub metrics: Vec<MetricDecl>,
+    pub score: Spanned<Expr>,
+    pub repeats: Option<u64>,
+    pub split: Option<SplitDecl>,
+    pub select: Option<SelectDecl>,
+    pub tunables: Vec<TuneStmt>,
+    pub topology: Option<TopologyDecl>,
     pub span: Span,
 }
 
@@ -292,6 +311,7 @@ pub struct TopologyDecl {
     pub max_nodes: Option<u64>,
     pub max_depth: Option<u64>,
     pub preserve: Vec<String>,
+    pub target_score: Option<f64>,
     pub span: Span,
 }
 

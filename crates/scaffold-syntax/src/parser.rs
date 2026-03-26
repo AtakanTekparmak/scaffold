@@ -26,6 +26,22 @@ pub fn parse(source: &str) -> ParseResult<Program> {
     parser.parse_program()
 }
 
+/// Parsed objective fields (shared between objective and sub-objective).
+struct ObjectiveFields {
+    graph: Option<Ident>,
+    dataset: Option<DatasetSpec>,
+    checkers: Vec<CheckerDecl>,
+    judges: Vec<JudgeDecl>,
+    metrics: Vec<MetricDecl>,
+    score: Option<Spanned<Expr>>,
+    repeats: Option<u64>,
+    split: Option<SplitDecl>,
+    select: Option<SelectDecl>,
+    tunables: Vec<TuneStmt>,
+    topology: Option<TopologyDecl>,
+    subs: Vec<SubObjectiveDecl>,
+}
+
 pub struct Parser<'src> {
     lexer: Lexer<'src>,
     source: &'src str,
@@ -760,34 +776,35 @@ impl<'src> Parser<'src> {
 
     // ── Objective declarations ──
 
-    fn parse_objective_decl(&mut self) -> ParseResult<ObjectiveDecl> {
-        let start = self.expect(&Token::Objective)?;
-        let name = self.expect_ident()?;
-        self.expect(&Token::LBrace)?;
-
-        let mut graph = None;
-        let mut dataset = None;
-        let mut checkers = Vec::new();
-        let mut judges = Vec::new();
-        let mut metrics = Vec::new();
-        let mut score = None;
-        let mut repeats = None;
-        let mut split = None;
-        let mut select = None;
-        let mut tunables = Vec::new();
-        let mut topology = None;
+    /// Parse the body fields of an objective or sub-objective.
+    /// When `allow_subs` is false, `sub` blocks are rejected (for sub-objectives).
+    fn parse_objective_fields(&mut self, allow_subs: bool) -> ParseResult<ObjectiveFields> {
+        let mut fields = ObjectiveFields {
+            graph: None,
+            dataset: None,
+            checkers: Vec::new(),
+            judges: Vec::new(),
+            metrics: Vec::new(),
+            score: None,
+            repeats: None,
+            split: None,
+            select: None,
+            tunables: Vec::new(),
+            topology: None,
+            subs: Vec::new(),
+        };
 
         while !self.at(&Token::RBrace) {
             match self.peek() {
                 Some(Token::Graph) => {
                     self.advance();
                     self.expect(&Token::Colon)?;
-                    graph = Some(self.expect_ident()?);
+                    fields.graph = Some(self.expect_ident()?);
                 }
                 Some(Token::Dataset) => {
                     self.advance();
                     self.expect(&Token::Colon)?;
-                    dataset = Some(self.parse_dataset_spec()?);
+                    fields.dataset = Some(self.parse_dataset_spec()?);
                 }
                 Some(Token::Checker) => {
                     self.advance();
@@ -795,7 +812,7 @@ impl<'src> Parser<'src> {
                     self.expect(&Token::LBrace)?;
                     let expr = self.parse_expr()?;
                     let cend = self.expect(&Token::RBrace)?;
-                    checkers.push(CheckerDecl {
+                    fields.checkers.push(CheckerDecl {
                         span: cname.span.start..cend.end,
                         name: cname,
                         expr,
@@ -838,7 +855,7 @@ impl<'src> Parser<'src> {
                         }
                     }
                     let jend = self.expect(&Token::RBrace)?;
-                    judges.push(JudgeDecl {
+                    fields.judges.push(JudgeDecl {
                         span: jname.span.start..jend.end,
                         name: jname,
                         model: jmodel,
@@ -854,7 +871,7 @@ impl<'src> Parser<'src> {
                     self.expect(&Token::Colon)?;
                     let checker = self.expect_ident()?;
                     let mend = self.expect(&Token::RBrace)?;
-                    metrics.push(MetricDecl {
+                    fields.metrics.push(MetricDecl {
                         span: mname.span.start..mend.end,
                         name: mname,
                         checker,
@@ -863,13 +880,13 @@ impl<'src> Parser<'src> {
                 Some(Token::Score) => {
                     self.advance();
                     self.expect(&Token::Colon)?;
-                    score = Some(self.parse_expr()?);
+                    fields.score = Some(self.parse_expr()?);
                 }
                 Some(Token::Repeats) => {
                     self.advance();
                     self.expect(&Token::Colon)?;
                     let (v, _) = self.expect_int()?;
-                    repeats = Some(v as u64);
+                    fields.repeats = Some(v as u64);
                 }
                 Some(Token::Split) => {
                     self.advance();
@@ -894,7 +911,7 @@ impl<'src> Parser<'src> {
                     self.eat(&Token::Comma);
 
                     let send = self.expect(&Token::RBrace)?;
-                    split = Some(SplitDecl {
+                    fields.split = Some(SplitDecl {
                         train,
                         val,
                         test,
@@ -926,7 +943,7 @@ impl<'src> Parser<'src> {
                     }
 
                     let send = self.expect(&Token::RBrace)?;
-                    select = Some(SelectDecl {
+                    fields.select = Some(SelectDecl {
                         primary,
                         tie_breakers,
                         span: sstart.start..send.end,
@@ -955,7 +972,7 @@ impl<'src> Parser<'src> {
                         }
                         let tend = self.expect(&Token::RBracket)?;
 
-                        tunables.push(TuneStmt {
+                        fields.tunables.push(TuneStmt {
                             path,
                             domain,
                             span: tstart.start..tend.end,
@@ -972,6 +989,7 @@ impl<'src> Parser<'src> {
                     let mut max_nodes = None;
                     let mut max_depth = None;
                     let mut preserve = Vec::new();
+                    let mut target_score = None;
 
                     while !self.at(&Token::RBrace) {
                         match self.peek() {
@@ -1013,10 +1031,16 @@ impl<'src> Parser<'src> {
                                 }
                                 self.expect(&Token::RBracket)?;
                             }
+                            Some(Token::TargetScore) => {
+                                self.advance();
+                                self.expect(&Token::Colon)?;
+                                let (v, _) = self.expect_float_or_int()?;
+                                target_score = Some(v);
+                            }
                             _ => {
                                 let span = self.peek_span();
                                 return Err(ParseError {
-                                    message: "expected topology field (mutations, max_nodes, max_depth, preserve)".into(),
+                                    message: "expected topology field (mutations, max_nodes, max_depth, preserve, target_score)".into(),
                                     span,
                                 });
                             }
@@ -1024,12 +1048,23 @@ impl<'src> Parser<'src> {
                     }
 
                     let tend = self.expect(&Token::RBrace)?;
-                    topology = Some(TopologyDecl {
+                    fields.topology = Some(TopologyDecl {
                         mutations,
                         max_nodes,
                         max_depth,
                         preserve,
+                        target_score,
                         span: tstart.start..tend.end,
+                    });
+                }
+                Some(Token::Sub) if allow_subs => {
+                    fields.subs.push(self.parse_sub_objective_decl()?);
+                }
+                Some(Token::Sub) => {
+                    let span = self.peek_span();
+                    return Err(ParseError {
+                        message: "nested sub blocks are not allowed".into(),
+                        span,
                     });
                 }
                 _ => {
@@ -1042,17 +1077,26 @@ impl<'src> Parser<'src> {
             }
         }
 
+        Ok(fields)
+    }
+
+    fn parse_objective_decl(&mut self) -> ParseResult<ObjectiveDecl> {
+        let start = self.expect(&Token::Objective)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LBrace)?;
+
+        let fields = self.parse_objective_fields(true)?;
         let end = self.expect(&Token::RBrace)?;
 
-        let graph = graph.ok_or_else(|| ParseError {
+        let graph = fields.graph.ok_or_else(|| ParseError {
             message: format!("objective '{}' missing 'graph' field", name.name),
             span: name.span.clone(),
         })?;
-        let dataset = dataset.ok_or_else(|| ParseError {
+        let dataset = fields.dataset.ok_or_else(|| ParseError {
             message: format!("objective '{}' missing 'dataset' field", name.name),
             span: name.span.clone(),
         })?;
-        let score = score.ok_or_else(|| ParseError {
+        let score = fields.score.ok_or_else(|| ParseError {
             message: format!("objective '{}' missing 'score' field", name.name),
             span: name.span.clone(),
         })?;
@@ -1062,15 +1106,54 @@ impl<'src> Parser<'src> {
             name,
             graph,
             dataset,
-            checkers,
-            judges,
-            metrics,
+            checkers: fields.checkers,
+            judges: fields.judges,
+            metrics: fields.metrics,
             score,
-            repeats,
-            split,
-            select,
-            tunables,
-            topology,
+            repeats: fields.repeats,
+            split: fields.split,
+            select: fields.select,
+            tunables: fields.tunables,
+            topology: fields.topology,
+            subs: fields.subs,
+        })
+    }
+
+    fn parse_sub_objective_decl(&mut self) -> ParseResult<SubObjectiveDecl> {
+        let start = self.expect(&Token::Sub)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LBrace)?;
+
+        let fields = self.parse_objective_fields(false)?;
+        let end = self.expect(&Token::RBrace)?;
+
+        let graph = fields.graph.ok_or_else(|| ParseError {
+            message: format!("sub '{}' missing 'graph' field", name.name),
+            span: name.span.clone(),
+        })?;
+        let dataset = fields.dataset.ok_or_else(|| ParseError {
+            message: format!("sub '{}' missing 'dataset' field", name.name),
+            span: name.span.clone(),
+        })?;
+        let score = fields.score.ok_or_else(|| ParseError {
+            message: format!("sub '{}' missing 'score' field", name.name),
+            span: name.span.clone(),
+        })?;
+
+        Ok(SubObjectiveDecl {
+            span: start.start..end.end,
+            name,
+            graph,
+            dataset,
+            checkers: fields.checkers,
+            judges: fields.judges,
+            metrics: fields.metrics,
+            score,
+            repeats: fields.repeats,
+            split: fields.split,
+            select: fields.select,
+            tunables: fields.tunables,
+            topology: fields.topology,
         })
     }
 
@@ -1441,6 +1524,8 @@ fn is_keyword_ident(tok: &Token) -> bool {
             | Token::Topology
             | Token::Mutations
             | Token::Preserve
+            | Token::TargetScore
+            | Token::Sub
             | Token::Dataset
             | Token::Cases
             | Token::Tune
@@ -1679,5 +1764,113 @@ mod tests {
         "#;
         let program = parse(src).unwrap();
         assert_eq!(program.declarations.len(), 5);
+    }
+
+    #[test]
+    fn parse_objective_with_single_sub() {
+        let src = r#"
+            objective eval {
+                graph: outer
+                dataset: file("data/full.jsonl")
+                checker exact { output == expected }
+                metric accuracy { checker: exact }
+                score: accuracy
+
+                sub inner_opt {
+                    graph: inner
+                    dataset: file("data/inner.jsonl")
+                    checker sub_exact { output == expected }
+                    metric sub_acc { checker: sub_exact }
+                    score: sub_acc
+                }
+            }
+        "#;
+        let program = parse(src).unwrap();
+        assert_eq!(program.declarations.len(), 1);
+        if let Declaration::Objective(ref obj) = program.declarations[0] {
+            assert_eq!(obj.subs.len(), 1);
+            assert_eq!(obj.subs[0].name.name, "inner_opt");
+            assert_eq!(obj.subs[0].graph.name, "inner");
+        } else {
+            panic!("expected objective");
+        }
+    }
+
+    #[test]
+    fn parse_objective_with_multiple_subs() {
+        let src = r#"
+            objective eval {
+                graph: outer
+                dataset: cases [{ input: "x", expected: "y" }]
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
+
+                sub sub_a {
+                    graph: graph_a
+                    dataset: file("a.jsonl")
+                    checker c { output == expected }
+                    metric m { checker: c }
+                    score: m
+                }
+
+                sub sub_b {
+                    graph: graph_b
+                    dataset: file("b.jsonl")
+                    checker c { output == expected }
+                    metric m { checker: c }
+                    score: m
+                    tune {
+                        solver.model in ["gpt-4o", "gpt-4o-mini"]
+                    }
+                    topology {
+                        mutations: [insert_verify, wrap_retry]
+                        max_nodes: 8
+                    }
+                }
+            }
+        "#;
+        let program = parse(src).unwrap();
+        if let Declaration::Objective(ref obj) = program.declarations[0] {
+            assert_eq!(obj.subs.len(), 2);
+            assert_eq!(obj.subs[0].name.name, "sub_a");
+            assert_eq!(obj.subs[1].name.name, "sub_b");
+            assert_eq!(obj.subs[1].tunables.len(), 1);
+            assert!(obj.subs[1].topology.is_some());
+        } else {
+            panic!("expected objective");
+        }
+    }
+
+    #[test]
+    fn parse_nested_sub_rejected() {
+        let src = r#"
+            objective eval {
+                graph: outer
+                dataset: file("data.jsonl")
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
+
+                sub inner {
+                    graph: inner
+                    dataset: file("inner.jsonl")
+                    checker c { output == expected }
+                    metric m { checker: c }
+                    score: m
+
+                    sub nested {
+                        graph: deep
+                        dataset: file("deep.jsonl")
+                        checker c { output == expected }
+                        metric m { checker: c }
+                        score: m
+                    }
+                }
+            }
+        "#;
+        let result = parse(src);
+        let err = result.err().expect("should fail to parse nested sub");
+        assert!(err.message.contains("nested sub"), "error was: {}", err.message);
     }
 }

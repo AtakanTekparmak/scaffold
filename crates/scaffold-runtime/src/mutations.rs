@@ -52,6 +52,53 @@ pub enum Mutation {
         field: String,
         value: serde_json::Value,
     },
+
+    /// Rewrite a node's prompt template.
+    RewritePrompt {
+        node: String,
+        new_template: String,
+    },
+
+    /// Rewrite a node's system prompt.
+    RewriteSystem {
+        node: String,
+        new_system: String,
+    },
+
+    /// Rewrite a tool node's shell command.
+    RewriteShell {
+        node: String,
+        new_shell: String,
+    },
+}
+
+impl Mutation {
+    /// Human-readable short label for TUI display.
+    pub fn short_label(&self) -> String {
+        match self {
+            Mutation::InsertVerify { after_step, verify_node, .. } => {
+                format!("+verify({})@{}", verify_node, after_step)
+            }
+            Mutation::WrapRetry { step, verify_node, max_retries } => {
+                format!("retry({}x{})@{}", verify_node, max_retries, step)
+            }
+            Mutation::InsertStep { new_step_name: _, node, .. } => {
+                format!("+step({})", node)
+            }
+            Mutation::RemoveStep { step } => format!("-step({})", step),
+            Mutation::ReplaceComponent { step, new_node } => {
+                format!("swap({}->{})", step, new_node)
+            }
+            Mutation::FanOutParallel { step, .. } => format!("fanout({})", step),
+            Mutation::ReplaceWithSubgraph { step, graph } => {
+                format!("subgraph({}->{})", step, graph)
+            }
+            Mutation::SetConfig { node, field, .. } => format!("cfg({}.{})", node, field),
+            Mutation::RewritePrompt { node, .. } => format!("rewrite_prompt({})", node),
+            Mutation::RewriteSystem { node, .. } => format!("rewrite_system({})", node),
+            Mutation::RewriteShell { node, .. } => format!("rewrite_shell({})", node),
+        }
+    }
 }
 
 /// Result of applying a mutation.
@@ -102,6 +149,31 @@ pub fn apply_mutation(graph: &GraphIR, mutation: &Mutation, ir: &ScaffoldIR) -> 
 
         Mutation::SetConfig { node, field, value } => {
             apply_set_config(graph, ir, node, field, value)
+        }
+
+        Mutation::RewritePrompt { node, .. } => {
+            // Prompt rewrites don't change graph structure — overrides are applied separately.
+            if !ir.nodes.iter().any(|n| n.name == *node) {
+                return MutationResult::Skipped(format!("node '{}' not found", node));
+            }
+            MutationResult::Ok(graph.clone())
+        }
+
+        Mutation::RewriteSystem { node, .. } => {
+            if !ir.nodes.iter().any(|n| n.name == *node) {
+                return MutationResult::Skipped(format!("node '{}' not found", node));
+            }
+            MutationResult::Ok(graph.clone())
+        }
+
+        Mutation::RewriteShell { node, .. } => {
+            match ir.nodes.iter().find(|n| n.name == *node) {
+                None => MutationResult::Skipped(format!("node '{}' not found", node)),
+                Some(n) if n.kind != NodeKindIR::Tool => {
+                    MutationResult::Skipped(format!("node '{}' is not a tool node", node))
+                }
+                _ => MutationResult::Ok(graph.clone()),
+            }
         }
     }
 }
@@ -454,7 +526,7 @@ fn apply_replace_with_subgraph(
 }
 
 fn apply_set_config(
-    _graph: &GraphIR,
+    graph: &GraphIR,
     ir: &ScaffoldIR,
     node_name: &str,
     field: &str,
@@ -480,9 +552,8 @@ fn apply_set_config(
         return MutationResult::Skipped(format!("unknown config field '{}'", field));
     }
 
-    // SetConfig produces overrides, not a new graph.
-    // Return the graph unchanged — the optimizer handles overrides separately.
-    MutationResult::Skipped("set_config produces overrides, not graph mutations".into())
+    // Graph unchanged — the optimizer stores the override separately.
+    MutationResult::Ok(graph.clone())
 }
 
 // ── Helpers ──
@@ -563,6 +634,37 @@ pub fn collect_step_names(stmts: &[GraphStmtIR]) -> Vec<String> {
         }
     }
     names
+}
+
+/// Collect graph names referenced by step calls (where node name is in `known_graphs`).
+pub fn collect_graph_refs_from_body(
+    stmts: &[GraphStmtIR],
+    known_graphs: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) => {
+                if known_graphs.contains(&s.node) {
+                    refs.insert(s.node.clone());
+                }
+            }
+            GraphStmtIR::Loop(l) => collect_graph_refs_from_body(&l.body, known_graphs, refs),
+            GraphStmtIR::If(i) => {
+                collect_graph_refs_from_body(&i.then_body, known_graphs, refs);
+                collect_graph_refs_from_body(&i.else_body, known_graphs, refs);
+            }
+            GraphStmtIR::Parallel(p) => collect_graph_refs_from_body(&p.body, known_graphs, refs),
+            GraphStmtIR::Choose(c) => {
+                for alt in &c.alternatives {
+                    if known_graphs.contains(alt) {
+                        refs.insert(alt.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Compute a structural fingerprint of a graph (for novelty search).
@@ -775,6 +877,7 @@ mod tests {
             max_nodes: Some(1),
             max_depth: None,
             preserve: vec!["s1".to_string()],
+            target_score: None,
         };
         let violations = check_constraints(&graph, &topo);
         assert!(violations.is_empty()); // 1 step <= max_nodes=1
@@ -784,6 +887,7 @@ mod tests {
             max_nodes: Some(0),
             max_depth: None,
             preserve: vec!["s1".to_string()],
+            target_score: None,
         };
         let violations2 = check_constraints(&graph, &topo2);
         assert!(!violations2.is_empty()); // 1 step > max_nodes=0

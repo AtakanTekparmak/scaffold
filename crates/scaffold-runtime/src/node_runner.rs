@@ -64,7 +64,7 @@ fn resolve_max_tokens(
 }
 
 /// Load template content from StringOrFileIR.
-fn load_template(sof: &StringOrFileIR) -> Result<String> {
+pub(crate) fn load_template(sof: &StringOrFileIR) -> Result<String> {
     match sof {
         StringOrFileIR::Literal { value } => Ok(value.clone()),
         StringOrFileIR::File { path } => {
@@ -132,12 +132,22 @@ async fn run_prompt(
 ) -> Result<Value> {
     let config = &node.config;
 
-    // Load and render template
-    let template_source = match &config.template {
-        Some(sof) => load_template(sof)?,
-        None => {
-            // If no template, just use the input as the prompt
-            return run_prompt_raw(node, &input.to_string(), overrides).await;
+    // Load and render template (overrides take priority)
+    let template_source = if let Some(v) = overrides.get("template") {
+        match v.as_str() {
+            Some(s) => s.to_string(),
+            None => match &config.template {
+                Some(sof) => load_template(sof)?,
+                None => return run_prompt_raw(node, &input.to_string(), overrides).await,
+            },
+        }
+    } else {
+        match &config.template {
+            Some(sof) => load_template(sof)?,
+            None => {
+                // If no template, just use the input as the prompt
+                return run_prompt_raw(node, &input.to_string(), overrides).await;
+            }
         }
     };
 
@@ -153,10 +163,14 @@ async fn run_prompt(
 
     let prompt_text = render_template(&template_source, &ctx, prompt_mgr)?;
 
-    // Load system prompt if configured
-    let system = match &config.system {
-        Some(sof) => Some(load_template(sof)?),
-        None => None,
+    // Load system prompt (overrides take priority)
+    let system = if let Some(v) = overrides.get("system") {
+        v.as_str().map(|s| s.to_string())
+    } else {
+        match &config.system {
+            Some(sof) => Some(load_template(sof)?),
+            None => None,
+        }
     };
 
     let llm_config = build_llm_config(config, overrides, system);
@@ -170,6 +184,13 @@ async fn run_prompt(
             Err(_) => {
                 // Fall back to string output
             }
+        }
+    }
+
+    // Try to parse JSON from the response when output type is structured
+    if !matches!(node.output, TypeIR::String) {
+        if let Ok(json_val) = llm::parse_json_with_repairs(&response) {
+            return Ok(Value::from(json_val));
         }
     }
 
@@ -195,8 +216,10 @@ async fn run_tool(
 ) -> Result<Value> {
     let config = &node.config;
 
-    // Shell tool: run a shell command
-    if let Some(ref shell_cmd) = config.shell {
+    // Shell tool: run a shell command (check override first)
+    let shell_override = overrides.get("shell").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let shell_source = shell_override.as_deref().or(config.shell.as_deref());
+    if let Some(shell_cmd) = shell_source {
         let ctx = match &input {
             Value::Map(m) => Value::Map(m.clone()),
             Value::Struct { fields, .. } => Value::Map(fields.clone()),
@@ -214,10 +237,13 @@ async fn run_tool(
             .and_then(|v| v.as_u64())
             .or(config.timeout);
 
-        let output = if let Some(t) = timeout {
-            crate::shell::execute_with_timeout(&rendered_cmd, t * 1000)?
-        } else {
-            crate::shell::execute(&rendered_cmd)?
+        // Meta-agent proposed shell commands run sandboxed (no network access).
+        let is_meta_proposed = shell_override.is_some();
+        let output = match (is_meta_proposed, timeout) {
+            (true, Some(t)) => crate::shell::execute_sandboxed_with_timeout(&rendered_cmd, t * 1000)?,
+            (true, None) => crate::shell::execute_sandboxed(&rendered_cmd)?,
+            (false, Some(t)) => crate::shell::execute_with_timeout(&rendered_cmd, t * 1000)?,
+            (false, None) => crate::shell::execute(&rendered_cmd)?,
         };
 
         return Ok(Value::String(output));
@@ -329,14 +355,29 @@ async fn run_verify(
 ) -> Result<Value> {
     let config = &node.config;
 
-    // Load and render template
-    let template_source = match &config.template {
-        Some(sof) => load_template(sof)?,
-        None => {
-            return Err(Error::NodeFailed {
-                node: node.name.clone(),
-                message: "verify node requires a template".into(),
-            });
+    // Load and render template (overrides take priority)
+    let template_source = if let Some(v) = overrides.get("template") {
+        match v.as_str() {
+            Some(s) => s.to_string(),
+            None => match &config.template {
+                Some(sof) => load_template(sof)?,
+                None => {
+                    return Err(Error::NodeFailed {
+                        node: node.name.clone(),
+                        message: "verify node requires a template".into(),
+                    });
+                }
+            },
+        }
+    } else {
+        match &config.template {
+            Some(sof) => load_template(sof)?,
+            None => {
+                return Err(Error::NodeFailed {
+                    node: node.name.clone(),
+                    message: "verify node requires a template".into(),
+                });
+            }
         }
     };
 
@@ -351,9 +392,14 @@ async fn run_verify(
 
     let prompt_text = render_template(&template_source, &ctx, prompt_mgr)?;
 
-    let system = match &config.system {
-        Some(sof) => Some(load_template(sof)?),
-        None => None,
+    // Load system prompt (overrides take priority)
+    let system = if let Some(v) = overrides.get("system") {
+        v.as_str().map(|s| s.to_string())
+    } else {
+        match &config.system {
+            Some(sof) => Some(load_template(sof)?),
+            None => None,
+        }
     };
 
     let llm_config = build_llm_config(config, overrides, system);

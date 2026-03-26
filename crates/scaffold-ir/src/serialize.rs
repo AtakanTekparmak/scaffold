@@ -129,93 +129,126 @@ impl Lowerer {
     }
 
     fn lower_objective_decl(&mut self, od: &ObjectiveDecl) {
-        let dataset = match &od.dataset {
-            DatasetSpec::File(path) => DatasetSpecIR::File {
-                path: path.clone(),
-            },
-            DatasetSpec::Inline { cases } => DatasetSpecIR::Inline {
-                cases: cases
-                    .iter()
-                    .map(|c| InlineCaseIR {
-                        input: lower_expr(&c.input),
-                        expected: lower_expr(&c.expected),
-                        id: c.id.clone(),
-                    })
-                    .collect(),
-            },
-        };
-
-        let checkers = od
-            .checkers
+        let subs = od
+            .subs
             .iter()
-            .map(|c| CheckerIR {
-                name: c.name.name.clone(),
-                expr: lower_expr(&c.expr),
+            .map(|sub| SubObjectiveIR {
+                name: sub.name.name.clone(),
+                graph: sub.graph.name.clone(),
+                dataset: lower_dataset_spec(&sub.dataset),
+                checkers: lower_checkers(&sub.checkers),
+                judges: lower_judges(&sub.judges),
+                metrics: lower_metrics(&sub.metrics),
+                score: lower_expr(&sub.score),
+                repeats: sub.repeats,
+                split: lower_split(&sub.split),
+                select: lower_select(&sub.select),
+                tunables: lower_tunables(&sub.tunables),
+                topology: lower_topology(&sub.topology),
             })
             .collect();
-
-        let judges = od
-            .judges
-            .iter()
-            .map(|j| JudgeIR {
-                name: j.name.name.clone(),
-                model: j.model.clone(),
-                template: j.template.as_ref().map(lower_string_or_file),
-                rubric: j.rubric.as_ref().map(lower_string_or_file),
-            })
-            .collect();
-
-        let metrics = od
-            .metrics
-            .iter()
-            .map(|m| MetricIR {
-                name: m.name.name.clone(),
-                checker: m.checker.name.clone(),
-            })
-            .collect();
-
-        let split = od.split.as_ref().map(|s| SplitIR {
-            train: s.train,
-            val: s.val,
-            test: s.test,
-        });
-
-        let select = od.select.as_ref().map(|s| SelectIR {
-            primary: s.primary.name.clone(),
-            tie_breakers: s.tie_breakers.iter().map(|i| i.name.clone()).collect(),
-        });
-
-        let tunables = od
-            .tunables
-            .iter()
-            .map(|t| TunableIR {
-                path: t.path.iter().map(|i| i.name.clone()).collect(),
-                domain: t.domain.iter().map(lower_expr).collect(),
-            })
-            .collect();
-
-        let topology = od.topology.as_ref().map(|t| TopologyIR {
-            mutations: t.mutations.clone(),
-            max_nodes: t.max_nodes,
-            max_depth: t.max_depth,
-            preserve: t.preserve.clone(),
-        });
 
         self.ir.objectives.push(ObjectiveIR {
             name: od.name.name.clone(),
             graph: od.graph.name.clone(),
-            dataset,
-            checkers,
-            judges,
-            metrics,
+            dataset: lower_dataset_spec(&od.dataset),
+            checkers: lower_checkers(&od.checkers),
+            judges: lower_judges(&od.judges),
+            metrics: lower_metrics(&od.metrics),
             score: lower_expr(&od.score),
             repeats: od.repeats,
-            split,
-            select,
-            tunables,
-            topology,
+            split: lower_split(&od.split),
+            select: lower_select(&od.select),
+            tunables: lower_tunables(&od.tunables),
+            topology: lower_topology(&od.topology),
+            subs,
         });
     }
+}
+
+fn lower_dataset_spec(ds: &DatasetSpec) -> DatasetSpecIR {
+    match ds {
+        DatasetSpec::File(path) => DatasetSpecIR::File {
+            path: path.clone(),
+        },
+        DatasetSpec::Inline { cases } => DatasetSpecIR::Inline {
+            cases: cases
+                .iter()
+                .map(|c| InlineCaseIR {
+                    input: lower_expr(&c.input),
+                    expected: lower_expr(&c.expected),
+                    id: c.id.clone(),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn lower_checkers(checkers: &[CheckerDecl]) -> Vec<CheckerIR> {
+    checkers
+        .iter()
+        .map(|c| CheckerIR {
+            name: c.name.name.clone(),
+            expr: lower_expr(&c.expr),
+        })
+        .collect()
+}
+
+fn lower_judges(judges: &[JudgeDecl]) -> Vec<JudgeIR> {
+    judges
+        .iter()
+        .map(|j| JudgeIR {
+            name: j.name.name.clone(),
+            model: j.model.clone(),
+            template: j.template.as_ref().map(lower_string_or_file),
+            rubric: j.rubric.as_ref().map(lower_string_or_file),
+        })
+        .collect()
+}
+
+fn lower_metrics(metrics: &[MetricDecl]) -> Vec<MetricIR> {
+    metrics
+        .iter()
+        .map(|m| MetricIR {
+            name: m.name.name.clone(),
+            checker: m.checker.name.clone(),
+        })
+        .collect()
+}
+
+fn lower_split(split: &Option<SplitDecl>) -> Option<SplitIR> {
+    split.as_ref().map(|s| SplitIR {
+        train: s.train,
+        val: s.val,
+        test: s.test,
+    })
+}
+
+fn lower_select(select: &Option<SelectDecl>) -> Option<SelectIR> {
+    select.as_ref().map(|s| SelectIR {
+        primary: s.primary.name.clone(),
+        tie_breakers: s.tie_breakers.iter().map(|i| i.name.clone()).collect(),
+    })
+}
+
+fn lower_tunables(tunables: &[TuneStmt]) -> Vec<TunableIR> {
+    tunables
+        .iter()
+        .map(|t| TunableIR {
+            path: t.path.iter().map(|i| i.name.clone()).collect(),
+            domain: t.domain.iter().map(lower_expr).collect(),
+        })
+        .collect()
+}
+
+fn lower_topology(topology: &Option<TopologyDecl>) -> Option<TopologyIR> {
+    topology.as_ref().map(|t| TopologyIR {
+        mutations: t.mutations.clone(),
+        max_nodes: t.max_nodes,
+        max_depth: t.max_depth,
+        preserve: t.preserve.clone(),
+        target_score: t.target_score,
+    })
 }
 
 fn lower_type_expr(texpr: &Spanned<TypeExpr>) -> TypeIR {
@@ -400,5 +433,60 @@ mod tests {
         let ir2 = from_json(&json).unwrap();
         assert_eq!(ir2.nodes.len(), 1);
         assert_eq!(ir2.graphs.len(), 1);
+    }
+
+    #[test]
+    fn lower_objective_with_subs() {
+        let src = r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "Solve: {{ input }}"
+            }
+            graph inner {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+            graph outer {
+                in: string
+                out: string
+                step s = inner(input)
+                emit s
+            }
+            objective eval {
+                graph: outer
+                dataset: cases [{ input: "x", expected: "y" }]
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
+
+                sub inner_opt {
+                    graph: inner
+                    dataset: cases [{ input: "a", expected: "b" }]
+                    checker sub_exact { output == expected }
+                    metric sub_acc { checker: sub_exact }
+                    score: sub_acc
+                    tune {
+                        solver.model in ["gpt-4o", "gpt-4o-mini"]
+                    }
+                }
+            }
+        "#;
+        let program = parse(src).unwrap();
+        let ir = lower(&program).unwrap();
+        assert_eq!(ir.objectives.len(), 1);
+        assert_eq!(ir.objectives[0].subs.len(), 1);
+        assert_eq!(ir.objectives[0].subs[0].name, "inner_opt");
+        assert_eq!(ir.objectives[0].subs[0].graph, "inner");
+        assert_eq!(ir.objectives[0].subs[0].tunables.len(), 1);
+
+        // JSON round-trip with subs
+        let json = to_json(&ir).unwrap();
+        let ir2 = from_json(&json).unwrap();
+        assert_eq!(ir2.objectives[0].subs.len(), 1);
+        assert_eq!(ir2.objectives[0].subs[0].name, "inner_opt");
     }
 }

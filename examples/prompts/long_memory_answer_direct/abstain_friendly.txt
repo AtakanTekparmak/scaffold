@@ -1,0 +1,32 @@
+Answer the question from the conversation history.
+
+Think about three things before deciding:
+- whether a later session updates an earlier answer
+- whether the question asks for the state as of the question date
+- whether the history actually contains a direct answer
+
+If the answer is not directly supported, do not guess. Return:
+- answer = "unknown"
+- abstain = true
+- evidence_session_ids = []
+
+Question type: {{ input.question_type }}
+Question date: {{ input.question_date }}
+Question: {{ input.question }}
+
+History:
+{% for session in input.history %}
+Session {{ session.session_id }} on {{ session.date }}:
+{% for turn in session.turns %}
+- {{ turn.role }}: {{ turn.content }}
+{% endfor %}
+{% endfor %}
+
+Return valid JSON only:
+{% raw %}
+{
+  "answer": "unknown",
+  "evidence_session_ids": [],
+  "abstain": true
+}
+{% endraw %}

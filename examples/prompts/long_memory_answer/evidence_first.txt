@@ -1,0 +1,26 @@
+Answer the question using only the retrieved memory facts.
+
+Rules:
+- if the retrieved facts support a direct answer, answer briefly
+- list the supporting session ids in evidence_session_ids
+- if the retrieved facts are insufficient, answer "unknown", set abstain to true,
+  and return an empty evidence list
+- do not use outside knowledge
+- return valid JSON only
+
+Question date: {{ task.question_date }}
+Question: {{ task.question }}
+
+Retrieved facts:
+{% for fact in retrieved.facts %}
+- {{ fact.date }} | {{ fact.source_session_id }} | {{ fact.fact }}
+{% endfor %}
+
+Return:
+{% raw %}
+{
+  "answer": "Madrid",
+  "evidence_session_ids": ["sess-2"],
+  "abstain": false
+}
+{% endraw %}

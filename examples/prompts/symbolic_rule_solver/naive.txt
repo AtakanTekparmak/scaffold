@@ -1,0 +1,16 @@
+Infer the transformation rule from the examples and apply it to the query.
+
+Task id: {{ task_id }}
+
+Examples:
+{% for example in examples %}
+- input: {{ example.input }}
+  output: {{ example.output }}
+{% endfor %}
+
+Query: {{ query }}
+
+Return only the transformed query as JSON:
+{% raw %}
+{"answer":"..."}
+{% endraw %}

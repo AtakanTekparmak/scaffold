@@ -1,0 +1,66 @@
+{
+  "source": "official LongMemEval oracle release",
+  "source_url": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_oracle.json",
+  "source_file": "examples/datasets/longmemeval_oracle.raw.json",
+  "preset": "mini",
+  "seed": 24,
+  "output": "examples/datasets/longmemeval_oracle_mini.jsonl",
+  "recommended_objective_split": {
+    "train": 0.5,
+    "val": 0.25,
+    "test": 0.25
+  },
+  "counts": {
+    "train": 6,
+    "val": 3,
+    "test": 3,
+    "total": 12
+  },
+  "sample_bucket_counts": {
+    "abstention": 1,
+    "knowledge-update": 2,
+    "multi-session": 2,
+    "single-session-assistant": 2,
+    "single-session-preference": 1,
+    "single-session-user": 2,
+    "temporal-reasoning": 2
+  },
+  "split_bucket_counts": {
+    "train": {
+      "abstention": 1,
+      "knowledge-update": 1,
+      "multi-session": 1,
+      "single-session-assistant": 1,
+      "single-session-preference": 1,
+      "single-session-user": 1
+    },
+    "val": {
+      "knowledge-update": 1,
+      "multi-session": 1,
+      "temporal-reasoning": 1
+    },
+    "test": {
+      "single-session-assistant": 1,
+      "single-session-user": 1,
+      "temporal-reasoning": 1
+    }
+  },
+  "train_question_ids": [
+    "2311e44b_abs",
+    "69fee5aa",
+    "157a136e",
+    "488d3006",
+    "06f04340",
+    "6b168ec8"
+  ],
+  "val_question_ids": [
+    "gpt4_b5700ca0",
+    "06db6396",
+    "77eafa52"
+  ],
+  "test_question_ids": [
+    "8752c811",
+    "a06e4cfe",
+    "gpt4_18c2b244"
+  ]
+}

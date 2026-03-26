@@ -21,6 +21,7 @@ pub mod config;
 pub mod error;
 pub mod executor;
 pub mod llm;
+pub mod meta_agent;
 pub mod mutations;
 pub mod node_runner;
 pub mod optimizer;
@@ -37,7 +38,11 @@ pub use config::{config, Config};
 pub use error::{Error, Result};
 pub use executor::GraphExecutor;
 pub use mutations::Mutation;
-pub use optimizer::{optimize, OptimizationBackend, OptimizationOptions, OptimizationReport};
+pub use optimizer::{
+    eval_checker_expr, optimize, optimize_hierarchical, HierarchicalReport,
+    OptEvent, OptimizationBackend, OptimizationOptions, OptimizationReport, OptPhase,
+    SubOptimizationReport,
+};
 pub use llm::{
     query as llm_query, query_structured, query_structured_with_config, query_with_config,
     query_with_model, Agent, AgentBuilder, LlmBackend, LlmConfig,

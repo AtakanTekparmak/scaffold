@@ -111,6 +111,8 @@ pub enum Token {
     File,
 
     // ── Keywords: objective ──
+    #[token("sub")]
+    Sub,
     #[token("dataset")]
     Dataset,
     #[token("cases")]
@@ -151,6 +153,8 @@ pub enum Token {
     MaxDepth,
     #[token("preserve")]
     Preserve,
+    #[token("target_score")]
+    TargetScore,
     #[token("input")]
     Input,
     #[token("expected")]
@@ -305,6 +309,7 @@ impl std::fmt::Display for Token {
             Token::While => write!(f, "while"),
             Token::Reduce => write!(f, "reduce"),
             Token::File => write!(f, "file"),
+            Token::Sub => write!(f, "sub"),
             Token::Dataset => write!(f, "dataset"),
             Token::Cases => write!(f, "cases"),
             Token::Checker => write!(f, "checker"),
@@ -325,6 +330,7 @@ impl std::fmt::Display for Token {
             Token::MaxNodes => write!(f, "max_nodes"),
             Token::MaxDepth => write!(f, "max_depth"),
             Token::Preserve => write!(f, "preserve"),
+            Token::TargetScore => write!(f, "target_score"),
             Token::Input => write!(f, "input"),
             Token::Expected => write!(f, "expected"),
             Token::Id => write!(f, "id"),

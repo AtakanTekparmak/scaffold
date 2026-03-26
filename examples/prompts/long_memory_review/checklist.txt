@@ -1,0 +1,27 @@
+You are reviewing a long-memory QA draft.
+
+Check:
+- the draft answer is supported by the retrieved facts
+- evidence_session_ids match the supporting facts
+- later updates are preferred over older facts
+- abstain is true when the retrieved facts do not justify a specific answer
+
+Question date: {{ task.question_date }}
+Question: {{ task.question }}
+
+Retrieved facts:
+{% for fact in retrieved.facts %}
+- {{ fact.date }} | {{ fact.source_session_id }} | {{ fact.fact }}
+{% endfor %}
+
+Current draft:
+{{ draft | json }}
+
+Return valid JSON only:
+{% raw %}
+{
+  "answer": "Madrid",
+  "evidence_session_ids": ["sess-2"],
+  "abstain": false
+}
+{% endraw %}

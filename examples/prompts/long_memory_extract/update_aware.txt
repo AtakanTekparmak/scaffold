@@ -1,0 +1,37 @@
+Build a memory store from the chat history.
+
+Extract only future-useful facts. When a later session explicitly updates an
+earlier fact, keep the newer fact and phrase it as the current state. Ignore
+greetings, filler, generic assistant explanations, and long background detail.
+
+Rules:
+- keep only facts that could plausibly answer a future question
+- for assistant recommendations, store the named recommendation or direct answer
+- avoid copying whole paragraphs or broad instructional content
+- each fact should be one short sentence
+- keep at most 8 facts per session and 24 facts total
+
+Question id: {{ question_id }}
+Question type: {{ question_type }}
+Question date: {{ question_date }}
+
+History:
+{% for session in history %}
+Session {{ session.session_id }} on {{ session.date }}:
+{% for turn in session.turns %}
+- {{ turn.role }}: {{ turn.content }}
+{% endfor %}
+
+{% endfor %}
+Return valid JSON only:
+{% raw %}
+{
+  "facts": [
+    {
+      "source_session_id": "sess-2",
+      "date": "2025-03-02",
+      "fact": "Nora is now in Madrid."
+    }
+  ]
+}
+{% endraw %}

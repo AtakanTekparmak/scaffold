@@ -1,0 +1,147 @@
+// Long Memory Oracle Mini – v2 graph syntax
+//
+// Two-level hierarchy:
+//   inner graph  extract_retrieve   (extract facts → retrieve relevant ones)
+//   outer graph  answer_pipeline    (call inner → answer question)
+//
+// The objective uses a `sub` block so the optimizer can tune
+// the retrieval stage in isolation before optimizing the full pipeline.
+
+// ── Types ──
+
+type MemoryTurn = { role: string, content: string }
+
+type MemorySession = {
+    session_id: string,
+    date: string,
+    turns: list<MemoryTurn>
+}
+
+type LongMemoryInput = {
+    question_id: string,
+    question_type: string,
+    question_date: string,
+    question: string,
+    history: list<MemorySession>
+}
+
+type MemoryFact = {
+    source_session_id: string,
+    date: string,
+    fact: string
+}
+
+type MemoryStore = { facts: list<MemoryFact> }
+
+type MemoryRetrieveOutput = { facts: list<MemoryFact> }
+
+type LongMemoryAnswer = {
+    answer: string,
+    evidence_session_ids: list<string>,
+    abstain: bool
+}
+
+// ── Nodes ──
+
+node extract_memory: prompt {
+    in: LongMemoryInput
+    out: MemoryStore
+    template: file("examples/prompts/long_memory_extract/structured_facts.txt")
+    model: "gpt-5-mini"
+    temperature: 0.0
+}
+
+node retrieve_memory: prompt {
+    in: { task: LongMemoryInput, memory: MemoryStore }
+    out: MemoryRetrieveOutput
+    template: file("examples/prompts/long_memory_retrieve/focused.txt")
+    model: "gpt-5-mini"
+    temperature: 0.0
+}
+
+node answer_memory: prompt {
+    in: { task: LongMemoryInput, retrieved: MemoryRetrieveOutput }
+    out: LongMemoryAnswer
+    template: file("examples/prompts/long_memory_answer/evidence_first.txt")
+    model: "gpt-5-mini"
+    temperature: 0.0
+}
+
+node review_memory: prompt {
+    in: { task: LongMemoryInput, retrieved: MemoryRetrieveOutput, draft: LongMemoryAnswer }
+    out: LongMemoryAnswer
+    template: file("examples/prompts/long_memory_review/checklist.txt")
+    model: "gpt-5-mini"
+    temperature: 0.0
+}
+
+// ── Graphs ──
+
+graph extract_retrieve {
+    in: LongMemoryInput
+    out: MemoryRetrieveOutput
+
+    step memory = extract_memory(input)
+    step retrieved = retrieve_memory(task: input, memory: memory)
+    emit retrieved
+}
+
+graph answer_pipeline {
+    in: LongMemoryInput
+    out: LongMemoryAnswer
+
+    step retrieved = extract_retrieve(input)
+    step draft = answer_memory(task: input, retrieved: retrieved)
+    emit draft
+}
+
+// ── Objective with hierarchical sub-optimization ──
+
+objective long_memory_mini {
+    graph: answer_pipeline
+    dataset: file("examples/datasets/longmemeval_oracle_mini.jsonl")
+
+    checker exact_answer { output.answer == expected.answer }
+    checker exact_abstain { output.abstain == expected.abstain }
+    checker non_empty { len(output.answer) > 0 }
+    checker evidence_present { output.abstain || len(output.evidence_session_ids) > 0 }
+
+    metric answer_accuracy { checker: exact_answer }
+    metric abstain_accuracy { checker: exact_abstain }
+    metric non_empty_metric { checker: non_empty }
+    metric evidence_metric { checker: evidence_present }
+
+    score: answer_accuracy
+
+    split { train: 0.5, val: 0.25, test: 0.25 }
+    select {
+        primary: answer_accuracy,
+        tie_breakers: [abstain_accuracy, evidence_metric, non_empty_metric]
+    }
+
+    tune {
+        answer_memory.temperature in [0.0, 0.3]
+    }
+
+    topology { mutations: [insert_verify] max_nodes: 6 target_score: 0.9 }
+
+    sub retrieval_opt {
+        graph: extract_retrieve
+        dataset: file("examples/datasets/longmemeval_oracle_mini.jsonl")
+
+        checker has_facts { len(output.facts) > 0 }
+        checker enough_facts { len(output.facts) > 2 }
+
+        metric retrieval_coverage { checker: has_facts }
+        metric fact_richness { checker: enough_facts }
+
+        score: retrieval_coverage
+
+        tune {
+            extract_memory.temperature in [0.0, 0.3]
+            retrieve_memory.temperature in [0.0, 0.3]
+        }
+
+        topology { mutations: [insert_verify] max_nodes: 5 target_score: 0.95 }
+    }
+}

@@ -23,6 +23,8 @@ use scaffold_syntax::parse;
 use scaffold_types::check;
 use scaffold_verify::{verify, Severity};
 
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "scaffold")]
 #[command(author, version, about = "Scaffold v2 DSL compiler and runtime", long_about = None)]
@@ -132,6 +134,14 @@ enum Commands {
         /// Enable live tracing
         #[arg(long)]
         live: bool,
+
+        /// Number of dataset cases to evaluate concurrently per candidate
+        #[arg(long, default_value = "1")]
+        concurrency: usize,
+
+        /// LLM model for meta-agent guided mutations (e.g. gpt-4o). Omit for random mutations.
+        #[arg(long)]
+        meta_model: Option<String>,
     },
 
     /// Pretty-print IR back to scaffold source
@@ -172,6 +182,8 @@ fn main() -> ExitCode {
             report_dir,
             write_best,
             live,
+            concurrency,
+            meta_model,
         } => cmd_optimize(
             &file,
             &objective,
@@ -180,6 +192,8 @@ fn main() -> ExitCode {
             report_dir,
             write_best,
             live,
+            concurrency,
+            meta_model,
         ),
         Commands::Print { file } => cmd_print(&file),
     }
@@ -441,25 +455,70 @@ fn cmd_evaluate(
     );
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut total = 0.0;
-    let mut count = 0;
+    let case_count = dataset.len();
+    let mut checker_totals: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    let mut errors = 0;
 
     for case in &dataset {
         match rt.block_on(executor.execute_graph(&objective.graph, case.input.clone())) {
-            Ok(result) => {
-                total += 1.0;
-                let json: serde_json::Value = result.into();
-                eprintln!("  case {:?}: {}", case.id, serde_json::to_string(&json).unwrap_or_default());
+            Ok(output) => {
+                // Evaluate each checker expression
+                let mut case_checks = Vec::new();
+                for checker in &objective.checkers {
+                    let val = scaffold_runtime::eval_checker_expr(
+                        &executor, &checker.expr, &output, &case.expected,
+                    );
+                    *checker_totals.entry(checker.name.clone()).or_default() += val;
+                    case_checks.push(format!(
+                        "{}={}",
+                        checker.name,
+                        if val >= 1.0 { "PASS" } else { "FAIL" }
+                    ));
+                }
+                let json: serde_json::Value = output.into();
+                eprintln!(
+                    "  case {:?}: {} [{}]",
+                    case.id,
+                    serde_json::to_string(&json).unwrap_or_default(),
+                    case_checks.join(", ")
+                );
             }
             Err(e) => {
                 eprintln!("  case {:?}: error: {}", case.id, e);
+                errors += 1;
             }
         }
-        count += 1;
     }
 
-    if count > 0 {
-        eprintln!("score: {:.4}", total / count as f64);
+    if case_count > 0 {
+        eprintln!("---");
+        // Print per-checker averages
+        for checker in &objective.checkers {
+            let total = checker_totals.get(&checker.name).copied().unwrap_or(0.0);
+            eprintln!("  {}: {:.4}", checker.name, total / case_count as f64);
+        }
+        // Print per-metric averages
+        let mut metric_avgs: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for metric in &objective.metrics {
+            let checker_total = checker_totals.get(&metric.checker).copied().unwrap_or(0.0);
+            let avg = checker_total / case_count as f64;
+            metric_avgs.insert(metric.name.clone(), avg);
+        }
+        // Evaluate score expression
+        let score_scope = scaffold_runtime::Scope::with_bindings(
+            metric_avgs
+                .iter()
+                .map(|(k, v)| (k.as_str(), scaffold_runtime::Value::Float(*v)))
+                .collect(),
+        );
+        let score = match executor.eval_expr(&objective.score, &score_scope) {
+            Ok(scaffold_runtime::Value::Float(f)) => f,
+            Ok(scaffold_runtime::Value::Int(i)) => i as f64,
+            _ => 0.0,
+        };
+        eprintln!("score: {:.4} ({} errors / {} cases)", score, errors, case_count);
     }
 
     ExitCode::SUCCESS
@@ -475,11 +534,9 @@ fn cmd_optimize(
     report_dir: Option<PathBuf>,
     write_best: Option<PathBuf>,
     live: bool,
+    concurrency: usize,
+    meta_model: Option<String>,
 ) -> ExitCode {
-    if live {
-        setup_tracer();
-    }
-
     let ir = match load_ir(file) {
         Ok(ir) => ir,
         Err(msg) => {
@@ -488,26 +545,73 @@ fn cmd_optimize(
         }
     };
 
-    let options = OptimizationOptions {
-        max_candidates,
-        backend: match backend {
-            OptimizeBackendArg::Grid => OptimizationBackend::Grid,
-            OptimizeBackendArg::Evolutionary => OptimizationBackend::Evolutionary,
-        },
-        report_dir,
-        write_best,
+    let backend = match backend {
+        OptimizeBackendArg::Grid => OptimizationBackend::Grid,
+        OptimizeBackendArg::Evolutionary => OptimizationBackend::Evolutionary,
     };
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    match rt.block_on(scaffold_runtime::optimize(&ir, objective_name, &options)) {
-        Ok(report) => {
-            let json = serde_json::to_string_pretty(&report).unwrap_or_default();
-            println!("{}", json);
-            ExitCode::SUCCESS
+    if live {
+        // TUI mode: spawn optimizer in a thread, run TUI on main thread
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        let options = OptimizationOptions {
+            max_candidates,
+            backend,
+            report_dir,
+            write_best,
+            event_tx: Some(event_tx),
+            concurrency,
+            meta_model: meta_model.clone(),
+        };
+
+        let obj_name = objective_name.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(scaffold_runtime::optimize_hierarchical(
+                &ir, &obj_name, &options,
+            ));
+            let _ = result_tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        match tui::run_tui(event_rx, result_rx) {
+            Ok(report) => {
+                let json = serde_json::to_string_pretty(&report).unwrap_or_default();
+                println!("{}", json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::FAILURE
+            }
         }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            ExitCode::FAILURE
+    } else {
+        // Non-live mode: run optimizer directly
+        let options = OptimizationOptions {
+            max_candidates,
+            backend,
+            report_dir,
+            write_best,
+            event_tx: None,
+            concurrency,
+            meta_model,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(scaffold_runtime::optimize_hierarchical(
+            &ir,
+            objective_name,
+            &options,
+        )) {
+            Ok(report) => {
+                let json = serde_json::to_string_pretty(&report).unwrap_or_default();
+                println!("{}", json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::FAILURE
+            }
         }
     }
 }

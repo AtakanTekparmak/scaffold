@@ -11,6 +11,7 @@ thiserror.workspace = true
 scaffold-ir.workspace = true
 minijinja = "2.0"  # Fast Jinja2-compatible templating
 tokio = { version = "1.0", features = ["full"] }
+futures.workspace = true
 toml = "0.8"
 dirs = "5.0"
 dotenvy = "0.15"

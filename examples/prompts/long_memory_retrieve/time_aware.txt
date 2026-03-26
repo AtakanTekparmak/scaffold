@@ -1,0 +1,31 @@
+Retrieve the minimum set of facts needed to answer the question as of the
+question date.
+
+Rules:
+- use the question date to resolve updates and current state
+- prefer facts that directly answer the question
+- keep only the necessary evidence
+- return at most 4 facts
+- if support is missing, return no facts
+
+Question type: {{ task.question_type }}
+Question date: {{ task.question_date }}
+Question: {{ task.question }}
+
+Memory facts:
+{% for fact in memory.facts %}
+- {{ fact.date }} | {{ fact.source_session_id }} | {{ fact.fact }}
+{% endfor %}
+
+Return valid JSON only:
+{% raw %}
+{
+  "facts": [
+    {
+      "source_session_id": "sess-3",
+      "date": "2025-04-01",
+      "fact": "The dentist appointment is now April 17, 2025 at 2 PM."
+    }
+  ]
+}
+{% endraw %}

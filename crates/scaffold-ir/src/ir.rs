@@ -232,6 +232,33 @@ pub struct ObjectiveIR {
     pub tunables: Vec<TunableIR>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topology: Option<TopologyIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subs: Vec<SubObjectiveIR>,
+}
+
+/// A sub-objective for hierarchical optimization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubObjectiveIR {
+    pub name: String,
+    pub graph: String,
+    pub dataset: DatasetSpecIR,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkers: Vec<CheckerIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judges: Vec<JudgeIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricIR>,
+    pub score: ExprIR,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select: Option<SelectIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunables: Vec<TunableIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<TopologyIR>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +329,8 @@ pub struct TopologyIR {
     pub max_depth: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preserve: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_score: Option<f64>,
 }
 
 // ── Expressions ──

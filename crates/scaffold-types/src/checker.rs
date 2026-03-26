@@ -366,6 +366,45 @@ impl Checker {
                 }
             }
         }
+
+        // Check sub-objectives
+        for sub in &od.subs {
+            self.check_sub_objective(sub);
+        }
+    }
+
+    fn check_sub_objective(&mut self, sub: &SubObjectiveDecl) {
+        // Check graph reference
+        if !self.env.graphs.contains_key(&sub.graph.name) {
+            self.error(
+                &sub.graph.span,
+                format!(
+                    "sub-objective '{}' references undefined graph '{}'",
+                    sub.name.name, sub.graph.name
+                ),
+            );
+        }
+
+        // Check score expression
+        let mut scope = Scope::new();
+        for metric in &sub.metrics {
+            scope.define(metric.name.name.clone(), Type::Float);
+        }
+        let _score_ty = self.infer_expr(&sub.score, &scope);
+
+        // Check tune paths resolve
+        for tune in &sub.tunables {
+            if tune.path.is_empty() {
+                continue;
+            }
+            let node_name = &tune.path[0].name;
+            if !self.env.nodes.contains_key(node_name) {
+                self.error(
+                    &tune.path[0].span,
+                    format!("tune path references undefined node '{}'", node_name),
+                );
+            }
+        }
     }
 
     /// Infer the type of an expression

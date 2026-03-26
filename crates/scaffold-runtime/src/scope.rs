@@ -28,6 +28,18 @@ impl Scope {
         }
     }
 
+    /// Create a root scope with arbitrary named bindings (no "input" key).
+    pub fn with_bindings(bindings: Vec<(&str, Value)>) -> Self {
+        let map = bindings
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        Self {
+            bindings: map,
+            parent: None,
+        }
+    }
+
     /// Create a child scope that can read from this scope.
     pub fn child(&self) -> Self {
         Self {

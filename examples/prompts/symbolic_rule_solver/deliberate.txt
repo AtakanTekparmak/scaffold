@@ -1,0 +1,24 @@
+Infer the exact symbolic rewrite rule shown in the examples.
+
+Before answering, internally check:
+- what changes between each example input and output
+- whether token order changes
+- whether characters inside each token change
+- whether tokens are removed or duplicated
+
+Then apply the same rule to the query.
+
+Task id: {{ task_id }}
+
+Examples:
+{% for example in examples %}
+Example {{ loop.index }} input: {{ example.input }}
+Example {{ loop.index }} output: {{ example.output }}
+
+{% endfor %}
+Query: {{ query }}
+
+Return valid JSON only:
+{% raw %}
+{"answer":"..."}
+{% endraw %}

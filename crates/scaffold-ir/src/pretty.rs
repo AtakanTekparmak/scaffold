@@ -9,6 +9,13 @@ pub fn pretty_print(ir: &ScaffoldIR) -> String {
     pp.output
 }
 
+/// Pretty-print a single graph to scaffold source
+pub fn pretty_print_graph(graph: &GraphIR) -> String {
+    let mut pp = PrettyPrinter::new();
+    pp.print_graph(graph);
+    pp.output
+}
+
 struct PrettyPrinter {
     output: String,
     indent: usize,
@@ -210,30 +217,7 @@ impl PrettyPrinter {
 
         self.line(&format!("graph: {}", obj.graph));
 
-        match &obj.dataset {
-            DatasetSpecIR::File { path } => {
-                self.line(&format!("dataset: file(\"{}\")", path));
-            }
-            DatasetSpecIR::Inline { cases } => {
-                self.line("dataset: cases [");
-                self.indent += 1;
-                for case in cases {
-                    let id_str = case
-                        .id
-                        .as_ref()
-                        .map(|id| format!(", id: \"{}\"", id))
-                        .unwrap_or_default();
-                    self.line(&format!(
-                        "{{ input: {}, expected: {}{} }}",
-                        format_expr(&case.input),
-                        format_expr(&case.expected),
-                        id_str
-                    ));
-                }
-                self.indent -= 1;
-                self.line("]");
-            }
-        }
+        self.print_dataset(&obj.dataset);
 
         for c in &obj.checkers {
             self.line(&format!("checker {} {{ {} }}", c.name, format_expr(&c.expr)));
@@ -283,7 +267,80 @@ impl PrettyPrinter {
             self.line("}");
         }
 
-        if let Some(ref t) = obj.topology {
+        self.print_topology(&obj.topology);
+
+        for sub in &obj.subs {
+            self.print_sub_objective(sub);
+        }
+
+        self.indent -= 1;
+        self.line("}");
+    }
+
+    fn print_sub_objective(&mut self, sub: &SubObjectiveIR) {
+        self.line(&format!("sub {} {{", sub.name));
+        self.indent += 1;
+
+        self.line(&format!("graph: {}", sub.graph));
+
+        self.print_dataset(&sub.dataset);
+
+        for c in &sub.checkers {
+            self.line(&format!("checker {} {{ {} }}", c.name, format_expr(&c.expr)));
+        }
+
+        for m in &sub.metrics {
+            self.line(&format!("metric {} {{ checker: {} }}", m.name, m.checker));
+        }
+
+        self.line(&format!("score: {}", format_expr(&sub.score)));
+
+        if let Some(r) = sub.repeats {
+            self.line(&format!("repeats: {}", r));
+        }
+
+        if let Some(ref s) = sub.split {
+            self.line(&format!(
+                "split {{ train: {}, val: {}, test: {} }}",
+                s.train, s.val, s.test
+            ));
+        }
+
+        if let Some(ref s) = sub.select {
+            if s.tie_breakers.is_empty() {
+                self.line(&format!("select {{ primary: {} }}", s.primary));
+            } else {
+                self.line(&format!(
+                    "select {{ primary: {}, tie_breakers: [{}] }}",
+                    s.primary,
+                    s.tie_breakers.join(", ")
+                ));
+            }
+        }
+
+        if !sub.tunables.is_empty() {
+            self.line("tune {");
+            self.indent += 1;
+            for t in &sub.tunables {
+                let domain: Vec<String> = t.domain.iter().map(format_expr).collect();
+                self.line(&format!(
+                    "{} in [{}]",
+                    t.path.join("."),
+                    domain.join(", ")
+                ));
+            }
+            self.indent -= 1;
+            self.line("}");
+        }
+
+        self.print_topology(&sub.topology);
+
+        self.indent -= 1;
+        self.line("}");
+    }
+
+    fn print_topology(&mut self, topology: &Option<TopologyIR>) {
+        if let Some(ref t) = topology {
             self.line("topology {");
             self.indent += 1;
             if !t.mutations.is_empty() {
@@ -298,12 +355,39 @@ impl PrettyPrinter {
             if !t.preserve.is_empty() {
                 self.line(&format!("preserve: [{}]", t.preserve.join(", ")));
             }
+            if let Some(ts) = t.target_score {
+                self.line(&format!("target_score: {}", ts));
+            }
             self.indent -= 1;
             self.line("}");
         }
+    }
 
-        self.indent -= 1;
-        self.line("}");
+    fn print_dataset(&mut self, dataset: &DatasetSpecIR) {
+        match dataset {
+            DatasetSpecIR::File { path } => {
+                self.line(&format!("dataset: file(\"{}\")", path));
+            }
+            DatasetSpecIR::Inline { cases } => {
+                self.line("dataset: cases [");
+                self.indent += 1;
+                for case in cases {
+                    let id_str = case
+                        .id
+                        .as_ref()
+                        .map(|id| format!(", id: \"{}\"", id))
+                        .unwrap_or_default();
+                    self.line(&format!(
+                        "{{ input: {}, expected: {}{} }}",
+                        format_expr(&case.input),
+                        format_expr(&case.expected),
+                        id_str
+                    ));
+                }
+                self.indent -= 1;
+                self.line("]");
+            }
+        }
     }
 }
 
@@ -379,5 +463,78 @@ fn format_expr(expr: &ExprIR) -> String {
                 .collect();
             format!("{{ {} }}", fs.join(", "))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serialize::{from_json, lower, to_json};
+    use scaffold_syntax::parser::parse;
+
+    #[test]
+    fn pretty_print_round_trip_with_subs() {
+        let src = r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "Solve: {{ input }}"
+            }
+            graph inner {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+            graph outer {
+                in: string
+                out: string
+                step s = inner(input)
+                emit s
+            }
+            objective eval {
+                graph: outer
+                dataset: cases [
+                    { input: "x", expected: "y" }
+                ]
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
+
+                sub inner_opt {
+                    graph: inner
+                    dataset: cases [
+                        { input: "a", expected: "b" }
+                    ]
+                    checker sub_exact { output == expected }
+                    metric sub_acc { checker: sub_exact }
+                    score: sub_acc
+                    topology {
+                        mutations: [insert_verify]
+                        max_nodes: 8
+                    }
+                }
+            }
+        "#;
+        // Parse → Lower → Pretty print → Re-parse → Lower → Compare
+        let program = parse(src).unwrap();
+        let ir = lower(&program).unwrap();
+        let printed = pretty_print(&ir);
+
+        // Re-parse the printed output
+        let program2 = parse(&printed).expect("pretty-printed output should re-parse");
+        let ir2 = lower(&program2).unwrap();
+
+        // Check structural equivalence
+        assert_eq!(ir.objectives.len(), ir2.objectives.len());
+        assert_eq!(ir.objectives[0].subs.len(), ir2.objectives[0].subs.len());
+        assert_eq!(ir.objectives[0].subs[0].name, ir2.objectives[0].subs[0].name);
+        assert_eq!(ir.objectives[0].subs[0].graph, ir2.objectives[0].subs[0].graph);
+
+        // Also check JSON round-trip
+        let json = to_json(&ir).unwrap();
+        let ir3 = from_json(&json).unwrap();
+        assert_eq!(ir3.objectives[0].subs.len(), 1);
     }
 }

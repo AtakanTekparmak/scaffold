@@ -278,18 +278,68 @@ impl<'a> Verifier<'a> {
         }
 
         // Check tunable paths
-        for tunable in &obj.tunables {
+        self.check_tunables(&obj.tunables, &ctx);
+
+        // Check topology constraints
+        self.check_topology_constraints(&obj.topology, &ctx);
+
+        // Check metric checker references
+        self.check_metric_checkers(&obj.metrics, &obj.checkers, &ctx);
+
+        // Check sub-objectives
+        let mut sub_names: HashSet<String> = HashSet::new();
+        for sub in &obj.subs {
+            // Check for duplicate sub names
+            if !sub_names.insert(sub.name.clone()) {
+                self.error(
+                    &ctx,
+                    format!("duplicate sub-objective name '{}'", sub.name),
+                );
+            }
+            self.check_sub_objective(sub, &obj.graph, &ctx);
+        }
+    }
+
+    fn check_sub_objective(&mut self, sub: &SubObjectiveIR, parent_graph: &str, parent_ctx: &str) {
+        let ctx = format!("{}.sub.{}", parent_ctx, sub.name);
+
+        // Check graph reference
+        if !self.graph_names.contains(&sub.graph) {
+            self.error(&ctx, format!("references undefined graph '{}'", sub.graph));
+        }
+
+        // Check subgraph reachability: sub's graph must be transitively called from parent graph
+        if self.graph_names.contains(&sub.graph) && self.graph_names.contains(parent_graph) {
+            let reachable = self.collect_reachable_graphs(parent_graph);
+            if !reachable.contains(&sub.graph) {
+                self.error(
+                    &ctx,
+                    format!(
+                        "sub graph '{}' is not reachable from parent graph '{}'",
+                        sub.graph, parent_graph
+                    ),
+                );
+            }
+        }
+
+        // Check tunables, topology, metric-checker refs
+        self.check_tunables(&sub.tunables, &ctx);
+        self.check_topology_constraints(&sub.topology, &ctx);
+        self.check_metric_checkers(&sub.metrics, &sub.checkers, &ctx);
+    }
+
+    fn check_tunables(&mut self, tunables: &[TunableIR], ctx: &str) {
+        for tunable in tunables {
             if tunable.path.is_empty() {
                 continue;
             }
             let node_name = &tunable.path[0];
             if !self.node_names.contains(node_name) {
                 self.error(
-                    &ctx,
+                    ctx,
                     format!("tune path references undefined node '{}'", node_name),
                 );
             }
-            // Check that the field in path[1] is a valid config field
             if tunable.path.len() >= 2 {
                 let field = &tunable.path[1];
                 let valid_fields = [
@@ -303,15 +353,16 @@ impl<'a> Verifier<'a> {
                 ];
                 if !valid_fields.contains(&field.as_str()) {
                     self.warn(
-                        &ctx,
+                        ctx,
                         format!("tune field '{}' may not be a valid config field", field),
                     );
                 }
             }
         }
+    }
 
-        // Check topology constraints
-        if let Some(ref topo) = obj.topology {
+    fn check_topology_constraints(&mut self, topology: &Option<TopologyIR>, ctx: &str) {
+        if let Some(ref topo) = topology {
             let valid_mutations = [
                 "insert_verify",
                 "wrap_retry",
@@ -325,31 +376,30 @@ impl<'a> Verifier<'a> {
             for mutation in &topo.mutations {
                 if !valid_mutations.contains(&mutation.as_str()) {
                     self.warn(
-                        &ctx,
+                        ctx,
                         format!("unrecognized mutation type '{}'", mutation),
                     );
                 }
             }
-
-            // Check preserve targets
             for preserved in &topo.preserve {
                 if !self.node_names.contains(preserved)
                     && !self.graph_names.contains(preserved)
                 {
                     self.warn(
-                        &ctx,
+                        ctx,
                         format!("preserve target '{}' not found", preserved),
                     );
                 }
             }
         }
+    }
 
-        // Check metric checker references
-        for metric in &obj.metrics {
-            let checker_names: HashSet<&str> = obj.checkers.iter().map(|c| c.name.as_str()).collect();
+    fn check_metric_checkers(&mut self, metrics: &[MetricIR], checkers: &[CheckerIR], ctx: &str) {
+        let checker_names: HashSet<&str> = checkers.iter().map(|c| c.name.as_str()).collect();
+        for metric in metrics {
             if !checker_names.contains(metric.checker.as_str()) {
                 self.error(
-                    &ctx,
+                    ctx,
                     format!(
                         "metric '{}' references undefined checker '{}'",
                         metric.name, metric.checker
@@ -357,6 +407,24 @@ impl<'a> Verifier<'a> {
                 );
             }
         }
+    }
+
+    /// Collect all graphs transitively reachable from a given graph via step calls.
+    fn collect_reachable_graphs(&self, start_graph: &str) -> HashSet<String> {
+        let mut reachable = HashSet::new();
+        let mut stack = vec![start_graph.to_string()];
+        while let Some(name) = stack.pop() {
+            if let Some(graph) = self.ir.graphs.iter().find(|g| g.name == name) {
+                let mut called = HashSet::new();
+                collect_graph_refs(&graph.body, &self.graph_names, &mut called);
+                for called_name in called {
+                    if reachable.insert(called_name.clone()) {
+                        stack.push(called_name);
+                    }
+                }
+            }
+        }
+        reachable
     }
 
     fn check_reachability(&mut self) {
@@ -518,5 +586,150 @@ mod tests {
         assert!(errors
             .iter()
             .any(|e| e.message.contains("carry") && e.message.contains("outside")));
+    }
+
+    #[test]
+    fn verify_valid_sub_objective() {
+        let errors = verify_source(
+            r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "test"
+            }
+            graph inner {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+            graph outer {
+                in: string
+                out: string
+                step s = inner(input)
+                emit s
+            }
+            objective eval {
+                graph: outer
+                dataset: cases [{ input: "x", expected: "y" }]
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
+
+                sub inner_opt {
+                    graph: inner
+                    dataset: cases [{ input: "a", expected: "b" }]
+                    checker sub_exact { output == expected }
+                    metric sub_acc { checker: sub_exact }
+                    score: sub_acc
+                }
+            }
+        "#,
+        );
+        let real_errors: Vec<_> = errors
+            .iter()
+            .filter(|e| e.severity == Severity::Error)
+            .collect();
+        assert!(real_errors.is_empty(), "unexpected errors: {:?}", real_errors);
+    }
+
+    #[test]
+    fn verify_unreachable_sub_graph() {
+        let errors = verify_source(
+            r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "test"
+            }
+            graph inner {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+            graph outer {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+            objective eval {
+                graph: outer
+                dataset: cases [{ input: "x", expected: "y" }]
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
+
+                sub inner_opt {
+                    graph: inner
+                    dataset: cases [{ input: "a", expected: "b" }]
+                    checker sub_exact { output == expected }
+                    metric sub_acc { checker: sub_exact }
+                    score: sub_acc
+                }
+            }
+        "#,
+        );
+        // inner is NOT called from outer, so sub should fail reachability check
+        assert!(errors
+            .iter()
+            .any(|e| e.severity == Severity::Error
+                && e.message.contains("not reachable")));
+    }
+
+    #[test]
+    fn verify_duplicate_sub_names() {
+        let errors = verify_source(
+            r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "test"
+            }
+            graph inner {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+            graph outer {
+                in: string
+                out: string
+                step s = inner(input)
+                emit s
+            }
+            objective eval {
+                graph: outer
+                dataset: cases [{ input: "x", expected: "y" }]
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
+
+                sub dup {
+                    graph: inner
+                    dataset: cases [{ input: "a", expected: "b" }]
+                    checker c { output == expected }
+                    metric m { checker: c }
+                    score: m
+                }
+
+                sub dup {
+                    graph: inner
+                    dataset: cases [{ input: "c", expected: "d" }]
+                    checker c { output == expected }
+                    metric m { checker: c }
+                    score: m
+                }
+            }
+        "#,
+        );
+        assert!(errors
+            .iter()
+            .any(|e| e.severity == Severity::Error
+                && e.message.contains("duplicate sub-objective")));
     }
 }
