@@ -608,12 +608,26 @@ fn parse_proposal(
             Mutation::ReplaceComponent { step, new_node }
         }
         "set_config" => {
-            let node = require_str(&json, "node")?;
-            let field = require_str(&json, "field")?;
+            let raw_node = require_str(&json, "node")?;
+            let raw_field = json.get("field").and_then(|v| v.as_str()).map(|s| s.to_string());
             let value = json
                 .get("value")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+
+            // The meta-agent sometimes sends "node": "answer_memory.temperature"
+            // instead of "node": "answer_memory", "field": "temperature".
+            // Handle both formats gracefully.
+            let (node, field) = if let Some(f) = raw_field {
+                (raw_node, f)
+            } else if let Some(dot_pos) = raw_node.find('.') {
+                (raw_node[..dot_pos].to_string(), raw_node[dot_pos + 1..].to_string())
+            } else {
+                return Err(Error::Runtime(
+                    "meta-agent response missing 'field' for set_config".into()
+                ));
+            };
+
             validate_node_exists(ir, &node, None)?;
             // Validate that this node.field is a declared tunable
             let path = vec![node.clone(), field.clone()];
