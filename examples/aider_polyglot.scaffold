@@ -41,7 +41,7 @@ node fix_code: prompt {
 node eval_exercise: tool {
     in: { code: string, exercise_dir: string, language: string }
     out: string
-    shell: "python3 tools/eval_exercise.py --exercise-dir \"{{exercise_dir}}\" --language \"{{language}}\" <<'SCAFFOLD_HEREDOC_7f3a'\n{{code}}\nSCAFFOLD_HEREDOC_7f3a"
+    shell: ".venv/bin/python3 tools/eval_exercise.py --exercise-dir \"{{exercise_dir}}\" --language \"{{language}}\" <<'SCAFFOLD_HEREDOC_7f3a'\n{{code}}\nSCAFFOLD_HEREDOC_7f3a"
     timeout: 120
 }
 
@@ -103,5 +103,5 @@ objective aider_polyglot {
         fix_code.temperature in [0.0, 0.2, 0.5]
     }
 
-    topology { mutations: [set_config] max_nodes: 6 target_score: 0.9 }
+    topology { mutations: [set_config, insert_step, remove_step, replace_component] max_nodes: 8 target_score: 0.9 }
 }

@@ -54,6 +54,10 @@ pub struct AppState {
     pub meta_thinking: bool,
     /// Models used by harness nodes.
     pub harness_models: Vec<String>,
+    /// Last meta-agent context size (estimated tokens).
+    pub meta_context_tokens: Option<usize>,
+    /// Failure summarization progress: (done, total). None when not summarizing.
+    pub summarizing: Option<(usize, usize)>,
 }
 
 impl AppState {
@@ -74,6 +78,8 @@ impl AppState {
             meta_model: None,
             meta_thinking: false,
             harness_models: Vec::new(),
+            meta_context_tokens: None,
+            summarizing: None,
         }
     }
 
@@ -164,6 +170,7 @@ impl AppState {
             }
             OptEvent::EvaluationStarted { candidate_id, total_cases } => {
                 self.meta_thinking = false;
+                self.summarizing = None;
                 self.eval_progress = Some(EvalProgress {
                     candidate_id,
                     cases_done: 0,
@@ -240,10 +247,11 @@ impl AppState {
             OptEvent::MutationSkipped { reason } => {
                 self.push_log(format!("Mutation skipped: {}", reason), LogKind::Skip);
             }
-            OptEvent::MetaProposal { reasoning, mutation_label } => {
+            OptEvent::MetaProposal { reasoning, mutation_label, context_tokens } => {
                 self.meta_thinking = false;
+                self.meta_context_tokens = Some(context_tokens);
                 self.push_log(
-                    format!("Meta-agent: {} [{}]", reasoning, mutation_label),
+                    format!("Meta-agent: {} [{}] [ctx: ~{}k tok]", reasoning, mutation_label, context_tokens / 1000),
                     LogKind::MetaAgent,
                 );
             }
@@ -280,6 +288,13 @@ impl AppState {
             }
             OptEvent::Log { message } => {
                 self.push_log(message, LogKind::Normal);
+            }
+            OptEvent::SummarizingFailures { done, total } => {
+                self.summarizing = if done >= total {
+                    None
+                } else {
+                    Some((done, total))
+                };
             }
         }
     }

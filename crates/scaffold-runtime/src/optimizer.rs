@@ -54,13 +54,14 @@ pub enum OptEvent {
         case_id: Option<String>,
     },
     MutationSkipped { reason: String },
-    MetaProposal { reasoning: String, mutation_label: String },
+    MetaProposal { reasoning: String, mutation_label: String, context_tokens: usize },
     EarlyStopped { score: f64, target: f64 },
     Completed { objective_name: String, best_score: Option<f64>, total_candidates: usize },
     Log { message: String },
     MetaAgentActive { model: String },
     MetaAgentThinking,
     HarnessInfo { models: Vec<String> },
+    SummarizingFailures { done: usize, total: usize },
 }
 
 /// Optimizer phase.
@@ -130,6 +131,8 @@ pub struct CaseResult {
     pub passed: bool,
     /// Per-checker results for this case.
     pub checker_results: Vec<(String, bool)>,
+    /// Truncated graph output for failed cases (so the meta-agent can see *why* it failed).
+    pub output_excerpt: Option<String>,
 }
 
 /// A candidate in the search archive.
@@ -297,6 +300,20 @@ pub async fn optimize(
 
     // Load dataset
     let dataset = load_dataset_from_spec(&objective.dataset)?;
+
+    // Notify TUI of harness models and meta-agent early so the UI
+    // reflects them from the very first frame (including during seeding).
+    {
+        let mut models: Vec<String> = ir.nodes.iter()
+            .filter_map(|n| n.config.model.clone())
+            .collect();
+        models.sort();
+        models.dedup();
+        emit(options, OptEvent::HarnessInfo { models });
+    }
+    if let Some(ref model) = options.meta_model {
+        emit(options, OptEvent::MetaAgentActive { model: model.clone() });
+    }
 
     match options.backend {
         OptimizationBackend::Grid => {
@@ -818,7 +835,28 @@ async fn evaluate_candidate(
     let futs = dataset.iter().enumerate().map(|(idx, case)| {
         let input = case.input.clone();
         async move {
-            let result = executor_ref.execute_graph(graph_name, input).await;
+            // Retry transient API errors (HTTP 5xx, rate limits, timeouts) up to 2 times
+            let mut result = executor_ref.execute_graph(graph_name, input.clone()).await;
+            for retry in 0..2 {
+                if let Err(ref e) = result {
+                    let msg = e.to_string().to_lowercase();
+                    let is_transient = msg.contains("http")
+                        || msg.contains("429")
+                        || msg.contains("500")
+                        || msg.contains("502")
+                        || msg.contains("503")
+                        || msg.contains("504")
+                        || msg.contains("rate")
+                        || msg.contains("timed out")
+                        || msg.contains("connection");
+                    if is_transient {
+                        tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(retry + 1))).await;
+                        result = executor_ref.execute_graph(graph_name, input.clone()).await;
+                        continue;
+                    }
+                }
+                break;
+            }
             (idx, result)
         }
     });
@@ -829,7 +867,7 @@ async fn evaluate_candidate(
         let case = &dataset[idx];
         completed += 1;
 
-        let (passed, checker_bits) = match result {
+        let (passed, checker_bits, output_excerpt) = match result {
             Ok(output) => {
                 let mut primary_pass = true;
                 let mut all_pass = !objective.checkers.is_empty();
@@ -845,22 +883,57 @@ async fn evaluate_candidate(
                     }
                 }
                 let p = if primary_checker.is_some() { primary_pass } else { all_pass };
-                (p, bits)
+                // Log failed cases with truncated output for debugging
+                let excerpt = if !p {
+                    let out_str = output.to_string();
+                    let truncated = if out_str.len() > 300 {
+                        format!("{}...", &out_str[..300])
+                    } else {
+                        out_str.clone()
+                    };
+                    emit(options, OptEvent::Log {
+                        message: format!(
+                            "Case {} FAILED — output: {}",
+                            case.id.as_deref().unwrap_or("?"),
+                            truncated,
+                        ),
+                    });
+                    // Extract test_output from JSON if possible (avoids meta-agent
+                    // wasting context on the JSON wrapper)
+                    let useful = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&out_str) {
+                        json.get("test_output")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or(out_str.clone())
+                    } else {
+                        out_str.clone()
+                    };
+                    let max_len = 1500;
+                    if useful.len() > max_len {
+                        Some(format!("{}...", &useful[..max_len]))
+                    } else {
+                        Some(useful)
+                    }
+                } else {
+                    None
+                };
+                (p, bits, excerpt)
             }
             Err(e) => {
                 // Log graph execution errors so template / rendering failures
                 // are visible instead of silently scoring 0.
+                let err_str = format!("execution error: {}", e);
                 emit(options, OptEvent::Log {
                     message: format!(
-                        "Case {} execution error: {}",
+                        "Case {} {}",
                         case.id.as_deref().unwrap_or("?"),
-                        e,
+                        err_str,
                     ),
                 });
                 let bits: Vec<_> = objective.checkers.iter()
                     .map(|c| (c.name.clone(), false))
                     .collect();
-                (false, bits)
+                (false, bits, Some(err_str))
             }
         };
 
@@ -869,11 +942,12 @@ async fn evaluate_candidate(
         }
 
         // Only store failed cases (capped) — these are what the meta-agent learns from.
-        if !passed && case_results.len() < 30 {
+        if !passed {
             case_results.push(CaseResult {
                 case_id: case.id.clone(),
                 passed,
                 checker_results: checker_bits,
+                output_excerpt,
             });
         }
 
@@ -927,6 +1001,79 @@ pub fn eval_checker_expr(
         Ok(Value::Int(i)) => i as f64,
         _ => 0.0,
     }
+}
+
+/// Summarize verbose failure outputs using a small, cheap LLM.
+///
+/// Each failed case's `output_excerpt` (raw pytest/test output, up to 1500 chars)
+/// is sent to gpt-4o-mini for extraction of key failure lines. The returned Vec
+/// has the same length as `case_results`; entries are `Some(summary)` on success,
+/// `None` if the LLM call fails (we keep the original excerpt in that case).
+async fn summarize_failure_outputs(
+    case_results: &[CaseResult],
+    options: &OptimizationOptions,
+) -> Vec<Option<String>> {
+    use futures::stream::{self, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SUMMARIZER_MODEL: &str = "gpt-4o-mini";
+    const MAX_CONCURRENT: usize = 10;
+
+    let done_count = AtomicUsize::new(0);
+    let total = case_results.len();
+
+    let futs = case_results.iter().enumerate().map(|(idx, case)| {
+        let excerpt = case.output_excerpt.clone();
+        let done_ref = &done_count;
+        async move {
+            let raw = match excerpt {
+                Some(ref s) if !s.is_empty() => s.as_str(),
+                _ => {
+                    let completed = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit(options, OptEvent::SummarizingFailures { done: completed, total });
+                    return (idx, None);
+                }
+            };
+            // Skip short outputs — they're already concise enough
+            if raw.len() < 200 {
+                let completed = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                emit(options, OptEvent::SummarizingFailures { done: completed, total });
+                return (idx, None);
+            }
+            let prompt = format!(
+                "You are compressing failure logs from an evolutionary prompt optimization run. \
+                 Each log is a test/evaluation output from a candidate solution. \
+                 Your compressed output will be fed to a meta-agent LLM that uses this history \
+                 to decide which mutations to propose next.\n\n\
+                 Extract ONLY the information useful for the meta-agent:\n\
+                 - Assertion errors with expected vs actual values\n\
+                 - Exception names and error messages\n\
+                 - Failing test names\n\
+                 - Any pattern that reveals WHY the candidate failed\n\n\
+                 Drop stack traces, file paths, and boilerplate. \
+                 Output just the compressed failure summary, nothing else.\n\n{}",
+                raw
+            );
+            let config = crate::llm::LlmConfig::new()
+                .with_model(SUMMARIZER_MODEL)
+                .with_temperature(0.0)
+                .with_max_tokens(400);
+            let result = match crate::llm::query_with_config(&prompt, &config).await {
+                Ok(summary) => (idx, Some(summary.trim().to_string())),
+                Err(_) => (idx, None),
+            };
+            let completed = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
+            emit(options, OptEvent::SummarizingFailures { done: completed, total });
+            result
+        }
+    });
+
+    let mut results = vec![None; case_results.len()];
+    let mut stream = stream::iter(futs).buffer_unordered(MAX_CONCURRENT);
+    while let Some((idx, summary)) = stream.next().await {
+        results[idx] = summary;
+    }
+    results
 }
 
 // ── Grid Search ──
@@ -1078,19 +1225,6 @@ async fn run_evolutionary_into(
 
     let topology = objective.topology.as_ref();
     let target_score = topology.and_then(|t| t.target_score);
-
-    // Notify TUI of harness models and meta-agent
-    {
-        let mut models: Vec<String> = ir.nodes.iter()
-            .filter_map(|n| n.config.model.clone())
-            .collect();
-        models.sort();
-        models.dedup();
-        emit(options, OptEvent::HarnessInfo { models });
-    }
-    if let Some(ref model) = options.meta_model {
-        emit(options, OptEvent::MetaAgentActive { model: model.clone() });
-    }
 
     // ── Phase 1: Seed candidates (uncapped) ──
     // The original graph is always the first seed.
@@ -1264,26 +1398,97 @@ async fn run_evolutionary_into(
         let (mutation, meta_reasoning) = if let Some(ref meta_model) = options.meta_model {
             emit(options, OptEvent::MetaAgentThinking);
             // Clone parent for the meta-agent (borrow released)
-            let parent_clone = parent.clone();
+            let mut parent_clone = parent.clone();
+
+            // Lazy compression: estimate context size and compress failure
+            // outputs only if context would exceed the model's window.
+            // Context now includes ALL candidates' failure excerpts, so compress
+            // the entire archive when budget is exceeded.
+            let est_ctx_chars = crate::meta_agent::estimate_context_chars(
+                &parent_clone, archive, ir, objective, &allowed_mutations,
+            );
+            let ctx_budget_chars = 400_000; // ~100k tokens
+            if est_ctx_chars > ctx_budget_chars {
+                // Collect all case_results that need summarizing across the archive + parent
+                let mut all_excerpts: Vec<(usize, usize, String)> = Vec::new(); // (candidate_idx, case_idx, excerpt)
+                for (ci, cand) in archive.candidates.iter().enumerate() {
+                    for (ki, case) in cand.case_results.iter().enumerate() {
+                        if let Some(ref exc) = case.output_excerpt {
+                            if exc.len() > 300 {
+                                all_excerpts.push((ci, ki, exc.clone()));
+                            }
+                        }
+                    }
+                }
+                // Also include parent clone's case results
+                for (ki, case) in parent_clone.case_results.iter().enumerate() {
+                    if let Some(ref exc) = case.output_excerpt {
+                        if exc.len() > 300 {
+                            all_excerpts.push((usize::MAX, ki, exc.clone()));
+                        }
+                    }
+                }
+
+                if !all_excerpts.is_empty() {
+                    let total = all_excerpts.len();
+                    emit(options, OptEvent::SummarizingFailures { done: 0, total });
+
+                    // Build fake CaseResults for the summarizer
+                    let fake_cases: Vec<CaseResult> = all_excerpts.iter()
+                        .map(|(_, _, exc)| CaseResult {
+                            case_id: None, passed: false, checker_results: vec![],
+                            output_excerpt: Some(exc.clone()),
+                        })
+                        .collect();
+                    let summaries = summarize_failure_outputs(&fake_cases, options).await;
+                    let mut summarized = 0usize;
+                    for (idx, summary) in summaries.into_iter().enumerate() {
+                        if let Some(s) = summary {
+                            let (ci, ki, _) = &all_excerpts[idx];
+                            if *ci == usize::MAX {
+                                parent_clone.case_results[*ki].output_excerpt = Some(s);
+                            } else {
+                                archive.candidates[*ci].case_results[*ki].output_excerpt = Some(s);
+                            }
+                            summarized += 1;
+                        }
+                    }
+                    if summarized > 0 {
+                        emit(options, OptEvent::Log {
+                            message: format!(
+                                "Compressed {}/{} failure logs across archive (ctx was ~{}k chars, budget {}k)",
+                                summarized, total,
+                                est_ctx_chars / 1000, ctx_budget_chars / 1000,
+                            ),
+                        });
+                    }
+                }
+            }
+
             let meta = crate::meta_agent::MetaAgent::new(meta_model);
             match meta
                 .propose_mutation(&parent_clone, archive, ir, objective, &allowed_mutations)
                 .await
             {
                 Ok(proposal) => {
+                    // Estimate tokens: ~4 chars per token (system + context)
+                    let total_chars = proposal.context_chars + proposal.system_chars;
+                    let est_tokens = total_chars / 4;
                     emit(
                         options,
                         OptEvent::MetaProposal {
                             reasoning: proposal.reasoning.clone(),
                             mutation_label: proposal.mutation.short_label(),
+                            context_tokens: est_tokens,
                         },
                     );
                     emit(
                         options,
                         OptEvent::Log {
                             message: format!(
-                                "Meta-agent: {} ({})",
-                                proposal.reasoning, proposal.mutation.short_label()
+                                "Meta-agent: {} ({}) [ctx: ~{}k tokens]",
+                                proposal.reasoning, proposal.mutation.short_label(),
+                                est_tokens / 1000,
                             ),
                         },
                     );
@@ -1321,13 +1526,10 @@ async fn run_evolutionary_into(
                     emit(
                         options,
                         OptEvent::Log {
-                            message: format!(
-                                "Meta-agent failed: {}, falling back to random",
-                                e
-                            ),
+                            message: format!("Meta-agent exhausted retries: {}", e),
                         },
                     );
-                    (generate_random_mutation(&parent_graph, ir, &allowed_mutations, &objective.tunables, &mut rng), None)
+                    continue; // skip this generation attempt
                 }
             }
         } else {

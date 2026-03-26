@@ -10,7 +10,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Gauge};
+use ratatui::widgets::{Block, Borders, Gauge, LineGauge};
 use ratatui::Terminal;
 
 use scaffold_runtime::{HierarchicalReport, OptEvent};
@@ -154,16 +154,30 @@ fn run_loop(
 
 fn draw_ui(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
+    let has_meta = state.meta_model.is_some();
 
-    // Top 55%, progress bar 3 lines, bottom rest
-    let main_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(55),
-            Constraint::Length(3),
-            Constraint::Min(5),
-        ])
-        .split(area);
+    // Top 55%, progress bar 3 lines, optional meta context 1 line, bottom rest
+    let main_layout = if has_meta {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(55),
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Min(5),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(55),
+                Constraint::Length(3),
+                Constraint::Length(0),
+                Constraint::Min(5),
+            ])
+            .split(area)
+    };
 
     // Top row: lineage 50% | chart 50%
     let top_layout = Layout::default()
@@ -183,10 +197,16 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
     let gauge = render_progress(state);
     frame.render_widget(gauge, main_layout[1]);
 
+    // Render meta-agent context bar (persistent when meta-model is active)
+    if has_meta {
+        let ctx_bar = render_meta_context(state);
+        frame.render_widget(ctx_bar, main_layout[2]);
+    }
+
     // Render log panel
-    let log_height = main_layout[2].height as usize;
+    let log_height = main_layout[3].height as usize;
     let log_widget = log::render_log(state, log_height);
-    frame.render_widget(log_widget, main_layout[2]);
+    frame.render_widget(log_widget, main_layout[3]);
 }
 
 fn render_progress(state: &AppState) -> Gauge<'_> {
@@ -235,6 +255,21 @@ fn render_progress(state: &AppState) -> Gauge<'_> {
                 state.best_score,
                 state.candidates.len()
             ))
+    } else if let Some((done, total)) = state.summarizing {
+        let ratio = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+        Gauge::default()
+            .block(
+                Block::default()
+                    .title(format!(" Compressing failure logs{}{} ",
+                        models_tag,
+                        meta_tag,
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::LightBlue)),
+            )
+            .gauge_style(Style::default().fg(Color::LightBlue).bg(Color::DarkGray))
+            .ratio(ratio.min(1.0))
+            .label(format!("Summarizing {}/{} failures (context too large)", done, total))
     } else if state.meta_thinking {
         Gauge::default()
             .block(
@@ -250,7 +285,7 @@ fn render_progress(state: &AppState) -> Gauge<'_> {
             )
             .gauge_style(Style::default().fg(Color::Magenta).bg(Color::DarkGray))
             .ratio(0.0)
-            .label("Meta-agent proposing mutation...")
+            .label("Meta-agent thinking...")
     } else {
         Gauge::default()
             .block(
@@ -267,5 +302,40 @@ fn render_progress(state: &AppState) -> Gauge<'_> {
             .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
             .ratio(0.0)
             .label("Waiting...")
+    }
+}
+
+fn render_meta_context(state: &AppState) -> LineGauge<'_> {
+    let ctx_window = 128_000usize;
+    match state.meta_context_tokens {
+        Some(tok) => {
+            let ratio = (tok as f64 / ctx_window as f64).min(1.0);
+            let pct = ratio * 100.0;
+            let color = if pct > 80.0 {
+                Color::Red
+            } else if pct > 60.0 {
+                Color::Yellow
+            } else {
+                Color::Magenta
+            };
+            let label = format!(
+                " meta ctx: ~{}k / {}k tok ({:.0}%) ",
+                tok / 1000,
+                ctx_window / 1000,
+                pct,
+            );
+            LineGauge::default()
+                .filled_style(Style::default().fg(color))
+                .unfilled_style(Style::default().fg(Color::DarkGray))
+                .ratio(ratio)
+                .label(label)
+        }
+        None => {
+            LineGauge::default()
+                .filled_style(Style::default().fg(Color::DarkGray))
+                .unfilled_style(Style::default().fg(Color::DarkGray))
+                .ratio(0.0)
+                .label(" meta ctx: waiting for first proposal ")
+        }
     }
 }

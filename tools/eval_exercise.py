@@ -62,7 +62,7 @@ def get_test_command(language):
     # type: (str) -> List[str]
     """Get the test command for a given language."""
     commands = {
-        "python": ["python3", "-m", "pytest", "-x", "--tb=short", "--no-header", "-q"],
+        "python": [sys.executable, "-m", "pytest", "-x", "--tb=short", "--no-header", "-q"],
         "rust": ["cargo", "test", "--", "--include-ignored"],
         "go": ["go", "test", "./..."],
         "javascript": ["npx", "jest", "--no-coverage"],

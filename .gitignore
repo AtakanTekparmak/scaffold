@@ -14,6 +14,7 @@ openai_usage.log
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # External repos (cloned for benchmarks)
 polyglot-benchmark/

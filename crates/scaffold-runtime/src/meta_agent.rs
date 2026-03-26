@@ -17,6 +17,9 @@ use crate::optimizer::{Archive, Candidate};
 pub struct MutationProposal {
     pub mutation: Mutation,
     pub reasoning: String,
+    /// Size of the context sent to the meta-agent (chars / estimated tokens).
+    pub context_chars: usize,
+    pub system_chars: usize,
 }
 
 /// The meta-agent: an LLM-based mutation proposer.
@@ -32,6 +35,10 @@ impl MetaAgent {
     }
 
     /// Propose a mutation given the parent candidate, archive, IR, and objective.
+    ///
+    /// Retries up to `MAX_RETRIES` times, feeding validation errors and
+    /// deduplication warnings back into the context so the meta-agent can
+    /// self-correct. Never falls back to random mutations.
     pub async fn propose_mutation(
         &self,
         parent: &Candidate,
@@ -40,15 +47,79 @@ impl MetaAgent {
         objective: &ObjectiveIR,
         allowed_mutations: &[String],
     ) -> Result<MutationProposal> {
-        let context = build_context(parent, archive, ir, objective, allowed_mutations);
+        const MAX_RETRIES: usize = 10;
+
+        let base_context = build_context(parent, archive, ir, objective, allowed_mutations);
+        let context_chars = base_context.len();
+        let system_chars = SYSTEM_PROMPT.len();
         let llm_config = LlmConfig::new()
             .with_model(&self.model)
             .with_temperature(0.7)
             .with_system_prompt(SYSTEM_PROMPT);
 
-        let response = llm::query_with_config(&context, &llm_config).await?;
+        let mut errors: Vec<String> = Vec::new();
+        let mut seen_labels: Vec<String> = Vec::new();
 
-        parse_proposal(&response, ir, &parent.graph, objective, allowed_mutations)
+        for attempt in 0..=MAX_RETRIES {
+            let context = if errors.is_empty() {
+                base_context.clone()
+            } else {
+                let mut ctx = base_context.clone();
+                ctx.push_str("\n\n## Previous Proposal Errors (FIX THESE)\n");
+                ctx.push_str("Your previous proposals were REJECTED. You MUST propose something different.\n");
+                for (i, err) in errors.iter().enumerate() {
+                    ctx.push_str(&format!("{}. {}\n", i + 1, err));
+                }
+                ctx.push_str("\nDo NOT repeat any of the rejected proposals. Choose a completely different mutation.\n");
+                ctx
+            };
+
+            let response = llm::query_with_config(&context, &llm_config).await?;
+
+            match parse_proposal(&response, ir, &parent.graph, objective, allowed_mutations) {
+                Ok(mut proposal) => {
+                    // Deduplication: reject if same label was already proposed in this retry sequence
+                    let label = proposal.mutation.short_label();
+                    if seen_labels.contains(&label) {
+                        errors.push(format!(
+                            "DUPLICATE: you already proposed '{}' which was rejected. Try a DIFFERENT mutation kind or target.",
+                            label,
+                        ));
+                        continue;
+                    }
+                    seen_labels.push(label);
+
+                    // Validate mutation can be applied
+                    match crate::mutations::apply_mutation(&parent.graph, &proposal.mutation, ir) {
+                        crate::mutations::MutationResult::Ok(_) => {
+                            proposal.context_chars = context_chars;
+                            proposal.system_chars = system_chars;
+                            return Ok(proposal);
+                        }
+                        crate::mutations::MutationResult::Skipped(reason) => {
+                            errors.push(format!(
+                                "Mutation '{}' failed to apply: {}",
+                                proposal.mutation.short_label(), reason,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt == MAX_RETRIES {
+                        return Err(e);
+                    }
+                    errors.push(format!("Parse/validation error: {}", e));
+                    continue;
+                }
+            }
+        }
+
+        Err(Error::Runtime(format!(
+            "meta-agent failed after {} retries: {}",
+            MAX_RETRIES,
+            errors.last().unwrap_or(&"unknown".to_string()),
+        )))
     }
 }
 
@@ -62,9 +133,9 @@ You can propose exactly ONE mutation as a JSON object with these fields:
 STRUCTURAL mutations:
 - {"kind":"insert_verify","after_step":"<step>","verify_node":"<node>","max_retries":<n>,"reasoning":"..."} (verify_node MUST be a node of kind "verify", NOT prompt/tool/agent)
 - {"kind":"wrap_retry","step":"<step>","verify_node":"<node>","max_retries":<n>,"reasoning":"..."} (verify_node MUST be a node of kind "verify", NOT prompt/tool/agent)
-- {"kind":"insert_step","after_step":"<step>","new_step_name":"<name>","node":"<node>","reasoning":"..."}
-- {"kind":"remove_step","step":"<step>","reasoning":"..."}
-- {"kind":"replace_component","step":"<step>","new_node":"<node>","reasoning":"..."}
+- {"kind":"insert_step","after_step":"<step>","new_step_name":"<name>","node":"<node>","reasoning":"..."} — the new step receives the output of after_step as its single positional argument. Best for nodes that accept a single input (e.g. tool nodes). For multi-input prompt nodes, use replace_component instead.
+- {"kind":"remove_step","step":"<step>","reasoning":"..."} — removes a step; downstream steps referencing it will break, so only remove steps whose output is not used by other steps.
+- {"kind":"replace_component","step":"<step>","new_node":"<node>","reasoning":"..."} — swaps which node a step invokes while keeping the same wiring. The new node must accept the same argument names.
 - {"kind":"set_config","node":"<node>","field":"<field>","value":<json_value>,"reasoning":"..."}
 
 PROMPT mutations:
@@ -91,6 +162,20 @@ Consider:
 - Make incremental changes to prompts rather than full rewrites when possible
 
 Return ONLY a single JSON object. No markdown, no explanation outside the JSON."#;
+
+/// Estimate the total context size (in chars) that would be sent to the meta-agent.
+/// Used to decide whether lazy compression of failure logs is needed.
+pub fn estimate_context_chars(
+    parent: &Candidate,
+    archive: &Archive,
+    ir: &ScaffoldIR,
+    objective: &ObjectiveIR,
+    allowed_mutations: &[String],
+) -> usize {
+    // Building the full string is cheap (no I/O), so just measure it directly.
+    let ctx = build_context(parent, archive, ir, objective, allowed_mutations);
+    ctx.len() + SYSTEM_PROMPT.len()
+}
 
 /// Build the context string sent to the meta-agent LLM.
 fn build_context(
@@ -256,6 +341,7 @@ fn build_context(
 
         if !catastrophic.is_empty() || !regressions.is_empty() {
             ctx.push_str("## Mutation History — AVOID REPEATING FAILURES\n");
+            // Always show all catastrophic failures (most important signal)
             if !catastrophic.is_empty() {
                 ctx.push_str("**The following mutations caused catastrophic score drops. DO NOT propose similar mutations:**\n");
                 for line in &catastrophic {
@@ -263,9 +349,15 @@ fn build_context(
                     ctx.push('\n');
                 }
             }
+            // Sliding window: only show the 10 most recent regressions
             if !regressions.is_empty() {
-                ctx.push_str("Regressions (score dropped significantly):\n");
-                for line in &regressions {
+                let skip = regressions.len().saturating_sub(10);
+                if skip > 0 {
+                    ctx.push_str(&format!("Regressions ({} most recent of {}):\n", regressions.len() - skip, regressions.len()));
+                } else {
+                    ctx.push_str("Regressions (score dropped significantly):\n");
+                }
+                for line in regressions.iter().skip(skip) {
                     ctx.push_str(line);
                     ctx.push('\n');
                 }
@@ -315,6 +407,69 @@ fn build_context(
         }
     }
 
+    // 3.7 All candidate evaluations — full learning trajectory for meta-agent.
+    // Shows every non-seed candidate with failure details. Lazy compression in
+    // the optimizer will summarize excerpts if the total context gets too large.
+    {
+        let evaluated: Vec<&Candidate> = archive
+            .candidates
+            .iter()
+            .filter(|c| c.score.is_some() && !c.mutations.is_empty())
+            .collect();
+        if !evaluated.is_empty() {
+            ctx.push_str("## Candidate Evaluation History (oldest → newest)\n");
+            ctx.push_str("Full history of what was tried and how it affected pass/fail patterns.\n\n");
+            for c in &evaluated {
+                let score = c.score.unwrap_or(0.0);
+                let last_mut = c.mutations.last().map(|m| m.short_label()).unwrap_or_default();
+                let parent_score = c.parent_id
+                    .and_then(|pid| archive.candidates.iter().find(|p| p.id == pid))
+                    .and_then(|p| p.score)
+                    .unwrap_or(0.0);
+                let delta = score - parent_score;
+                let delta_str = if delta > 0.0 {
+                    format!("+{:.4}", delta)
+                } else {
+                    format!("{:.4}", delta)
+                };
+
+                ctx.push_str(&format!(
+                    "### Candidate #{} — score={:.4} (delta={}) mutation=[{}]\n",
+                    c.id, score, delta_str, last_mut,
+                ));
+
+                if !c.case_results.is_empty() {
+                    let failed_ids: Vec<&str> = c.case_results.iter()
+                        .map(|cr| cr.case_id.as_deref().unwrap_or("?"))
+                        .collect();
+                    ctx.push_str(&format!(
+                        "  {}/{} passed, {} failed: [{}]\n",
+                        c.cases_passed, c.total_cases,
+                        c.total_cases - c.cases_passed,
+                        failed_ids.join(", "),
+                    ));
+
+                    // Full failure excerpts — lazy compression handles size
+                    for case in &c.case_results {
+                        let id = case.case_id.as_deref().unwrap_or("?");
+                        if let Some(ref excerpt) = case.output_excerpt {
+                            ctx.push_str(&format!(
+                                "    {}: {}\n",
+                                id,
+                                excerpt.replace('\n', "\\n"),
+                            ));
+                        }
+                    }
+                } else {
+                    ctx.push_str(&format!(
+                        "  {}/{} passed\n", c.cases_passed, c.total_cases,
+                    ));
+                }
+                ctx.push('\n');
+            }
+        }
+    }
+
     // 4. Parent's evaluation summary + failed cases
     if parent.total_cases > 0 {
         let failed = parent.total_cases - parent.cases_passed;
@@ -338,7 +493,7 @@ fn build_context(
 
         if !parent.case_results.is_empty() {
             ctx.push_str(&format!("Failed cases ({}):\n", parent.case_results.len()));
-            for (i, case) in parent.case_results.iter().take(20).enumerate() {
+            for (i, case) in parent.case_results.iter().enumerate() {
                 let id = case.case_id.as_deref().unwrap_or("?");
                 let checkers: Vec<String> = case.checker_results.iter()
                     .map(|(name, ok)| format!("{}={}", name, if *ok { "PASS" } else { "FAIL" }))
@@ -347,9 +502,10 @@ fn build_context(
                     "  {}. case={} [{}]\n",
                     i + 1, id, checkers.join(", ")
                 ));
-            }
-            if parent.case_results.len() > 20 {
-                ctx.push_str(&format!("  ... and {} more\n", parent.case_results.len() - 20));
+                // Show failure diagnosis (LLM-summarized when available, raw excerpt otherwise)
+                if let Some(ref excerpt) = case.output_excerpt {
+                    ctx.push_str(&format!("     failure: {}\n", excerpt.replace('\n', "\\n")));
+                }
             }
         }
         ctx.push('\n');
@@ -519,6 +675,35 @@ fn find_step_node(stmts: &[GraphStmtIR], step_name: &str) -> Option<String> {
     None
 }
 
+/// Collect the named argument names from a step in the graph.
+fn find_step_named_args(stmts: &[GraphStmtIR], step_name: &str) -> Vec<String> {
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.name == step_name => {
+                return s.args.iter().filter_map(|a| {
+                    if let StepArgIR::Named { name, .. } = a { Some(name.clone()) } else { None }
+                }).collect();
+            }
+            GraphStmtIR::Loop(l) => {
+                let r = find_step_named_args(&l.body, step_name);
+                if !r.is_empty() { return r; }
+            }
+            GraphStmtIR::If(i) => {
+                let r = find_step_named_args(&i.then_body, step_name);
+                if !r.is_empty() { return r; }
+                let r = find_step_named_args(&i.else_body, step_name);
+                if !r.is_empty() { return r; }
+            }
+            GraphStmtIR::Parallel(p) => {
+                let r = find_step_named_args(&p.body, step_name);
+                if !r.is_empty() { return r; }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
 /// Parse the LLM response into a MutationProposal.
 fn parse_proposal(
     response: &str,
@@ -605,6 +790,27 @@ fn parse_proposal(
             let new_node = require_str(&json, "new_node")?;
             validate_step_exists(parent_graph, &step)?;
             validate_node_exists(ir, &new_node, None)?;
+            // Validate input compatibility: the new node's required input fields
+            // must be satisfiable by the step's existing named arguments.
+            if let Some(node_ir) = ir.nodes.iter().find(|n| n.name == new_node) {
+                let required_fields = resolve_input_fields(ir, node_ir);
+                if !required_fields.is_empty() {
+                    let step_args = find_step_named_args(&parent_graph.body, &step);
+                    let missing: Vec<&String> = required_fields.iter()
+                        .filter(|f| !step_args.contains(f))
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(Error::Runtime(format!(
+                            "replace_component: node '{}' requires input fields [{}] but step '{}' only provides [{}]. Missing: [{}]",
+                            new_node,
+                            required_fields.join(", "),
+                            step,
+                            step_args.join(", "),
+                            missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                        )));
+                    }
+                }
+            }
             Mutation::ReplaceComponent { step, new_node }
         }
         "set_config" => {
@@ -696,6 +902,8 @@ fn parse_proposal(
     Ok(MutationProposal {
         mutation,
         reasoning,
+        context_chars: 0,
+        system_chars: 0,
     })
 }
 
