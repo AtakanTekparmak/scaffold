@@ -211,13 +211,21 @@ RULES:
 
 6. Content mutations (rewrite_prompt, rewrite_system, rewrite_shell, set_config) change a single node's behavior. Use when the graph structure is sound but a node's output is wrong — format, constraints, instructions.
 
-7. Structural mutations (edit_graph) change the graph's topology. Use when the problem needs a different execution strategy. The full DSL is available: loops with carry for iterative refinement, parallel fan-out for concurrent alternatives, verify nodes as quality gates, choose blocks for optimizer-searchable alternatives, new tool/prompt nodes for preprocessing or validation.
+7. Structural mutations (edit_graph) change the graph's topology. Think of the graph as a circuit — you can build complex feedback systems, not just linear pipelines. Design patterns to consider:
+   - Loops with carry: iterative refinement where each pass feeds back into the next (e.g., generate → evaluate → refine → re-evaluate, carrying improved state)
+   - Verify gates: LLM-based quality checks that route to different paths based on output quality
+   - Parallel fan-out: run concurrent strategies and pick the best result via a reduce node
+   - Decomposition: split a monolithic node into smaller specialized nodes (analysis → planning → execution → validation), each with a focused prompt that's independently optimizable
+   - Choose blocks: let the optimizer search between alternative subgraph designs
+   - Feedback loops: a verify or eval node's output feeds back as input to a retry path, creating closed-loop error correction
 
-8. Node type constraints: rewrite_prompt and rewrite_system apply ONLY to prompt/agent/verify nodes. rewrite_shell applies ONLY to tool nodes. Check "Available Nodes" for types.
+8. Prefer multi-node circuits over monolithic nodes. If a single node is doing too much and failing, decompose it. Smaller nodes with focused tasks compose better and give the optimizer more levers to tune. Use edit_graph with new_nodes to introduce specialized nodes.
 
-9. For rewrite_prompt, provide the COMPLETE template including all {{ variable }} references from the original. You may change prose, formatting, and structure freely.
+9. Node type constraints: rewrite_prompt and rewrite_system apply ONLY to prompt/agent/verify nodes. rewrite_shell applies ONLY to tool nodes. Check "Available Nodes" for types.
 
-10. For edit_graph, write valid .scaffold DSL. The graph must keep the same name, input type, and output type. Preserved steps (from topology) must still exist. All referenced nodes must be defined. Respect the max_nodes topology constraint.
+10. For rewrite_prompt, provide the COMPLETE template including all {{ variable }} references from the original. You may change prose, formatting, and structure freely.
+
+11. For edit_graph, write valid .scaffold DSL. The graph must keep the same name, input type, and output type. Preserved steps (from topology) must still exist. All referenced nodes must be defined. Respect the max_nodes topology constraint.
 
 Return ONLY a single JSON object. No markdown, no explanation outside the JSON."#;
 
