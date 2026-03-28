@@ -59,10 +59,11 @@ impl MetaAgent {
         ir: &ScaffoldIR,
         objective: &ObjectiveIR,
         allowed_mutations: &[String],
+        epoch_start_id: Option<usize>,
     ) -> Result<MutationProposal> {
         const MAX_RETRIES: usize = 10;
 
-        let base_context = build_context(parent, archive, ir, objective, allowed_mutations);
+        let base_context = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id);
         let system_chars = SYSTEM_PROMPT.len();
         let llm_config = LlmConfig::new()
             .with_model(&self.model)
@@ -221,11 +222,18 @@ RULES:
 
 8. Prefer multi-node circuits over monolithic nodes. If a single node is doing too much and failing, decompose it. Smaller nodes with focused tasks compose better and give the optimizer more levers to tune. Use edit_graph with new_nodes to introduce specialized nodes.
 
-9. Node type constraints: rewrite_prompt and rewrite_system apply ONLY to prompt/agent/verify nodes. rewrite_shell applies ONLY to tool nodes. Check "Available Nodes" for types.
+9. Tool nodes are powerful levers. When prompt rewrites stagnate (3+ attempts on the same node with no improvement), consider tool-based interventions:
+   - rewrite_shell: modify an existing tool node's shell command — change parameters, flags, output format, add pre/post-processing pipelines
+   - edit_graph with new tool nodes: add shell-based steps for validation (syntax check, linting), formatting (auto-formatter), pre-processing (data extraction, parsing), or post-processing (output cleanup, assertion checks)
+   - Tool nodes can run any shell command available on the system. Use shell pipelines, heredocs for stdin, and template variables ({{var}}) for dynamic inputs
+   - Example new tool node: `node check_syntax: tool { in: { code: string } out: string shell: "python3 -c 'import ast; ast.parse(open(\"/dev/stdin\").read()); print(\"OK\")' <<'EOF'\n{{code}}\nEOF" }`
+   Think of tools as "deterministic guarantees" — a syntax checker never hallucinates, a formatter always produces valid output. When LLM nodes are unreliable, add tool nodes to catch or fix their failures.
 
-10. For rewrite_prompt, provide the COMPLETE template including all {{ variable }} references from the original. You may change prose, formatting, and structure freely.
+10. Node type constraints: rewrite_prompt and rewrite_system apply ONLY to prompt/agent/verify nodes. rewrite_shell applies ONLY to tool nodes. Check "Available Nodes" for types.
 
-11. For edit_graph, write valid .scaffold DSL. The graph must keep the same name, input type, and output type. Preserved steps (from topology) must still exist. All referenced nodes must be defined. Respect the max_nodes topology constraint.
+11. For rewrite_prompt, provide the COMPLETE template including all {{ variable }} references from the original. You may change prose, formatting, and structure freely.
+
+12. For edit_graph, write valid .scaffold DSL. The graph must keep the same name, input type, and output type. Preserved steps (from topology) must still exist. All referenced nodes must be defined. Respect the max_nodes topology constraint.
 
 Return ONLY a single JSON object. No markdown, no explanation outside the JSON."#;
 
@@ -324,6 +332,40 @@ Builtins: `len(x)`, `contains(h,n)`, `str(x)`, `int(x)`, `float(x)`, `lower(s)`,
 Variables: `{{ field_name }}`, `{{ input.nested }}`
 Loops: `{% for item in list %}...{% endfor %}`
 Raw blocks: `{% raw %}...{% endraw %}`
+
+### Structural Patterns (examples for edit_graph)
+
+**Iterative refinement loop** — retry with feedback until a quality gate passes:
+```
+step draft = generator(input)
+step eval_result = evaluator(output: draft)
+loop (max: 3, while: json_parse(eval_result).pass == false) {
+    step draft = refiner(input: input, previous: draft, feedback: eval_result)
+    step eval_result = evaluator(output: draft)
+    carry best = draft
+}
+emit best
+```
+
+**Verify gate with fallback** — LLM quality check before committing:
+```
+step result = solver(input)
+step check = quality_checker(output: result, criteria: input)
+if check.pass == false {
+    step result2 = alternative_solver(input: input, feedback: check.reason)
+    emit result2
+} else {
+    emit result
+}
+```
+
+**Decomposed pipeline** — split a complex task into focused stages:
+```
+step analysis = analyzer(input)
+step plan = planner(context: analysis, task: input)
+step result = executor(plan: plan, task: input)
+emit result
+```
 "#;
 
 /// Per-mutation-kind documentation. Keys are the kind strings used in proposals.
@@ -378,21 +420,28 @@ pub fn estimate_context_chars(
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
     allowed_mutations: &[String],
+    epoch_start_id: Option<usize>,
 ) -> usize {
     // Building the full string is cheap (no I/O), so just measure it directly.
-    let ctx = build_context(parent, archive, ir, objective, allowed_mutations);
+    let ctx = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id);
     ctx.len() + SYSTEM_PROMPT.len()
 }
 
 /// Build the context string sent to the meta-agent LLM.
+///
+/// When `epoch_start_id` is set, only candidates with `id >= epoch_start_id` are shown
+/// in the archive, pass/fail matrix, and mutation effects sections. This keeps context
+/// bounded across long runs while the TUI still shows full lineage.
 fn build_context(
     parent: &Candidate,
     archive: &Archive,
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
     allowed_mutations: &[String],
+    epoch_start_id: Option<usize>,
 ) -> String {
     let mut ctx = String::with_capacity(4096);
+    let epoch_start = epoch_start_id.unwrap_or(0);
 
     // 1. Objective summary
     ctx.push_str("## Objective\n");
@@ -508,10 +557,28 @@ fn build_context(
     push_candidate_overrides(&mut ctx, "Selected Candidate Active Overrides", parent);
     ctx.push('\n');
 
-    let lineage = candidate_lineage(archive, parent);
+    let full_lineage = candidate_lineage(archive, parent);
+    // Truncate lineage at epoch boundary — pre-epoch ancestors collapsed to one line
+    let lineage: Vec<&Candidate> = if epoch_start_id.is_some() {
+        full_lineage.iter().copied().filter(|c| c.id >= epoch_start).collect()
+    } else {
+        full_lineage.clone()
+    };
     if !lineage.is_empty() {
         ctx.push_str("## Selected Candidate Lineage\n");
         ctx.push_str("Exact causal path from seed to the selected candidate. Use this to reason about what changed locally.\n\n");
+        // If lineage was truncated, show a one-line summary of the epoch baseline
+        if epoch_start_id.is_some() && full_lineage.len() > lineage.len() {
+            if let Some(first) = lineage.first() {
+                let ancestor_count = full_lineage.len() - lineage.len();
+                ctx.push_str(&format!(
+                    "- (epoch baseline: {} prior ancestors, starting from {} score={:.4})\n",
+                    ancestor_count,
+                    candidate_label(first),
+                    first.score.unwrap_or(0.0),
+                ));
+            }
+        }
         for cand in &lineage {
             ctx.push_str(&format!(
                 "- {} score={:.4} parent={}\n",
@@ -566,8 +633,17 @@ fn build_context(
     }
 
     // 3. Archive summary (top 10 candidates)
-    ctx.push_str("## Archive (top candidates by score)\n");
-    let ranked = archive.ranked();
+    // When epoch filtering is active, only show candidates from the current epoch.
+    let epoch_label = if epoch_start_id.is_some() {
+        format!(" (epoch from #{})", epoch_start)
+    } else {
+        String::new()
+    };
+    ctx.push_str(&format!("## Archive (top candidates by score{})\n", epoch_label));
+    let ranked: Vec<&Candidate> = archive.ranked()
+        .into_iter()
+        .filter(|c| c.id >= epoch_start)
+        .collect();
     for (i, c) in ranked.iter().take(10).enumerate() {
         let mutations_str = if is_seed_candidate(c) {
             "seed".to_string()
@@ -600,7 +676,7 @@ fn build_context(
     {
         let mut all_case_ids: BTreeSet<String> = BTreeSet::new();
         for c in &archive.candidates {
-            if c.score.is_none() {
+            if c.score.is_none() || c.id < epoch_start {
                 continue;
             }
             for id in &c.passed_case_ids {
@@ -617,7 +693,7 @@ fn build_context(
         let mut scored: Vec<&Candidate> = archive
             .candidates
             .iter()
-            .filter(|c| c.score.is_some())
+            .filter(|c| c.score.is_some() && c.id >= epoch_start)
             .collect();
         scored.sort_by_key(|c| c.id);
 
@@ -657,7 +733,7 @@ fn build_context(
         let evaluated: Vec<&Candidate> = archive
             .candidates
             .iter()
-            .filter(|c| c.score.is_some() && !c.mutations.is_empty())
+            .filter(|c| c.score.is_some() && !c.mutations.is_empty() && c.id >= epoch_start)
             .collect();
 
         if !evaluated.is_empty() {
@@ -737,12 +813,15 @@ fn build_context(
             }
 
             // Stagnation warning (inline)
-            let ranked = archive.ranked();
-            let best_score = ranked
+            let epoch_ranked: Vec<&Candidate> = archive.ranked()
+                .into_iter()
+                .filter(|c| c.id >= epoch_start)
+                .collect();
+            let best_score = epoch_ranked
                 .first()
                 .map(|c| c.score.unwrap_or(0.0))
                 .unwrap_or(0.0);
-            let stagnation_count = stagnation_count_after_best(archive);
+            let stagnation_count = stagnation_count_after_best(archive, epoch_start);
             if stagnation_count >= 2 {
                 ctx.push_str(&format!(
                     "⚠ STAGNATION: Best score ({:.4}) unchanged for {} candidates. Try a fundamentally different approach.\n\n",
@@ -755,7 +834,7 @@ fn build_context(
     let failure_clusters = summarize_failure_clusters(parent);
     let repair_behavior = summarize_repair_behavior(parent, ir);
     let structural_pressure =
-        structural_pressure_summary(archive, &failure_clusters, &repair_behavior);
+        structural_pressure_summary(archive, &failure_clusters, &repair_behavior, epoch_start);
 
     if !failure_clusters.is_empty() || parent.total_cases > 0 {
         ctx.push_str("## Failure Decomposition Hints\n");
@@ -1490,13 +1569,17 @@ fn mutation_group_trend(group: &[&Candidate], archive: &Archive) -> MutationTren
     }
 }
 
-fn stagnation_count_after_best(archive: &Archive) -> usize {
-    let ranked = archive.ranked();
-    let best_id = ranked.first().map(|candidate| candidate.id).unwrap_or(0);
+fn stagnation_count_after_best(archive: &Archive, epoch_start: usize) -> usize {
+    let best_id = archive.ranked()
+        .into_iter()
+        .filter(|c| c.id >= epoch_start)
+        .map(|c| c.id)
+        .next()
+        .unwrap_or(0);
     archive
         .candidates
         .iter()
-        .filter(|candidate| candidate.score.is_some() && candidate.id > best_id)
+        .filter(|candidate| candidate.score.is_some() && candidate.id > best_id && candidate.id >= epoch_start)
         .count()
 }
 
@@ -1504,6 +1587,7 @@ fn structural_pressure_summary(
     archive: &Archive,
     clusters: &[FailureClusterSummary],
     repair: &RepairBehaviorSummary,
+    epoch_start: usize,
 ) -> StructuralPressureSummary {
     let mut points = 0usize;
     let mut reasons = Vec::new();
@@ -1533,7 +1617,7 @@ fn structural_pressure_summary(
     let evaluated: Vec<&Candidate> = archive
         .candidates
         .iter()
-        .filter(|candidate| candidate.score.is_some() && !candidate.mutations.is_empty())
+        .filter(|candidate| candidate.score.is_some() && !candidate.mutations.is_empty() && candidate.id >= epoch_start)
         .collect();
     let mut saturated_families = 0usize;
     let mut groups: Vec<(String, Vec<&Candidate>)> = Vec::new();
@@ -1566,7 +1650,7 @@ fn structural_pressure_summary(
         ));
     }
 
-    let stagnation = stagnation_count_after_best(archive);
+    let stagnation = stagnation_count_after_best(archive, epoch_start);
     if stagnation >= 2 {
         points += 1;
         reasons.push(format!(
@@ -3426,6 +3510,7 @@ mod tests {
             &ir,
             &objective,
             &["add_prompt_step".into(), "set_config".into()],
+            None,
         );
 
         assert!(ctx.contains("## Failure Decomposition Hints"));
@@ -3670,6 +3755,7 @@ mod tests {
             &ir,
             &objective,
             &["insert_step".into(), "remove_step".into()],
+            None,
         );
 
         // Should show edit_graph instead of individual structural mutations

@@ -35,6 +35,13 @@ pub struct EvalProgress {
     pub cases_passed: usize,
 }
 
+/// Which panel is focused for keyboard scrolling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FocusPanel {
+    Log,
+    Lineage,
+}
+
 pub struct AppState {
     pub candidates: Vec<CandidateEntry>,
     pub score_history: Vec<(f64, f64)>, // (index as f64, score)
@@ -46,6 +53,9 @@ pub struct AppState {
     pub eval_progress: Option<EvalProgress>,
     pub log_scroll: usize,
     pub user_scrolled: bool,
+    pub lineage_scroll: usize,
+    pub lineage_user_scrolled: bool,
+    pub focus: FocusPanel,
     pub finished: bool,
     pub start_time: Instant,
     /// Meta-agent model name (None = random mutations).
@@ -73,6 +83,9 @@ impl AppState {
             eval_progress: None,
             log_scroll: 0,
             user_scrolled: false,
+            lineage_scroll: 0,
+            lineage_user_scrolled: false,
+            focus: FocusPanel::Log,
             finished: false,
             start_time: Instant::now(),
             meta_model: None,
@@ -345,15 +358,38 @@ impl AppState {
         self.push_log(message, kind);
     }
 
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            FocusPanel::Log => FocusPanel::Lineage,
+            FocusPanel::Lineage => FocusPanel::Log,
+        };
+    }
+
     pub fn scroll_down(&mut self) {
-        self.user_scrolled = true;
-        if self.log_scroll < self.log_entries.len().saturating_sub(1) {
-            self.log_scroll += 1;
+        match self.focus {
+            FocusPanel::Log => {
+                self.user_scrolled = true;
+                if self.log_scroll < self.log_entries.len().saturating_sub(1) {
+                    self.log_scroll += 1;
+                }
+            }
+            FocusPanel::Lineage => {
+                self.lineage_user_scrolled = true;
+                self.lineage_scroll += 1;
+            }
         }
     }
 
     pub fn scroll_up(&mut self) {
-        self.user_scrolled = true;
-        self.log_scroll = self.log_scroll.saturating_sub(1);
+        match self.focus {
+            FocusPanel::Log => {
+                self.user_scrolled = true;
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
+            FocusPanel::Lineage => {
+                self.lineage_user_scrolled = true;
+                self.lineage_scroll = self.lineage_scroll.saturating_sub(1);
+            }
+        }
     }
 }

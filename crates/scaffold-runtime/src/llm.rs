@@ -281,35 +281,64 @@ async fn query_openrouter(model: &str, prompt: &str, llm_config: &LlmConfig) -> 
             )
         })?;
 
-    // Set env vars for rig's OpenAI client to use OpenRouter
-    std::env::set_var("OPENAI_API_KEY", &api_key);
-    std::env::set_var("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
-
-    let client: openai::Client = openai::Client::from_env();
-    let completion_model = client.completion_model(model);
-
-    // Build the completion request
-    let mut request = completion_model.completion_request(prompt);
-
+    // Build chat completions request body directly (avoids rig's Responses API
+    // which sends fields like service_tier that OpenRouter may reject).
+    let mut messages = Vec::new();
     if let Some(ref system) = llm_config.system_prompt {
-        request = request.preamble(system.clone());
+        messages.push(serde_json::json!({"role": "system", "content": system}));
     }
+    messages.push(serde_json::json!({"role": "user", "content": prompt}));
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+    });
 
     if let Some(temp) = llm_config.temperature {
-        request = request.temperature(temp as f64);
+        body["temperature"] = serde_json::json!(temp);
     }
-
     if let Some(max_tokens) = llm_config.max_tokens {
-        request = request.max_tokens(max_tokens as u64);
+        body["max_tokens"] = serde_json::json!(max_tokens);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| Error::Runtime(format!("OpenRouter API error: {}", e)))?;
+    let api_key_owned = api_key.clone();
+    let body_string = body.to_string();
 
-    // Extract text from the first choice
-    extract_text_or_error(response.choice.iter())
+    let response_text = tokio::task::spawn_blocking(move || {
+        let resp = ureq::post("https://openrouter.ai/api/v1/chat/completions")
+            .set("Authorization", &format!("Bearer {}", api_key_owned))
+            .set("Content-Type", "application/json")
+            .send_string(&body_string)
+            .map_err(|e| Error::Runtime(format!("OpenRouter API error: {}", e)))?;
+
+        resp.into_string()
+            .map_err(|e| Error::Runtime(format!("OpenRouter read error: {}", e)))
+    })
+    .await
+    .map_err(|e| Error::Runtime(format!("OpenRouter task error: {}", e)))??;
+
+    // Parse the chat completions response
+    let parsed: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|e| Error::Runtime(format!("OpenRouter JSON parse error: {}", e)))?;
+
+    // Check for API errors
+    if let Some(err) = parsed.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(Error::Runtime(format!("OpenRouter API error: {}", msg)));
+    }
+
+    // Extract content from first choice
+    parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|msg| msg.get("content"))
+        .and_then(|content| content.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::Runtime("OpenRouter: no content in response".to_string()))
 }
 
 /// Query and parse response as JSON (typed)

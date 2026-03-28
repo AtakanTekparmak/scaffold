@@ -130,6 +130,10 @@ pub struct OptimizationOptions {
     /// When set, every meta-agent LLM call appends the full system prompt,
     /// context, raw response, and parse result to this file.
     pub meta_log: Option<PathBuf>,
+    /// Restart meta-agent context every N successful generations.
+    /// When set, the meta-agent's context is compacted by only showing candidates
+    /// from the current "epoch". The TUI still shows full lineage.
+    pub meta_context_restart: Option<usize>,
 }
 
 impl Default for OptimizationOptions {
@@ -143,6 +147,7 @@ impl Default for OptimizationOptions {
             concurrency: 1,
             meta_model: None,
             meta_log: None,
+            meta_context_restart: None,
         }
     }
 }
@@ -1628,6 +1633,12 @@ async fn run_evolutionary_into(
     let max_attempts = max_generations * 5;
     let mut total_attempts = 0;
 
+    // Epoch tracking for meta-agent context compaction.
+    // When meta_context_restart is set, the meta-agent context resets every N generations
+    // by only showing candidates from the current epoch.
+    let mut epoch_start_id: Option<usize> = None;
+    let mut epoch_generation_count: usize = 0;
+
     while successful_generations < max_generations && total_attempts < max_attempts {
         total_attempts += 1;
 
@@ -1635,7 +1646,7 @@ async fn run_evolutionary_into(
         // Novelty bonus (down-weight overused parents) only for random mode;
         // meta-agent provides its own diversity through LLM reasoning.
         let use_novelty = options.meta_model.is_none();
-        let parent = select_parent(archive, &mut rng, use_novelty);
+        let parent = select_parent(archive, &mut rng, use_novelty, epoch_start_id);
         if parent.is_none() {
             break;
         }
@@ -1653,7 +1664,7 @@ async fn run_evolutionary_into(
             let meta =
                 crate::meta_agent::MetaAgent::new(meta_model).with_log(options.meta_log.clone());
             match meta
-                .propose_mutation(&parent_clone, archive, ir, objective, &allowed_mutations)
+                .propose_mutation(&parent_clone, archive, ir, objective, &allowed_mutations, epoch_start_id)
                 .await
             {
                 Ok(proposal) => {
@@ -1975,6 +1986,7 @@ async fn run_evolutionary_into(
                         .await?;
 
                 successful_generations += 1;
+                epoch_generation_count += 1;
 
                 if successful_generations == 1 {
                     emit(
@@ -2023,6 +2035,26 @@ async fn run_evolutionary_into(
 
                 // Track parent usage for novelty weighting
                 archive.increment_children(parent_id);
+
+                // Check if we should start a new epoch (context compaction).
+                // Done after archive.add() so the just-evaluated candidate is
+                // visible to archive.best().
+                if let Some(restart_interval) = options.meta_context_restart {
+                    if epoch_generation_count >= restart_interval {
+                        let best_id = archive.best().map(|c| c.id).unwrap_or(0);
+                        epoch_start_id = Some(best_id);
+                        epoch_generation_count = 0;
+                        emit(
+                            options,
+                            OptEvent::Log {
+                                message: format!(
+                                    "Epoch restart: compacting meta-agent context from candidate #{} (after {} generations)",
+                                    best_id, restart_interval
+                                ),
+                            },
+                        );
+                    }
+                }
 
                 // Check early stop
                 if let Some(ts) = target_score {
@@ -2076,11 +2108,13 @@ fn select_parent<'a>(
     archive: &'a Archive,
     rng: &mut SimpleRng,
     use_novelty: bool,
+    epoch_start_id: Option<usize>,
 ) -> Option<&'a Candidate> {
+    let epoch_start = epoch_start_id.unwrap_or(0);
     let evaluated: Vec<&Candidate> = archive
         .candidates
         .iter()
-        .filter(|c| c.score.is_some())
+        .filter(|c| c.score.is_some() && c.id >= epoch_start)
         .collect();
 
     if evaluated.is_empty() {

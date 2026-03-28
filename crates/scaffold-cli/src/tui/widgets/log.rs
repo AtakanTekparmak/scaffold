@@ -50,16 +50,23 @@ pub fn render_log(state: &AppState, height: usize) -> List<'_> {
         String::new()
     };
 
+    let focused = state.focus == crate::tui::app::FocusPanel::Log;
+    let focus_tag = if focused { " (focused)" } else { "" };
     let title = if state.finished {
-        format!(" Log (done){} ", scroll_indicator)
+        format!(" Log (done){}{} ", scroll_indicator, focus_tag)
     } else {
-        format!(" Log (j/k scroll, q quit){} ", scroll_indicator)
+        format!(" Log (Tab focus, j/k scroll, q quit){}{} ", scroll_indicator, focus_tag)
+    };
+    let border_color = if focused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
     };
 
     List::new(items).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(border_color)),
     )
 }

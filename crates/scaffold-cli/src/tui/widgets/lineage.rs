@@ -4,13 +4,17 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::tui::app::AppState;
 
 /// Build a tree of candidates as styled lines using box-drawing characters.
-pub fn render_lineage(state: &AppState) -> Paragraph<'_> {
+/// Returns (Paragraph, total_line_count) so the caller can manage scrolling.
+pub fn render_lineage(state: &AppState) -> (Paragraph<'_>, usize) {
     if state.candidates.is_empty() {
-        return Paragraph::new("  Waiting for candidates...").block(
-            Block::default()
-                .title(" Lineage Tree ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+        return (
+            Paragraph::new("  Waiting for candidates...").block(
+                Block::default()
+                    .title(" Lineage Tree ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+            1,
         );
     }
 
@@ -43,12 +47,27 @@ pub fn render_lineage(state: &AppState) -> Paragraph<'_> {
         );
     }
 
-    Paragraph::new(lines).block(
+    let focus_indicator = if state.focus == crate::tui::app::FocusPanel::Lineage {
+        " (focused) "
+    } else {
+        " "
+    };
+    let border_color = if state.focus == crate::tui::app::FocusPanel::Lineage {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    let total_lines = lines.len();
+    let paragraph = Paragraph::new(lines).block(
         Block::default()
-            .title(format!(" Lineage Tree  [best: {:.4}] ", state.best_score))
+            .title(format!(
+                " Lineage Tree  [best: {:.4}]{}",
+                state.best_score, focus_indicator
+            ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    )
+            .border_style(Style::default().fg(border_color)),
+    );
+    (paragraph, total_lines)
 }
 
 fn render_node<'a>(

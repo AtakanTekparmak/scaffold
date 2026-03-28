@@ -4,7 +4,7 @@ mod widgets;
 use std::io::{self, Write as _};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -70,13 +70,21 @@ fn run_loop(
         if event::poll(Duration::from_millis(100)).unwrap_or(false) {
             if let Ok(Event::Key(key)) = event::read() {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') => {
-                            quit_requested = true;
+                    // Ctrl+C always quits immediately
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        quit_requested = true;
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                quit_requested = true;
+                            }
+                            KeyCode::Tab => state.toggle_focus(),
+                            KeyCode::Char('j') | KeyCode::Down => state.scroll_down(),
+                            KeyCode::Char('k') | KeyCode::Up => state.scroll_up(),
+                            _ => {}
                         }
-                        KeyCode::Char('j') | KeyCode::Down => state.scroll_down(),
-                        KeyCode::Char('k') | KeyCode::Up => state.scroll_up(),
-                        _ => {}
                     }
                 }
             }
@@ -139,8 +147,14 @@ fn run_loop(
                 if event::poll(Duration::from_millis(100)).unwrap_or(false) {
                     if let Ok(Event::Key(key)) = event::read() {
                         if key.kind == KeyEventKind::Press {
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return result;
+                            }
                             match key.code {
-                                KeyCode::Char('q') => return result,
+                                KeyCode::Char('q') | KeyCode::Esc => return result,
+                                KeyCode::Tab => state.toggle_focus(),
                                 KeyCode::Char('j') | KeyCode::Down => state.scroll_down(),
                                 KeyCode::Char('k') | KeyCode::Up => state.scroll_up(),
                                 _ => {}
@@ -156,6 +170,9 @@ fn run_loop(
         if quit_requested {
             disable_raw_mode().ok();
             io::stdout().execute(LeaveAlternateScreen).ok();
+            // Flush to ensure terminal escape sequences are written
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
             eprintln!("Cancelled.");
             std::process::exit(0);
         }
@@ -195,9 +212,20 @@ fn draw_ui(frame: &mut Frame, state: &AppState) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(main_layout[0]);
 
-    // Render lineage tree
-    let lineage_widget = lineage::render_lineage(state);
-    frame.render_widget(lineage_widget, top_layout[0]);
+    // Render lineage tree with scroll
+    let (lineage_widget, total_lines) = lineage::render_lineage(state);
+    let lineage_visible = top_layout[0].height.saturating_sub(2) as usize; // minus borders
+    let scroll_offset = if state.lineage_user_scrolled {
+        // Manual scroll — clamp to valid range
+        state.lineage_scroll.min(total_lines.saturating_sub(lineage_visible))
+    } else {
+        // Auto-scroll to bottom
+        total_lines.saturating_sub(lineage_visible)
+    };
+    frame.render_widget(
+        lineage_widget.scroll((scroll_offset as u16, 0)),
+        top_layout[0],
+    );
 
     // Render score chart
     let chart_widget = chart::render_chart(state);
