@@ -54,7 +54,7 @@ pub struct AppState {
     pub meta_thinking: bool,
     /// Models used by harness nodes.
     pub harness_models: Vec<String>,
-    /// Last meta-agent context size (estimated tokens).
+    /// Last accepted meta-agent payload size (estimated tokens).
     pub meta_context_tokens: Option<usize>,
     /// Failure summarization progress: (done, total). None when not summarizing.
     pub summarizing: Option<(usize, usize)>,
@@ -120,7 +120,10 @@ impl AppState {
 
     pub fn process_event(&mut self, event: OptEvent) {
         match event {
-            OptEvent::SubObjectiveStarted { sub_name, graph_name } => {
+            OptEvent::SubObjectiveStarted {
+                sub_name,
+                graph_name,
+            } => {
                 // Clear candidate state — new phase restarts IDs from 0
                 self.candidates.clear();
                 self.score_history.clear();
@@ -130,11 +133,18 @@ impl AppState {
 
                 self.current_sub = Some(sub_name.clone());
                 self.push_log(
-                    format!("Sub-objective '{}' started (graph: {})", sub_name, graph_name),
+                    format!(
+                        "Sub-objective '{}' started (graph: {})",
+                        sub_name, graph_name
+                    ),
                     LogKind::Phase,
                 );
             }
-            OptEvent::SubObjectiveCompleted { sub_name, best_score, total_candidates } => {
+            OptEvent::SubObjectiveCompleted {
+                sub_name,
+                best_score,
+                total_candidates,
+            } => {
                 self.push_log(
                     format!(
                         "Sub '{}' completed: {} candidates, best={:.4}",
@@ -168,7 +178,10 @@ impl AppState {
                 self.current_phase = name.to_string();
                 self.push_log(format!("Phase: {}", name), LogKind::Phase);
             }
-            OptEvent::EvaluationStarted { candidate_id, total_cases } => {
+            OptEvent::EvaluationStarted {
+                candidate_id,
+                total_cases,
+            } => {
                 self.meta_thinking = false;
                 self.summarizing = None;
                 self.eval_progress = Some(EvalProgress {
@@ -178,15 +191,26 @@ impl AppState {
                     cases_passed: 0,
                 });
                 self.push_log(
-                    format!("Evaluating candidate #{} ({} cases)...", candidate_id, total_cases),
+                    format!(
+                        "Evaluating candidate #{} ({} cases)...",
+                        candidate_id, total_cases
+                    ),
                     LogKind::Normal,
                 );
             }
-            OptEvent::CaseCompleted { candidate_id, case_index, total_cases, passed, case_id } => {
+            OptEvent::CaseCompleted {
+                candidate_id,
+                case_index,
+                total_cases,
+                passed,
+                case_id,
+            } => {
                 if let Some(ref mut prog) = self.eval_progress {
                     if prog.candidate_id == candidate_id {
                         prog.cases_done = case_index;
-                        if passed { prog.cases_passed += 1; }
+                        if passed {
+                            prog.cases_passed += 1;
+                        }
                     }
                 }
                 let status = if passed { "PASS" } else { "FAIL" };
@@ -196,7 +220,11 @@ impl AppState {
                         "  case {} {}/{} {}",
                         id_str, case_index, total_cases, status
                     ),
-                    if passed { LogKind::Normal } else { LogKind::Skip },
+                    if passed {
+                        LogKind::Normal
+                    } else {
+                        LogKind::Skip
+                    },
                 );
             }
             OptEvent::CandidateEvaluated {
@@ -220,12 +248,12 @@ impl AppState {
                     is_best: false,
                 });
 
-                let best_so_far = self.score_history
+                let best_so_far = self
+                    .score_history
                     .last()
                     .map(|&(_, prev_best)| prev_best.max(score))
                     .unwrap_or(score);
-                self.score_history
-                    .push((candidate_id as f64, best_so_far));
+                self.score_history.push((candidate_id as f64, best_so_far));
 
                 self.update_best();
 
@@ -241,25 +269,35 @@ impl AppState {
                         "Candidate #{} [{}] score={:.4} (gen {}/{}){}",
                         candidate_id, label, score, generation, max_generations, best_marker
                     ),
-                    if is_new_best { LogKind::NewBest } else { LogKind::Normal },
+                    if is_new_best {
+                        LogKind::NewBest
+                    } else {
+                        LogKind::Normal
+                    },
                 );
             }
             OptEvent::MutationSkipped { reason } => {
                 self.push_log(format!("Mutation skipped: {}", reason), LogKind::Skip);
             }
-            OptEvent::MetaProposal { reasoning, mutation_label, context_tokens } => {
+            OptEvent::MetaProposal {
+                reasoning,
+                mutation_label,
+                context_tokens,
+            } => {
                 self.meta_thinking = false;
                 self.meta_context_tokens = Some(context_tokens);
                 self.push_log(
-                    format!("Meta-agent: {} [{}] [ctx: ~{}k tok]", reasoning, mutation_label, context_tokens / 1000),
+                    format!(
+                        "Meta-agent: {} [{}] [latest ctx: ~{}k tok]",
+                        reasoning,
+                        mutation_label,
+                        context_tokens / 1000
+                    ),
                     LogKind::MetaAgent,
                 );
             }
             OptEvent::MetaAgentActive { model } => {
-                self.push_log(
-                    format!("Meta-agent active: {}", model),
-                    LogKind::MetaAgent,
-                );
+                self.push_log(format!("Meta-agent active: {}", model), LogKind::MetaAgent);
                 self.meta_model = Some(model);
             }
             OptEvent::MetaAgentThinking => {
@@ -271,7 +309,11 @@ impl AppState {
                     LogKind::EarlyStop,
                 );
             }
-            OptEvent::Completed { objective_name, best_score, total_candidates } => {
+            OptEvent::Completed {
+                objective_name,
+                best_score,
+                total_candidates,
+            } => {
                 self.push_log(
                     format!(
                         "Completed '{}': {} candidates, best={:.4}",

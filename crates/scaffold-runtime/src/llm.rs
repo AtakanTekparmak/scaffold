@@ -429,7 +429,9 @@ fn extract_json(response: &str) -> &str {
     trimmed
 }
 
-pub(crate) fn parse_json_with_repairs(response: &str) -> std::result::Result<serde_json::Value, String> {
+pub(crate) fn parse_json_with_repairs(
+    response: &str,
+) -> std::result::Result<serde_json::Value, String> {
     let mut attempts = Vec::new();
     let primary = extract_balanced_json_candidate(response)
         .unwrap_or_else(|| extract_json(response).trim().to_string());

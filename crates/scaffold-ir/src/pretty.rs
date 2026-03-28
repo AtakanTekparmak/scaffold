@@ -16,6 +16,13 @@ pub fn pretty_print_graph(graph: &GraphIR) -> String {
     pp.output
 }
 
+/// Pretty-print a single node definition to scaffold source
+pub fn pretty_print_node(node: &NodeIR) -> String {
+    let mut pp = PrettyPrinter::new();
+    pp.print_node(node);
+    pp.output
+}
+
 struct PrettyPrinter {
     output: String,
     indent: usize,
@@ -536,5 +543,37 @@ mod tests {
         let json = to_json(&ir).unwrap();
         let ir3 = from_json(&json).unwrap();
         assert_eq!(ir3.objectives[0].subs.len(), 1);
+    }
+
+    #[test]
+    fn pretty_print_node_round_trip() {
+        let src = r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                temperature: 0.7
+                template: "Solve: {{ input }}"
+                system: "You are helpful."
+            }
+        "#;
+        let program = parse(src).unwrap();
+        let ir = lower(&program).unwrap();
+        let node = &ir.nodes[0];
+
+        let printed = pretty_print_node(node);
+        assert!(printed.contains("node solver: prompt {"));
+        assert!(printed.contains("model: \"gpt-4o\""));
+        assert!(printed.contains("temperature: 0.7"));
+
+        // Re-parse to verify it's valid
+        let program2 = parse(&format!(
+            "{}\ngraph g {{ in: string out: string step s = solver(input) emit s }}",
+            printed
+        ))
+        .expect("pretty-printed node should re-parse");
+        let ir2 = lower(&program2).unwrap();
+        assert_eq!(ir2.nodes[0].name, "solver");
+        assert_eq!(ir2.nodes[0].config.model.as_deref(), Some("gpt-4o"));
     }
 }

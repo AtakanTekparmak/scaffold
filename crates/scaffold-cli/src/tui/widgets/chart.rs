@@ -25,11 +25,7 @@ pub fn render_chart<'a>(state: &'a AppState) -> Chart<'a> {
         Line::from(format!("{}", x_max as usize)),
     ];
 
-    let y_labels: Vec<Line<'_>> = vec![
-        Line::from("0.0"),
-        Line::from("0.5"),
-        Line::from("1.0"),
-    ];
+    let y_labels: Vec<Line<'_>> = vec![Line::from("0.0"), Line::from("0.5"), Line::from("1.0")];
 
     Chart::new(datasets)
         .block(

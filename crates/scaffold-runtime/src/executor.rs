@@ -4,8 +4,8 @@
 //! parallel fan-out, choose, emit, and carry statements.
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
 use scaffold_ir::ir::*;
 
@@ -23,6 +23,8 @@ pub struct GraphExecutor {
     ir: ScaffoldIR,
     prompt_mgr: PromptManager,
     overrides: TunableOverrides,
+    /// Synthetic nodes created by `AddPromptStep` mutations (stored via `_node.*` overrides).
+    synthetic_nodes: Vec<NodeIR>,
 }
 
 impl GraphExecutor {
@@ -32,6 +34,7 @@ impl GraphExecutor {
             ir,
             prompt_mgr: PromptManager::new(),
             overrides: HashMap::new(),
+            synthetic_nodes: Vec::new(),
         }
     }
 
@@ -42,7 +45,24 @@ impl GraphExecutor {
     }
 
     /// Set tunable overrides.
+    ///
+    /// Also scans for `_node.<name>` keys to create synthetic nodes
+    /// (used by `AddPromptStep` mutations).
     pub fn with_overrides(mut self, overrides: TunableOverrides) -> Self {
+        // Parse synthetic nodes from `_node.<name>` override keys.
+        let mut synthetic = Vec::new();
+        for key in overrides.keys() {
+            if let Some(name) = key.strip_prefix("_node.") {
+                synthetic.push(NodeIR {
+                    name: name.to_string(),
+                    kind: NodeKindIR::Prompt,
+                    input: TypeIR::String,
+                    output: TypeIR::String,
+                    config: NodeConfigIR::default(),
+                });
+            }
+        }
+        self.synthetic_nodes = synthetic;
         self.overrides = overrides;
         self
     }
@@ -64,6 +84,36 @@ impl GraphExecutor {
             let mut scope = Scope::root(input);
             self.execute_stmts(&graph.body, &mut scope, graph_name)
                 .await
+        })
+    }
+
+    /// Execute a named graph with step-level output tracing.
+    ///
+    /// Returns the emitted value plus a Vec of (step_name, truncated_output)
+    /// for every step executed (including inside if/parallel blocks).
+    pub fn execute_graph_traced<'a>(
+        &'a self,
+        graph_name: &'a str,
+        input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(Value, Vec<(String, String)>)>> + 'a>> {
+        Box::pin(async move {
+            let graph = self
+                .ir
+                .graphs
+                .iter()
+                .find(|g| g.name == graph_name)
+                .ok_or_else(|| Error::UnknownNode(graph_name.to_string()))?;
+
+            let trace = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut scope = Scope::root_traced(input, trace.clone());
+            let result = self
+                .execute_stmts(&graph.body, &mut scope, graph_name)
+                .await?;
+            let steps = match std::sync::Arc::try_unwrap(trace) {
+                Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+                Err(arc) => arc.lock().unwrap().clone(),
+            };
+            Ok((result, steps))
         })
     }
 
@@ -102,8 +152,7 @@ impl GraphExecutor {
                         }
                     }
                     GraphStmtIR::Parallel(par_ir) => {
-                        let result =
-                            self.execute_parallel(par_ir, scope, graph_name).await?;
+                        let result = self.execute_parallel(par_ir, scope, graph_name).await?;
                         if result.is_some() {
                             emitted = result;
                         }
@@ -139,12 +188,13 @@ impl GraphExecutor {
                 return self.execute_graph(&step.node, input).await;
             }
 
-            // Node call
+            // Node call (check IR nodes first, then synthetic nodes from AddPromptStep)
             let node = self
                 .ir
                 .nodes
                 .iter()
                 .find(|n| n.name == step.node)
+                .or_else(|| self.synthetic_nodes.iter().find(|n| n.name == step.node))
                 .ok_or_else(|| Error::UnknownNode(step.node.clone()))?;
 
             let input = self.resolve_step_input(&step.args, scope)?;
@@ -288,10 +338,7 @@ impl GraphExecutor {
             }
 
             let mut child_scope = scope.child();
-            match self
-                .execute_stmts(body, &mut child_scope, graph_name)
-                .await
-            {
+            match self.execute_stmts(body, &mut child_scope, graph_name).await {
                 Ok(val) => Ok(Some(val)),
                 Err(Error::NoEmit) => Ok(None),
                 Err(e) => Err(e),
@@ -429,16 +476,13 @@ impl GraphExecutor {
 
             ExprIR::FieldAccess { base, field } => {
                 let base_val = self.eval_expr(base, scope)?;
-                base_val
-                    .field(field)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::ExprError(format!(
-                            "field '{}' not found on {}",
-                            field,
-                            base_val.type_name()
-                        ))
-                    })
+                base_val.field(field).cloned().ok_or_else(|| {
+                    Error::ExprError(format!(
+                        "field '{}' not found on {}",
+                        field,
+                        base_val.type_name()
+                    ))
+                })
             }
 
             ExprIR::Index { base, index } => {
@@ -449,16 +493,12 @@ impl GraphExecutor {
                         let idx = *i as usize;
                         list.get(idx)
                             .cloned()
-                            .ok_or_else(|| {
-                                Error::ExprError(format!("index {} out of bounds", i))
-                            })
+                            .ok_or_else(|| Error::ExprError(format!("index {} out of bounds", i)))
                     }
                     (Value::Map(map), Value::String(key)) => map
                         .get(key)
                         .cloned()
-                        .ok_or_else(|| {
-                            Error::ExprError(format!("key '{}' not found", key))
-                        }),
+                        .ok_or_else(|| Error::ExprError(format!("key '{}' not found", key))),
                     _ => Err(Error::ExprError(format!(
                         "cannot index {} with {}",
                         base_val.type_name(),
@@ -813,7 +853,10 @@ fn eval_builtin_call(name: &str, args: &[Value]) -> Result<Value> {
             }
             match (&args[0], &args[1]) {
                 (Value::String(s), Value::String(sep)) => {
-                    let parts: Vec<Value> = s.split(sep.as_str()).map(|p| Value::String(p.to_string())).collect();
+                    let parts: Vec<Value> = s
+                        .split(sep.as_str())
+                        .map(|p| Value::String(p.to_string()))
+                        .collect();
                     Ok(Value::List(parts))
                 }
                 _ => Err(Error::ExprError("split() requires (string, string)".into())),
@@ -923,12 +966,7 @@ mod tests {
         );
         assert_eq!(
             executor
-                .eval_expr(
-                    &ExprIR::LitString {
-                        value: "hi".into()
-                    },
-                    &scope
-                )
+                .eval_expr(&ExprIR::LitString { value: "hi".into() }, &scope)
                 .unwrap(),
             Value::String("hi".into())
         );
@@ -954,13 +992,9 @@ mod tests {
         assert_eq!(executor.eval_expr(&add, &scope).unwrap(), Value::Int(5));
 
         let eq = ExprIR::Binary {
-            left: Box::new(ExprIR::LitString {
-                value: "a".into(),
-            }),
+            left: Box::new(ExprIR::LitString { value: "a".into() }),
             op: "==".to_string(),
-            right: Box::new(ExprIR::LitString {
-                value: "a".into(),
-            }),
+            right: Box::new(ExprIR::LitString { value: "a".into() }),
         };
         assert_eq!(executor.eval_expr(&eq, &scope).unwrap(), Value::Bool(true));
     }
@@ -987,9 +1021,7 @@ mod tests {
     async fn test_unknown_graph() {
         let ir = make_simple_ir();
         let executor = GraphExecutor::new(ir);
-        let result = executor
-            .execute_graph("nonexistent", Value::Null)
-            .await;
+        let result = executor.execute_graph("nonexistent", Value::Null).await;
         assert!(result.is_err());
     }
 }

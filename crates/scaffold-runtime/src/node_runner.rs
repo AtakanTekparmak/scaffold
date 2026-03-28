@@ -217,7 +217,10 @@ async fn run_tool(
     let config = &node.config;
 
     // Shell tool: run a shell command (check override first)
-    let shell_override = overrides.get("shell").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let shell_override = overrides
+        .get("shell")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let shell_source = shell_override.as_deref().or(config.shell.as_deref());
     if let Some(shell_cmd) = shell_source {
         let ctx = match &input {
@@ -240,7 +243,9 @@ async fn run_tool(
         // Meta-agent proposed shell commands run sandboxed (no network access).
         let is_meta_proposed = shell_override.is_some();
         let output = match (is_meta_proposed, timeout) {
-            (true, Some(t)) => crate::shell::execute_sandboxed_with_timeout(&rendered_cmd, t * 1000)?,
+            (true, Some(t)) => {
+                crate::shell::execute_sandboxed_with_timeout(&rendered_cmd, t * 1000)?
+            }
             (true, None) => crate::shell::execute_sandboxed(&rendered_cmd)?,
             (false, Some(t)) => crate::shell::execute_with_timeout(&rendered_cmd, t * 1000)?,
             (false, None) => crate::shell::execute(&rendered_cmd)?,
@@ -277,10 +282,7 @@ fn eval_json_field_expr(expr: &ExprIR, input: &Value) -> Value {
             if name == "input" {
                 input.clone()
             } else {
-                input
-                    .field(name)
-                    .cloned()
-                    .unwrap_or(Value::Null)
+                input.field(name).cloned().unwrap_or(Value::Null)
             }
         }
         ExprIR::FieldAccess { base, field } => {

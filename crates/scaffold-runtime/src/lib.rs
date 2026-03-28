@@ -37,15 +37,14 @@ pub use agent_convos::maybe_log_agent_conversation;
 pub use config::{config, Config};
 pub use error::{Error, Result};
 pub use executor::GraphExecutor;
-pub use mutations::Mutation;
-pub use optimizer::{
-    eval_checker_expr, optimize, optimize_hierarchical, HierarchicalReport,
-    OptEvent, OptimizationBackend, OptimizationOptions, OptimizationReport, OptPhase,
-    SubOptimizationReport,
-};
 pub use llm::{
     query as llm_query, query_structured, query_structured_with_config, query_with_config,
     query_with_model, Agent, AgentBuilder, LlmBackend, LlmConfig,
+};
+pub use mutations::Mutation;
+pub use optimizer::{
+    eval_checker_expr, optimize, optimize_hierarchical, HierarchicalReport, OptEvent, OptPhase,
+    OptimizationBackend, OptimizationOptions, OptimizationReport, SubOptimizationReport,
 };
 pub use prompt::PromptManager;
 pub use scope::Scope;

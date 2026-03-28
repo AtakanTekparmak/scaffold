@@ -87,7 +87,12 @@ fn run_loop(
             match event_rx.try_recv() {
                 Ok(evt) => {
                     if let Some(ref mut f) = log_file {
-                        let _ = writeln!(f, "+{:.1}s {:?}", state.start_time.elapsed().as_secs_f64(), evt);
+                        let _ = writeln!(
+                            f,
+                            "+{:.1}s {:?}",
+                            state.start_time.elapsed().as_secs_f64(),
+                            evt
+                        );
                     }
                     state.process_event(evt);
                 }
@@ -102,7 +107,12 @@ fn run_loop(
                 match event_rx.try_recv() {
                     Ok(evt) => {
                         if let Some(ref mut f) = log_file {
-                            let _ = writeln!(f, "+{:.1}s {:?}", state.start_time.elapsed().as_secs_f64(), evt);
+                            let _ = writeln!(
+                                f,
+                                "+{:.1}s {:?}",
+                                state.start_time.elapsed().as_secs_f64(),
+                                evt
+                            );
                         }
                         state.process_event(evt);
                     }
@@ -233,7 +243,10 @@ fn render_progress(state: &AppState) -> Gauge<'_> {
         Gauge::default()
             .block(
                 Block::default()
-                    .title(format!(" Evaluating  [{}]{}{} ", state.current_phase, models_tag, meta_tag))
+                    .title(format!(
+                        " Evaluating  [{}]{}{} ",
+                        state.current_phase, models_tag, meta_tag
+                    ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow)),
             )
@@ -256,25 +269,33 @@ fn render_progress(state: &AppState) -> Gauge<'_> {
                 state.candidates.len()
             ))
     } else if let Some((done, total)) = state.summarizing {
-        let ratio = if total > 0 { done as f64 / total as f64 } else { 0.0 };
+        let ratio = if total > 0 {
+            done as f64 / total as f64
+        } else {
+            0.0
+        };
         Gauge::default()
             .block(
                 Block::default()
-                    .title(format!(" Compressing failure logs{}{} ",
-                        models_tag,
-                        meta_tag,
+                    .title(format!(
+                        " Compressing failure logs{}{} ",
+                        models_tag, meta_tag,
                     ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::LightBlue)),
             )
             .gauge_style(Style::default().fg(Color::LightBlue).bg(Color::DarkGray))
             .ratio(ratio.min(1.0))
-            .label(format!("Summarizing {}/{} failures (context too large)", done, total))
+            .label(format!(
+                "Summarizing {}/{} failures (context too large)",
+                done, total
+            ))
     } else if state.meta_thinking {
         Gauge::default()
             .block(
                 Block::default()
-                    .title(format!(" {}  [{}]{}{} ",
+                    .title(format!(
+                        " {}  [{}]{}{} ",
                         state.current_sub.as_deref().unwrap_or("Optimizer"),
                         state.current_phase,
                         models_tag,
@@ -290,7 +311,8 @@ fn render_progress(state: &AppState) -> Gauge<'_> {
         Gauge::default()
             .block(
                 Block::default()
-                    .title(format!(" {}  [{}]{}{} ",
+                    .title(format!(
+                        " {}  [{}]{}{} ",
                         state.current_sub.as_deref().unwrap_or("Optimizer"),
                         state.current_phase,
                         models_tag,
@@ -319,7 +341,7 @@ fn render_meta_context(state: &AppState) -> LineGauge<'_> {
                 Color::Magenta
             };
             let label = format!(
-                " meta ctx: ~{}k / {}k tok ({:.0}%) ",
+                " latest meta ctx: ~{}k / {}k tok ({:.0}%) ",
                 tok / 1000,
                 ctx_window / 1000,
                 pct,
@@ -330,12 +352,10 @@ fn render_meta_context(state: &AppState) -> LineGauge<'_> {
                 .ratio(ratio)
                 .label(label)
         }
-        None => {
-            LineGauge::default()
-                .filled_style(Style::default().fg(Color::DarkGray))
-                .unfilled_style(Style::default().fg(Color::DarkGray))
-                .ratio(0.0)
-                .label(" meta ctx: waiting for first proposal ")
-        }
+        None => LineGauge::default()
+            .filled_style(Style::default().fg(Color::DarkGray))
+            .unfilled_style(Style::default().fg(Color::DarkGray))
+            .ratio(0.0)
+            .label(" latest meta ctx: waiting for first proposal "),
     }
 }

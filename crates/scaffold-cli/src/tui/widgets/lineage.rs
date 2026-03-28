@@ -6,13 +6,12 @@ use crate::tui::app::AppState;
 /// Build a tree of candidates as styled lines using box-drawing characters.
 pub fn render_lineage(state: &AppState) -> Paragraph<'_> {
     if state.candidates.is_empty() {
-        return Paragraph::new("  Waiting for candidates...")
-            .block(
-                Block::default()
-                    .title(" Lineage Tree ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            );
+        return Paragraph::new("  Waiting for candidates...").block(
+            Block::default()
+                .title(" Lineage Tree ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     }
 
     // Build parent -> children map
@@ -46,10 +45,7 @@ pub fn render_lineage(state: &AppState) -> Paragraph<'_> {
 
     Paragraph::new(lines).block(
         Block::default()
-            .title(format!(
-                " Lineage Tree  [best: {:.4}] ",
-                state.best_score
-            ))
+            .title(format!(" Lineage Tree  [best: {:.4}] ", state.best_score))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     )
@@ -88,7 +84,9 @@ fn render_node<'a>(
     let best_marker = if candidate.is_best { " * BEST" } else { "" };
 
     let style = if candidate.is_best {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };

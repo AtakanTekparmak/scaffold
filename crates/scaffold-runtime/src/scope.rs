@@ -4,8 +4,12 @@
 //! created by steps, carries, and loop variables.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::value::Value;
+
+/// Collected step outputs from a graph execution (step_name → truncated string).
+pub type StepTrace = Arc<Mutex<Vec<(String, String)>>>;
 
 /// A scope holds variable bindings during graph execution.
 ///
@@ -15,6 +19,10 @@ use crate::value::Value;
 pub struct Scope {
     bindings: HashMap<String, Value>,
     parent: Option<Box<Scope>>,
+    /// Optional shared trace — when present, every `bind()` call appends
+    /// the (name, truncated-value) pair. Shared across parent/child scopes
+    /// via Arc so child-scope bindings (inside if/parallel blocks) are captured.
+    step_trace: Option<StepTrace>,
 }
 
 impl Scope {
@@ -25,6 +33,18 @@ impl Scope {
         Self {
             bindings,
             parent: None,
+            step_trace: None,
+        }
+    }
+
+    /// Create a root scope with tracing enabled.
+    pub fn root_traced(input: Value, trace: StepTrace) -> Self {
+        let mut bindings = HashMap::new();
+        bindings.insert("input".to_string(), input);
+        Self {
+            bindings,
+            parent: None,
+            step_trace: Some(trace),
         }
     }
 
@@ -37,6 +57,7 @@ impl Scope {
         Self {
             bindings: map,
             parent: None,
+            step_trace: None,
         }
     }
 
@@ -45,12 +66,29 @@ impl Scope {
         Self {
             bindings: HashMap::new(),
             parent: Some(Box::new(self.clone())),
+            step_trace: self.step_trace.clone(),
         }
     }
 
     /// Bind a name to a value in this scope.
     pub fn bind(&mut self, name: impl Into<String>, value: Value) {
-        self.bindings.insert(name.into(), value);
+        let name = name.into();
+        // Append to shared trace if active (skip the "input" binding)
+        if name != "input" {
+            if let Some(ref trace) = self.step_trace {
+                let repr = value.to_string();
+                let max = 2000;
+                let truncated = if repr.len() > max {
+                    format!("{}...", &repr[..max])
+                } else {
+                    repr
+                };
+                if let Ok(mut t) = trace.lock() {
+                    t.push((name.clone(), truncated));
+                }
+            }
+        }
+        self.bindings.insert(name, value);
     }
 
     /// Look up a name, searching this scope then parents.

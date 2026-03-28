@@ -23,10 +23,16 @@ pub fn render_log(state: &AppState, height: usize) -> List<'_> {
         .map(|entry| {
             let ts = format!("+{:.1}s", entry.elapsed_secs);
             let style = match entry.kind {
-                LogKind::NewBest => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                LogKind::Phase => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                LogKind::NewBest => Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                LogKind::Phase => Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
                 LogKind::Skip => Style::default().fg(Color::DarkGray),
-                LogKind::EarlyStop => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                LogKind::EarlyStop => Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
                 LogKind::MetaAgent => Style::default().fg(Color::Magenta),
                 LogKind::Normal => Style::default().fg(Color::White),
             };

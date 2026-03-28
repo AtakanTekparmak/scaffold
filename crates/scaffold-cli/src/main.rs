@@ -15,10 +15,8 @@ use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use scaffold_ir::{lower, pretty_print, to_json, to_json_compact, ScaffoldIR};
-use scaffold_runtime::trace::{init_tracer, TracerConfig, TraceFormat, TraceLevel, TraceOutput};
-use scaffold_runtime::{
-    GraphExecutor, OptimizationBackend, OptimizationOptions, Value,
-};
+use scaffold_runtime::trace::{init_tracer, TraceFormat, TraceLevel, TraceOutput, TracerConfig};
+use scaffold_runtime::{GraphExecutor, OptimizationBackend, OptimizationOptions, Value};
 use scaffold_syntax::parse;
 use scaffold_types::check;
 use scaffold_verify::{verify, Severity};
@@ -127,7 +125,7 @@ enum Commands {
         #[arg(long)]
         report_dir: Option<PathBuf>,
 
-        /// Write best candidate IR to this file
+        /// Write the best candidate `.scaffold` to this file
         #[arg(long)]
         write_best: Option<PathBuf>,
 
@@ -142,6 +140,10 @@ enum Commands {
         /// LLM model for meta-agent guided mutations (e.g. gpt-4o). Omit for random mutations.
         #[arg(long)]
         meta_model: Option<String>,
+
+        /// Path to a debug log file for meta-agent context/responses.
+        #[arg(long)]
+        meta_log: Option<PathBuf>,
     },
 
     /// Pretty-print IR back to scaffold source
@@ -184,6 +186,7 @@ fn main() -> ExitCode {
             live,
             concurrency,
             meta_model,
+            meta_log,
         } => cmd_optimize(
             &file,
             &objective,
@@ -194,6 +197,7 @@ fn main() -> ExitCode {
             live,
             concurrency,
             meta_model,
+            meta_log,
         ),
         Commands::Print { file } => cmd_print(&file),
     }
@@ -401,10 +405,7 @@ fn cmd_evaluate(
                 }
             };
             match parsed.as_object() {
-                Some(obj) => obj
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+                Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 None => {
                     eprintln!("error: assignments must be a JSON object");
                     return ExitCode::FAILURE;
@@ -467,7 +468,10 @@ fn cmd_evaluate(
                 let mut case_checks = Vec::new();
                 for checker in &objective.checkers {
                     let val = scaffold_runtime::eval_checker_expr(
-                        &executor, &checker.expr, &output, &case.expected,
+                        &executor,
+                        &checker.expr,
+                        &output,
+                        &case.expected,
                     );
                     *checker_totals.entry(checker.name.clone()).or_default() += val;
                     case_checks.push(format!(
@@ -518,13 +522,45 @@ fn cmd_evaluate(
             Ok(scaffold_runtime::Value::Int(i)) => i as f64,
             _ => 0.0,
         };
-        eprintln!("score: {:.4} ({} errors / {} cases)", score, errors, case_count);
+        eprintln!(
+            "score: {:.4} ({} errors / {} cases)",
+            score, errors, case_count
+        );
     }
 
     ExitCode::SUCCESS
 }
 
 // ── Optimize ──
+
+fn default_best_candidate_path(
+    file: &PathBuf,
+    objective_name: &str,
+    report_dir: Option<&PathBuf>,
+    write_best: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = write_best {
+        return path;
+    }
+
+    if let Some(dir) = report_dir {
+        return dir.join("best_candidate.scaffold");
+    }
+
+    let stem = file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("best_candidate");
+    let safe_objective: String = objective_name
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect();
+    file.with_file_name(format!("{stem}.{safe_objective}.best.scaffold"))
+}
 
 fn cmd_optimize(
     file: &PathBuf,
@@ -536,6 +572,7 @@ fn cmd_optimize(
     live: bool,
     concurrency: usize,
     meta_model: Option<String>,
+    meta_log: Option<PathBuf>,
 ) -> ExitCode {
     let ir = match load_ir(file) {
         Ok(ir) => ir,
@@ -549,6 +586,12 @@ fn cmd_optimize(
         OptimizeBackendArg::Grid => OptimizationBackend::Grid,
         OptimizeBackendArg::Evolutionary => OptimizationBackend::Evolutionary,
     };
+    let write_best = Some(default_best_candidate_path(
+        file,
+        objective_name,
+        report_dir.as_ref(),
+        write_best,
+    ));
 
     if live {
         // TUI mode: spawn optimizer in a thread, run TUI on main thread
@@ -563,6 +606,7 @@ fn cmd_optimize(
             event_tx: Some(event_tx),
             concurrency,
             meta_model: meta_model.clone(),
+            meta_log: meta_log.clone(),
         };
 
         let obj_name = objective_name.to_string();
@@ -595,6 +639,7 @@ fn cmd_optimize(
             event_tx: None,
             concurrency,
             meta_model,
+            meta_log,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -660,7 +705,8 @@ fn cmd_print(file: &PathBuf) -> ExitCode {
 // ── Helpers ──
 
 fn load_ir(file: &PathBuf) -> Result<ScaffoldIR, String> {
-    let source = fs::read_to_string(file).map_err(|e| format!("error: cannot read {}: {}", file.display(), e))?;
+    let source = fs::read_to_string(file)
+        .map_err(|e| format!("error: cannot read {}: {}", file.display(), e))?;
 
     // Try as IR JSON first
     if let Ok(ir) = serde_json::from_str::<ScaffoldIR>(&source) {
@@ -679,10 +725,10 @@ fn load_ir(file: &PathBuf) -> Result<ScaffoldIR, String> {
 
 fn parse_input(input_arg: &str) -> Result<Value, String> {
     if let Some(file_path) = input_arg.strip_prefix('@') {
-        let content =
-            fs::read_to_string(file_path).map_err(|e| format!("cannot read {}: {}", file_path, e))?;
-        let json: serde_json::Value =
-            serde_json::from_str(&content).map_err(|e| format!("invalid JSON in {}: {}", file_path, e))?;
+        let content = fs::read_to_string(file_path)
+            .map_err(|e| format!("cannot read {}: {}", file_path, e))?;
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("invalid JSON in {}: {}", file_path, e))?;
         Ok(Value::from(json))
     } else {
         let json: serde_json::Value =
@@ -731,4 +777,32 @@ fn print_parse_error(filename: &str, source: &str, error: &scaffold_syntax::Pars
         .finish()
         .eprint((filename, Source::from(source)))
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_best_candidate_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_default_best_candidate_path_prefers_report_dir() {
+        let file = PathBuf::from("/tmp/solve.scaffold");
+        let report_dir = PathBuf::from("/tmp/reports");
+
+        let path = default_best_candidate_path(&file, "aider_polyglot", Some(&report_dir), None);
+
+        assert_eq!(path, report_dir.join("best_candidate.scaffold"));
+    }
+
+    #[test]
+    fn test_default_best_candidate_path_derives_from_input_file() {
+        let file = PathBuf::from("/tmp/solve.scaffold");
+
+        let path = default_best_candidate_path(&file, "aider/polyglot", None, None);
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/solve.aider_polyglot.best.scaffold")
+        );
+    }
 }

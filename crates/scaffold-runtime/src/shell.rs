@@ -50,11 +50,7 @@ fn build_command(command: &str, sandboxed: bool) -> Command {
     if sandboxed {
         let profile = sandbox_profile();
         let mut cmd = Command::new("sandbox-exec");
-        cmd.arg("-p")
-            .arg(profile)
-            .arg("sh")
-            .arg("-c")
-            .arg(command);
+        cmd.arg("-p").arg(profile).arg("sh").arg("-c").arg(command);
         return cmd;
     }
 
@@ -78,7 +74,11 @@ fn run_to_completion(command: &str, sandboxed: bool) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let label = if sandboxed { "shell (sandboxed)" } else { "shell" };
+        let label = if sandboxed {
+            "shell (sandboxed)"
+        } else {
+            "shell"
+        };
         Err(Error::ActionFailed {
             action: label.to_string(),
             message: format!("command failed: {}", stderr),
@@ -124,7 +124,11 @@ fn run_with_deadline(command: &str, sandboxed: bool, timeout_ms: u64) -> Result<
                     return Ok(String::from_utf8_lossy(&stdout).to_string());
                 } else {
                     let stderr_str = String::from_utf8_lossy(&stderr);
-                    let label = if sandboxed { "shell (sandboxed)" } else { "shell" };
+                    let label = if sandboxed {
+                        "shell (sandboxed)"
+                    } else {
+                        "shell"
+                    };
                     return Err(Error::ActionFailed {
                         action: label.to_string(),
                         message: format!("command failed: {}", stderr_str),
@@ -282,7 +286,11 @@ mod tests {
     fn test_execute_sandboxed_allows_cwd_read() {
         // Reading files inside the working directory should work
         let result = execute_sandboxed("ls Cargo.toml");
-        assert!(result.is_ok(), "sandbox should allow reading CWD files: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "sandbox should allow reading CWD files: {:?}",
+            result.err()
+        );
     }
 
     #[test]

@@ -39,6 +39,17 @@ pub fn from_json(json: &str) -> Result<ScaffoldIR, String> {
     serde_json::from_str(json).map_err(|e| e.to_string())
 }
 
+/// Parse .scaffold source and lower to IR in one step.
+pub fn parse_and_lower(source: &str) -> Result<ScaffoldIR, String> {
+    let program = scaffold_syntax::parser::parse(source).map_err(|e| format!("{}", e))?;
+    lower(&program).map_err(|errs| {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 pub struct Lowerer {
     ir: ScaffoldIR,
     errors: Vec<LowerError>,
@@ -488,5 +499,34 @@ mod tests {
         let ir2 = from_json(&json).unwrap();
         assert_eq!(ir2.objectives[0].subs.len(), 1);
         assert_eq!(ir2.objectives[0].subs[0].name, "inner_opt");
+    }
+
+    #[test]
+    fn test_parse_and_lower() {
+        let src = r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "Solve: {{ input }}"
+            }
+            graph solve {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+        "#;
+        let ir = super::parse_and_lower(src).unwrap();
+        assert_eq!(ir.nodes.len(), 1);
+        assert_eq!(ir.graphs.len(), 1);
+        assert_eq!(ir.nodes[0].name, "solver");
+        assert_eq!(ir.graphs[0].name, "solve");
+    }
+
+    #[test]
+    fn test_parse_and_lower_error() {
+        let result = super::parse_and_lower("this is not valid scaffold source {{{");
+        assert!(result.is_err());
     }
 }

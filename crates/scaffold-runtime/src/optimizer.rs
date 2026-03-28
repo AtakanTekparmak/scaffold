@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use scaffold_ir::ir::*;
+use scaffold_ir::pretty::pretty_print;
 
 use crate::error::{Error, Result};
 use crate::executor::{GraphExecutor, TunableOverrides};
@@ -28,10 +29,21 @@ use crate::value::Value;
 /// Events emitted by the optimizer for live visualization.
 #[derive(Debug, Clone)]
 pub enum OptEvent {
-    SubObjectiveStarted { sub_name: String, graph_name: String },
-    SubObjectiveCompleted { sub_name: String, best_score: Option<f64>, total_candidates: usize },
-    ParentPhaseStarted { objective_name: String },
-    PhaseChanged { phase: OptPhase },
+    SubObjectiveStarted {
+        sub_name: String,
+        graph_name: String,
+    },
+    SubObjectiveCompleted {
+        sub_name: String,
+        best_score: Option<f64>,
+        total_candidates: usize,
+    },
+    ParentPhaseStarted {
+        objective_name: String,
+    },
+    PhaseChanged {
+        phase: OptPhase,
+    },
     CandidateEvaluated {
         candidate_id: usize,
         parent_id: Option<usize>,
@@ -53,15 +65,37 @@ pub enum OptEvent {
         passed: bool,
         case_id: Option<String>,
     },
-    MutationSkipped { reason: String },
-    MetaProposal { reasoning: String, mutation_label: String, context_tokens: usize },
-    EarlyStopped { score: f64, target: f64 },
-    Completed { objective_name: String, best_score: Option<f64>, total_candidates: usize },
-    Log { message: String },
-    MetaAgentActive { model: String },
+    MutationSkipped {
+        reason: String,
+    },
+    MetaProposal {
+        reasoning: String,
+        mutation_label: String,
+        context_tokens: usize,
+    },
+    EarlyStopped {
+        score: f64,
+        target: f64,
+    },
+    Completed {
+        objective_name: String,
+        best_score: Option<f64>,
+        total_candidates: usize,
+    },
+    Log {
+        message: String,
+    },
+    MetaAgentActive {
+        model: String,
+    },
     MetaAgentThinking,
-    HarnessInfo { models: Vec<String> },
-    SummarizingFailures { done: usize, total: usize },
+    HarnessInfo {
+        models: Vec<String>,
+    },
+    SummarizingFailures {
+        done: usize,
+        total: usize,
+    },
 }
 
 /// Optimizer phase.
@@ -82,7 +116,7 @@ pub struct OptimizationOptions {
     pub backend: OptimizationBackend,
     /// Directory to write reports.
     pub report_dir: Option<PathBuf>,
-    /// Write the best candidate IR to this file.
+    /// Write the best candidate as a standalone `.scaffold` program to this file.
     pub write_best: Option<PathBuf>,
     /// Optional event sender for live TUI visualization.
     pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<OptEvent>>,
@@ -92,6 +126,10 @@ pub struct OptimizationOptions {
     /// LLM model for meta-agent guided mutations.
     /// None = random mutations (backward compatible).
     pub meta_model: Option<String>,
+    /// Path to a debug log file for meta-agent context/responses.
+    /// When set, every meta-agent LLM call appends the full system prompt,
+    /// context, raw response, and parse result to this file.
+    pub meta_log: Option<PathBuf>,
 }
 
 impl Default for OptimizationOptions {
@@ -104,6 +142,7 @@ impl Default for OptimizationOptions {
             event_tx: None,
             concurrency: 1,
             meta_model: None,
+            meta_log: None,
         }
     }
 }
@@ -113,6 +152,38 @@ fn emit(options: &OptimizationOptions, event: OptEvent) {
     if let Some(ref tx) = options.event_tx {
         let _ = tx.send(event);
     }
+}
+
+/// Reset the meta-agent debug log once at the start of a top-level optimize run.
+///
+/// The meta-agent itself appends within a run; this ensures separate runs don't
+/// accumulate into one ever-growing file.
+fn reset_meta_log(options: &OptimizationOptions) -> Result<()> {
+    let Some(path) = options.meta_log.as_ref() else {
+        return Ok(());
+    };
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Error::Runtime(format!(
+                    "failed to create meta log directory '{}': {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+    }
+
+    std::fs::File::create(path).map_err(|e| {
+        Error::Runtime(format!(
+            "failed to reset meta log '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    Ok(())
 }
 
 /// Backend selection.
@@ -133,6 +204,13 @@ pub struct CaseResult {
     pub checker_results: Vec<(String, bool)>,
     /// Truncated graph output for failed cases (so the meta-agent can see *why* it failed).
     pub output_excerpt: Option<String>,
+    /// Full graph output / checker output for failed cases.
+    pub raw_output: Option<String>,
+    /// The model's actual response (e.g. generated code) — lets the meta-agent see
+    /// how the prompt was interpreted, not just that it failed.
+    pub model_response: Option<String>,
+    /// Per-step outputs captured during graph execution (step_name → output).
+    pub step_trace: Vec<(String, String)>,
 }
 
 /// A candidate in the search archive.
@@ -164,6 +242,8 @@ pub struct Candidate {
     pub total_cases: usize,
     /// Number of cases that passed the primary checker.
     pub cases_passed: usize,
+    /// IDs of cases that passed (for computing diffs between candidates).
+    pub passed_case_ids: Vec<String>,
 }
 
 /// The optimization archive.
@@ -209,8 +289,11 @@ impl Archive {
 
     /// Get evaluated candidates sorted by score descending.
     pub fn ranked(&self) -> Vec<&Candidate> {
-        let mut evaluated: Vec<&Candidate> =
-            self.candidates.iter().filter(|c| c.score.is_some()).collect();
+        let mut evaluated: Vec<&Candidate> = self
+            .candidates
+            .iter()
+            .filter(|c| c.score.is_some())
+            .collect();
         evaluated.sort_by(|a, b| {
             b.score
                 .unwrap()
@@ -283,9 +366,7 @@ pub async fn optimize(
         .objectives
         .iter()
         .find(|o| o.name == objective_name)
-        .ok_or_else(|| {
-            Error::Runtime(format!("objective '{}' not found", objective_name))
-        })?;
+        .ok_or_else(|| Error::Runtime(format!("objective '{}' not found", objective_name)))?;
 
     let graph = ir
         .graphs
@@ -304,7 +385,9 @@ pub async fn optimize(
     // Notify TUI of harness models and meta-agent early so the UI
     // reflects them from the very first frame (including during seeding).
     {
-        let mut models: Vec<String> = ir.nodes.iter()
+        let mut models: Vec<String> = ir
+            .nodes
+            .iter()
             .filter_map(|n| n.config.model.clone())
             .collect();
         models.sort();
@@ -312,13 +395,16 @@ pub async fn optimize(
         emit(options, OptEvent::HarnessInfo { models });
     }
     if let Some(ref model) = options.meta_model {
-        emit(options, OptEvent::MetaAgentActive { model: model.clone() });
+        emit(
+            options,
+            OptEvent::MetaAgentActive {
+                model: model.clone(),
+            },
+        );
     }
 
     match options.backend {
-        OptimizationBackend::Grid => {
-            run_grid_search(ir, objective, graph, &dataset, options).await
-        }
+        OptimizationBackend::Grid => run_grid_search(ir, objective, graph, &dataset, options).await,
         OptimizationBackend::Evolutionary => {
             run_evolutionary(ir, objective, graph, &dataset, options).await
         }
@@ -333,13 +419,13 @@ pub async fn optimize_hierarchical(
     objective_name: &str,
     options: &OptimizationOptions,
 ) -> Result<HierarchicalReport> {
+    reset_meta_log(options)?;
+
     let objective = ir
         .objectives
         .iter()
         .find(|o| o.name == objective_name)
-        .ok_or_else(|| {
-            Error::Runtime(format!("objective '{}' not found", objective_name))
-        })?;
+        .ok_or_else(|| Error::Runtime(format!("objective '{}' not found", objective_name)))?;
 
     if objective.subs.is_empty() {
         // No subs — run flat optimization and wrap in hierarchical report
@@ -361,10 +447,13 @@ pub async fn optimize_hierarchical(
     // Optimize each sub in dependency order
     for sub_idx in ordered_subs {
         let sub = &objective.subs[sub_idx];
-        emit(options, OptEvent::SubObjectiveStarted {
-            sub_name: sub.name.clone(),
-            graph_name: sub.graph.clone(),
-        });
+        emit(
+            options,
+            OptEvent::SubObjectiveStarted {
+                sub_name: sub.name.clone(),
+                graph_name: sub.graph.clone(),
+            },
+        );
         if options.event_tx.is_none() {
             eprintln!(
                 "[optimizer] optimizing sub '{}' (graph: '{}')",
@@ -384,11 +473,14 @@ pub async fn optimize_hierarchical(
         // Remove the temporary objective
         working_ir.objectives.retain(|o| o.name != temp_name);
 
-        emit(options, OptEvent::SubObjectiveCompleted {
-            sub_name: sub.name.clone(),
-            best_score: result.report.best_score,
-            total_candidates: result.report.total_candidates,
-        });
+        emit(
+            options,
+            OptEvent::SubObjectiveCompleted {
+                sub_name: sub.name.clone(),
+                best_score: result.report.best_score,
+                total_candidates: result.report.total_candidates,
+            },
+        );
 
         sub_reports.push(SubOptimizationReport {
             sub_name: sub.name.clone(),
@@ -405,7 +497,12 @@ pub async fn optimize_hierarchical(
                 }
             }
             // Collect step names that call this sub's graph for auto-preserve
-            collect_steps_calling_graph(&working_ir, &objective.graph, &sub.graph, &mut frozen_step_names);
+            collect_steps_calling_graph(
+                &working_ir,
+                &objective.graph,
+                &sub.graph,
+                &mut frozen_step_names,
+            );
         }
 
         // Bake sub-objective's best overrides into the IR node configs.
@@ -420,7 +517,11 @@ pub async fn optimize_hierarchical(
     // We do this by modifying the objective in working_ir
     // But since optimize() takes objective by name from IR, we need to update it in place
     {
-        if let Some(obj) = working_ir.objectives.iter_mut().find(|o| o.name == objective_name) {
+        if let Some(obj) = working_ir
+            .objectives
+            .iter_mut()
+            .find(|o| o.name == objective_name)
+        {
             let topo = obj.topology.get_or_insert_with(|| TopologyIR {
                 mutations: vec![],
                 max_nodes: None,
@@ -436,9 +537,12 @@ pub async fn optimize_hierarchical(
         }
     }
 
-    emit(options, OptEvent::ParentPhaseStarted {
-        objective_name: objective_name.to_string(),
-    });
+    emit(
+        options,
+        OptEvent::ParentPhaseStarted {
+            objective_name: objective_name.to_string(),
+        },
+    );
     if options.event_tx.is_none() {
         eprintln!(
             "[optimizer] optimizing parent objective '{}' with frozen children",
@@ -487,7 +591,7 @@ fn compute_sub_dependency_order(subs: &[SubObjectiveIR], ir: &ScaffoldIR) -> Res
                     if dep_idx != i {
                         deps.entry(i).or_default().push(dep_idx);
                         *in_degree.entry(i).or_insert(0) += 0; // ensure entry exists
-                        // dep_idx is depended on by i, so i has an incoming edge
+                                                               // dep_idx is depended on by i, so i has an incoming edge
                     }
                 }
             }
@@ -563,9 +667,7 @@ async fn optimize_and_extract(
         .objectives
         .iter()
         .find(|o| o.name == objective_name)
-        .ok_or_else(|| {
-            Error::Runtime(format!("objective '{}' not found", objective_name))
-        })?;
+        .ok_or_else(|| Error::Runtime(format!("objective '{}' not found", objective_name)))?;
 
     let graph = ir
         .graphs
@@ -592,12 +694,17 @@ async fn optimize_and_extract(
     }
 
     let best_graph = archive.best().map(|c| c.graph.clone());
-    let best_overrides = archive.best()
+    let best_overrides = archive
+        .best()
         .map(|c| c.overrides.clone())
         .filter(|o| !o.is_empty());
-    let report = build_report(objective, &archive, options)?;
+    let report = build_report(ir, objective, &archive, options)?;
 
-    Ok(OptimizationResult { report, best_graph, best_overrides })
+    Ok(OptimizationResult {
+        report,
+        best_graph,
+        best_overrides,
+    })
 }
 
 /// Collect step names in parent_graph that call the given sub_graph.
@@ -641,10 +748,41 @@ fn collect_steps_calling_graph_in_body(
 
 /// Bake runtime overrides into the IR node configs so they become the new defaults.
 ///
+/// This also materializes synthetic nodes created by `AddPromptStep` so the baked IR
+/// remains executable without needing runtime-only `_node.*` overrides.
+///
 /// Override keys follow the pattern `"node_name.field"` where field is one of:
-/// template, system, shell, temperature, model, max_tokens.
+/// template, system, shell, temperature, model, max_tokens, max_turns, timeout.
 fn bake_overrides_into_ir(ir: &mut ScaffoldIR, overrides: &HashMap<String, serde_json::Value>) {
-    use scaffold_ir::ir::StringOrFileIR;
+    use scaffold_ir::ir::{NodeConfigIR, NodeIR, NodeKindIR, StringOrFileIR, TypeIR};
+
+    for (key, value) in overrides {
+        if let Some(node_name) = key.strip_prefix("_node.") {
+            if ir.nodes.iter().any(|n| n.name == node_name) {
+                continue;
+            }
+
+            let kind = value
+                .as_object()
+                .and_then(|obj| obj.get("kind"))
+                .and_then(|kind| kind.as_str())
+                .map(|kind| match kind {
+                    "tool" => NodeKindIR::Tool,
+                    "agent" => NodeKindIR::Agent,
+                    "verify" => NodeKindIR::Verify,
+                    _ => NodeKindIR::Prompt,
+                })
+                .unwrap_or(NodeKindIR::Prompt);
+
+            ir.nodes.push(NodeIR {
+                name: node_name.to_string(),
+                kind,
+                input: TypeIR::String,
+                output: TypeIR::String,
+                config: NodeConfigIR::default(),
+            });
+        }
+    }
 
     for (key, value) in overrides {
         let parts: Vec<&str> = key.splitn(2, '.').collect();
@@ -685,10 +823,37 @@ fn bake_overrides_into_ir(ir: &mut ScaffoldIR, overrides: &HashMap<String, serde
                 "max_tokens" => {
                     node.config.max_tokens = value.as_u64();
                 }
+                "max_turns" => {
+                    node.config.max_turns = value.as_u64();
+                }
+                "timeout" => {
+                    node.config.timeout = value.as_u64();
+                }
                 _ => {} // Unknown field, skip
             }
         }
     }
+}
+
+fn materialize_best_candidate_ir(
+    ir: &ScaffoldIR,
+    objective: &ObjectiveIR,
+    best: &Candidate,
+) -> ScaffoldIR {
+    let mut best_ir = ir.clone();
+
+    if let Some(graph) = best_ir
+        .graphs
+        .iter_mut()
+        .find(|graph| graph.name == objective.graph)
+    {
+        *graph = best.graph.clone();
+    } else {
+        best_ir.graphs.push(best.graph.clone());
+    }
+
+    bake_overrides_into_ir(&mut best_ir, &best.overrides);
+    best_ir
 }
 
 /// A single dataset case for evaluation.
@@ -760,9 +925,7 @@ fn expr_to_value(expr: &ExprIR) -> Value {
         ExprIR::LitString { value } => Value::String(value.clone()),
         ExprIR::LitBool { value } => Value::Bool(*value),
         ExprIR::LitNull => Value::Null,
-        ExprIR::List { elements } => {
-            Value::List(elements.iter().map(expr_to_value).collect())
-        }
+        ExprIR::List { elements } => Value::List(elements.iter().map(expr_to_value).collect()),
         ExprIR::Record { fields } => {
             let map: HashMap<String, Value> = fields
                 .iter()
@@ -785,7 +948,14 @@ async fn evaluate_candidate(
     dataset: &[DatasetCase],
     options: &OptimizationOptions,
     display_id: usize,
-) -> Result<(f64, HashMap<String, f64>, Vec<CaseResult>, usize, usize)> {
+) -> Result<(
+    f64,
+    HashMap<String, f64>,
+    Vec<CaseResult>,
+    usize,
+    usize,
+    Vec<String>,
+)> {
     use futures::stream::{self, StreamExt};
 
     // Build a modified IR with the candidate's graph
@@ -796,29 +966,31 @@ async fn evaluate_candidate(
         }
     }
 
-    let executor = GraphExecutor::new(modified_ir)
-        .with_overrides(candidate.overrides.clone());
+    let executor = GraphExecutor::new(modified_ir).with_overrides(candidate.overrides.clone());
 
     let case_count = dataset.len();
     if case_count == 0 {
-        return Ok((0.0, HashMap::new(), vec![], 0, 0));
+        return Ok((0.0, HashMap::new(), vec![], 0, 0, vec![]));
     }
 
     let concurrency = options.concurrency.max(1);
 
-    emit(options, OptEvent::EvaluationStarted {
-        candidate_id: display_id,
-        total_cases: case_count,
-    });
+    emit(
+        options,
+        OptEvent::EvaluationStarted {
+            candidate_id: display_id,
+            total_cases: case_count,
+        },
+    );
 
     // Find the primary checker name (used to determine per-case pass/fail in TUI).
     // Resolve: score expr → metric name → checker name.
     let primary_checker = match &objective.score {
-        ExprIR::Ident { name } => {
-            objective.metrics.iter()
-                .find(|m| m.name == *name)
-                .map(|m| m.checker.clone())
-        }
+        ExprIR::Ident { name } => objective
+            .metrics
+            .iter()
+            .find(|m| m.name == *name)
+            .map(|m| m.checker.clone()),
         _ => None,
     };
 
@@ -826,17 +998,42 @@ async fn evaluate_candidate(
     let mut case_results: Vec<CaseResult> = Vec::with_capacity(case_count);
     let mut completed = 0usize;
     let mut cases_passed = 0usize;
+    let mut passed_case_ids: Vec<String> = Vec::new();
 
     // Run cases concurrently with controlled parallelism.
     // buffer_unordered polls up to `concurrency` futures at once on the
     // same task (no Send required), yielding results as they complete.
     let graph_name = &objective.graph;
     let executor_ref = &executor;
+    // Identify prompt/agent node names so we can extract model responses from step traces.
+    let prompt_node_names: Vec<&str> = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKindIR::Prompt | NodeKindIR::Agent))
+        .map(|n| n.name.as_str())
+        .collect();
+    // Map step → node for the graph, so we know which steps are prompt calls.
+    let step_node_map: HashMap<String, String> = {
+        let graph_ir = ir
+            .graphs
+            .iter()
+            .find(|g| g.name == objective.graph)
+            .unwrap();
+        let step_names = crate::mutations::collect_step_names(&graph_ir.body);
+        step_names
+            .into_iter()
+            .filter_map(|s| {
+                crate::meta_agent::find_step_node_pub(&graph_ir.body, &s).map(|n| (s, n))
+            })
+            .collect()
+    };
     let futs = dataset.iter().enumerate().map(|(idx, case)| {
         let input = case.input.clone();
         async move {
-            // Retry transient API errors (HTTP 5xx, rate limits, timeouts) up to 2 times
-            let mut result = executor_ref.execute_graph(graph_name, input.clone()).await;
+            // Use traced execution to capture intermediate step outputs
+            let mut result = executor_ref
+                .execute_graph_traced(graph_name, input.clone())
+                .await;
             for retry in 0..2 {
                 if let Err(ref e) = result {
                     let msg = e.to_string().to_lowercase();
@@ -850,8 +1047,11 @@ async fn evaluate_candidate(
                         || msg.contains("timed out")
                         || msg.contains("connection");
                     if is_transient {
-                        tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(retry + 1))).await;
-                        result = executor_ref.execute_graph(graph_name, input.clone()).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(retry + 1)))
+                            .await;
+                        result = executor_ref
+                            .execute_graph_traced(graph_name, input.clone())
+                            .await;
                         continue;
                     }
                 }
@@ -867,97 +1067,151 @@ async fn evaluate_candidate(
         let case = &dataset[idx];
         completed += 1;
 
-        let (passed, checker_bits, output_excerpt) = match result {
-            Ok(output) => {
-                let mut primary_pass = true;
-                let mut all_pass = !objective.checkers.is_empty();
-                let mut bits = Vec::with_capacity(objective.checkers.len());
-                for checker in &objective.checkers {
-                    let val = eval_checker_expr(&executor, &checker.expr, &output, &case.expected);
-                    *checker_totals.entry(checker.name.clone()).or_default() += val;
-                    let ok = val >= 1.0;
-                    bits.push((checker.name.clone(), ok));
-                    if !ok { all_pass = false; }
-                    if primary_checker.as_deref() == Some(&checker.name) {
-                        primary_pass = ok;
+        let (passed, checker_bits, output_excerpt, raw_output, model_response, step_trace) =
+            match result {
+                Ok((output, step_trace)) => {
+                    let mut primary_pass = true;
+                    let mut all_pass = !objective.checkers.is_empty();
+                    let mut bits = Vec::with_capacity(objective.checkers.len());
+                    for checker in &objective.checkers {
+                        let val =
+                            eval_checker_expr(&executor, &checker.expr, &output, &case.expected);
+                        *checker_totals.entry(checker.name.clone()).or_default() += val;
+                        let ok = val >= 1.0;
+                        bits.push((checker.name.clone(), ok));
+                        if !ok {
+                            all_pass = false;
+                        }
+                        if primary_checker.as_deref() == Some(&checker.name) {
+                            primary_pass = ok;
+                        }
                     }
+                    let p = if primary_checker.is_some() {
+                        primary_pass
+                    } else {
+                        all_pass
+                    };
+                    // For failed cases, extract test output and model response from step trace
+                    let (excerpt, raw, model_resp) = if !p {
+                        let out_str = output.to_string();
+                        let truncated: String = if out_str.len() > 300 {
+                            let s: String = out_str.chars().take(300).collect();
+                            format!("{}...", s)
+                        } else {
+                            out_str.clone()
+                        };
+                        emit(
+                            options,
+                            OptEvent::Log {
+                                message: format!(
+                                    "Case {} FAILED — output: {}",
+                                    case.id.as_deref().unwrap_or("?"),
+                                    truncated,
+                                ),
+                            },
+                        );
+                        // Extract test_output from JSON if possible
+                        let useful =
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&out_str) {
+                                json.get("test_output")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or(out_str.clone())
+                            } else {
+                                out_str.clone()
+                            };
+                        let max_len = 1500;
+                        let excerpt = if useful.len() > max_len {
+                            Some(format!("{}...", &useful[..max_len]))
+                        } else {
+                            Some(useful.clone())
+                        };
+                        // Extract model response from step trace: find the LAST prompt node output
+                        let model_resp = step_trace
+                            .iter()
+                            .rev()
+                            .find(|(step_name, _)| {
+                                step_node_map
+                                    .get(step_name)
+                                    .map(|node| prompt_node_names.contains(&node.as_str()))
+                                    .unwrap_or(false)
+                            })
+                            .map(|(step_name, value)| {
+                                let max = 500;
+                                let truncated: String = value.chars().take(max).collect();
+                                if truncated.len() < value.len() {
+                                    format!("[{}] {}...", step_name, truncated)
+                                } else {
+                                    format!("[{}] {}", step_name, value)
+                                }
+                            });
+                        (excerpt, Some(useful), model_resp)
+                    } else {
+                        (None, None, None)
+                    };
+                    let trace = if !p { step_trace } else { Vec::new() };
+                    (p, bits, excerpt, raw, model_resp, trace)
                 }
-                let p = if primary_checker.is_some() { primary_pass } else { all_pass };
-                // Log failed cases with truncated output for debugging
-                let excerpt = if !p {
-                    let out_str = output.to_string();
-                    let truncated = if out_str.len() > 300 {
-                        format!("{}...", &out_str[..300])
-                    } else {
-                        out_str.clone()
-                    };
-                    emit(options, OptEvent::Log {
-                        message: format!(
-                            "Case {} FAILED — output: {}",
-                            case.id.as_deref().unwrap_or("?"),
-                            truncated,
-                        ),
-                    });
-                    // Extract test_output from JSON if possible (avoids meta-agent
-                    // wasting context on the JSON wrapper)
-                    let useful = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&out_str) {
-                        json.get("test_output")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or(out_str.clone())
-                    } else {
-                        out_str.clone()
-                    };
-                    let max_len = 1500;
-                    if useful.len() > max_len {
-                        Some(format!("{}...", &useful[..max_len]))
-                    } else {
-                        Some(useful)
-                    }
-                } else {
-                    None
-                };
-                (p, bits, excerpt)
-            }
-            Err(e) => {
-                // Log graph execution errors so template / rendering failures
-                // are visible instead of silently scoring 0.
-                let err_str = format!("execution error: {}", e);
-                emit(options, OptEvent::Log {
-                    message: format!(
-                        "Case {} {}",
-                        case.id.as_deref().unwrap_or("?"),
-                        err_str,
-                    ),
-                });
-                let bits: Vec<_> = objective.checkers.iter()
-                    .map(|c| (c.name.clone(), false))
-                    .collect();
-                (false, bits, Some(err_str))
-            }
-        };
+                Err(e) => {
+                    // Log graph execution errors so template / rendering failures
+                    // are visible instead of silently scoring 0.
+                    let err_str = format!("execution error: {}", e);
+                    emit(
+                        options,
+                        OptEvent::Log {
+                            message: format!(
+                                "Case {} {}",
+                                case.id.as_deref().unwrap_or("?"),
+                                err_str,
+                            ),
+                        },
+                    );
+                    let bits: Vec<_> = objective
+                        .checkers
+                        .iter()
+                        .map(|c| (c.name.clone(), false))
+                        .collect();
+                    (
+                        false,
+                        bits,
+                        Some(err_str.clone()),
+                        Some(err_str),
+                        None,
+                        Vec::new(),
+                    )
+                }
+            };
 
         if passed {
             cases_passed += 1;
+            if let Some(ref id) = case.id {
+                passed_case_ids.push(id.clone());
+            }
         }
 
-        // Only store failed cases (capped) — these are what the meta-agent learns from.
+        // Only store failed cases — these are what the meta-agent learns from.
         if !passed {
             case_results.push(CaseResult {
                 case_id: case.id.clone(),
                 passed,
                 checker_results: checker_bits,
                 output_excerpt,
+                raw_output,
+                model_response,
+                step_trace,
             });
         }
 
-        emit(options, OptEvent::CaseCompleted {
-            candidate_id: display_id,
-            case_index: completed,
-            total_cases: case_count,
-            passed,
-            case_id: case.id.clone(),
-        });
+        emit(
+            options,
+            OptEvent::CaseCompleted {
+                candidate_id: display_id,
+                case_index: completed,
+                total_cases: case_count,
+                passed,
+                case_id: case.id.clone(),
+            },
+        );
     }
 
     // Compute metric averages (each metric references a checker)
@@ -969,7 +1223,10 @@ async fn evaluate_candidate(
 
     // Evaluate the score expression with metric averages in scope
     let score_scope = Scope::with_bindings(
-        metric_avgs.iter().map(|(k, v)| (k.as_str(), Value::Float(*v))).collect(),
+        metric_avgs
+            .iter()
+            .map(|(k, v)| (k.as_str(), Value::Float(*v)))
+            .collect(),
     );
     let score = match executor.eval_expr(&objective.score, &score_scope) {
         Ok(Value::Float(f)) => f,
@@ -979,7 +1236,14 @@ async fn evaluate_candidate(
         _ => 0.0,
     };
 
-    Ok((score, metric_avgs, case_results, case_count, cases_passed))
+    Ok((
+        score,
+        metric_avgs,
+        case_results,
+        case_count,
+        cases_passed,
+        passed_case_ids,
+    ))
 }
 
 /// Evaluate a checker expression with `output` and `expected` in scope.
@@ -1003,79 +1267,6 @@ pub fn eval_checker_expr(
     }
 }
 
-/// Summarize verbose failure outputs using a small, cheap LLM.
-///
-/// Each failed case's `output_excerpt` (raw pytest/test output, up to 1500 chars)
-/// is sent to gpt-4o-mini for extraction of key failure lines. The returned Vec
-/// has the same length as `case_results`; entries are `Some(summary)` on success,
-/// `None` if the LLM call fails (we keep the original excerpt in that case).
-async fn summarize_failure_outputs(
-    case_results: &[CaseResult],
-    options: &OptimizationOptions,
-) -> Vec<Option<String>> {
-    use futures::stream::{self, StreamExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    const SUMMARIZER_MODEL: &str = "gpt-4o-mini";
-    const MAX_CONCURRENT: usize = 10;
-
-    let done_count = AtomicUsize::new(0);
-    let total = case_results.len();
-
-    let futs = case_results.iter().enumerate().map(|(idx, case)| {
-        let excerpt = case.output_excerpt.clone();
-        let done_ref = &done_count;
-        async move {
-            let raw = match excerpt {
-                Some(ref s) if !s.is_empty() => s.as_str(),
-                _ => {
-                    let completed = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                    emit(options, OptEvent::SummarizingFailures { done: completed, total });
-                    return (idx, None);
-                }
-            };
-            // Skip short outputs — they're already concise enough
-            if raw.len() < 200 {
-                let completed = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                emit(options, OptEvent::SummarizingFailures { done: completed, total });
-                return (idx, None);
-            }
-            let prompt = format!(
-                "You are compressing failure logs from an evolutionary prompt optimization run. \
-                 Each log is a test/evaluation output from a candidate solution. \
-                 Your compressed output will be fed to a meta-agent LLM that uses this history \
-                 to decide which mutations to propose next.\n\n\
-                 Extract ONLY the information useful for the meta-agent:\n\
-                 - Assertion errors with expected vs actual values\n\
-                 - Exception names and error messages\n\
-                 - Failing test names\n\
-                 - Any pattern that reveals WHY the candidate failed\n\n\
-                 Drop stack traces, file paths, and boilerplate. \
-                 Output just the compressed failure summary, nothing else.\n\n{}",
-                raw
-            );
-            let config = crate::llm::LlmConfig::new()
-                .with_model(SUMMARIZER_MODEL)
-                .with_temperature(0.0)
-                .with_max_tokens(400);
-            let result = match crate::llm::query_with_config(&prompt, &config).await {
-                Ok(summary) => (idx, Some(summary.trim().to_string())),
-                Err(_) => (idx, None),
-            };
-            let completed = done_ref.fetch_add(1, Ordering::Relaxed) + 1;
-            emit(options, OptEvent::SummarizingFailures { done: completed, total });
-            result
-        }
-    });
-
-    let mut results = vec![None; case_results.len()];
-    let mut stream = stream::iter(futs).buffer_unordered(MAX_CONCURRENT);
-    while let Some((idx, summary)) = stream.next().await {
-        results[idx] = summary;
-    }
-    results
-}
-
 // ── Grid Search ──
 
 async fn run_grid_search(
@@ -1087,7 +1278,7 @@ async fn run_grid_search(
 ) -> Result<OptimizationReport> {
     let mut archive = Archive::new();
     run_grid_search_into(ir, objective, graph, dataset, options, &mut archive).await?;
-    build_report(objective, &archive, options)
+    build_report(ir, objective, &archive, options)
 }
 
 async fn run_grid_search_into(
@@ -1120,22 +1311,27 @@ async fn run_grid_search_into(
             case_results: vec![],
             total_cases: 0,
             cases_passed: 0,
+            passed_case_ids: vec![],
         };
 
         let cand_id = archive.candidates.len();
-        let (score, metrics, cases, total, passed) = evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id).await?;
+        let (score, metrics, cases, total, passed, passed_ids) =
+            evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id).await?;
         let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
 
-        emit(options, OptEvent::CandidateEvaluated {
-            candidate_id: cand_id,
-            parent_id: None,
-            score,
-            metric_scores: metrics.clone(),
-            best_so_far: best_before.max(score),
-            mutations: vec![],
-            generation: i + 1,
-            max_generations: combinations.len().min(options.max_candidates),
-        });
+        emit(
+            options,
+            OptEvent::CandidateEvaluated {
+                candidate_id: cand_id,
+                parent_id: None,
+                score,
+                metric_scores: metrics.clone(),
+                best_so_far: best_before.max(score),
+                mutations: vec![],
+                generation: i + 1,
+                max_generations: combinations.len().min(options.max_candidates),
+            },
+        );
         if options.event_tx.is_none() {
             eprintln!(
                 "[optimizer] candidate {}/{}: score={:.4}",
@@ -1151,6 +1347,7 @@ async fn run_grid_search_into(
             case_results: cases,
             total_cases: total,
             cases_passed: passed,
+            passed_case_ids: passed_ids,
             ..candidate
         });
     }
@@ -1210,7 +1407,7 @@ async fn run_evolutionary(
 ) -> Result<OptimizationReport> {
     let mut archive = Archive::new();
     run_evolutionary_into(ir, objective, graph, dataset, options, &mut archive).await?;
-    build_report(objective, &archive, options)
+    build_report(ir, objective, &archive, options)
 }
 
 async fn run_evolutionary_into(
@@ -1242,10 +1439,11 @@ async fn run_evolutionary_into(
         case_results: vec![],
         total_cases: 0,
         cases_passed: 0,
+        passed_case_ids: vec![],
     };
 
     let next_id = archive.candidates.len();
-    let (seed_score, seed_metrics, seed_cases, seed_total, seed_passed) =
+    let (seed_score, seed_metrics, seed_cases, seed_total, seed_passed, seed_passed_ids) =
         evaluate_candidate(ir, objective, &seed, dataset, options, next_id).await?;
     let seed_id = archive.add(Candidate {
         score: Some(seed_score),
@@ -1253,33 +1451,52 @@ async fn run_evolutionary_into(
         case_results: seed_cases,
         total_cases: seed_total,
         cases_passed: seed_passed,
+        passed_case_ids: seed_passed_ids,
         ..seed
     });
 
-    emit(options, OptEvent::PhaseChanged { phase: OptPhase::Seeding });
-    emit(options, OptEvent::CandidateEvaluated {
-        candidate_id: seed_id,
-        parent_id: None,
-        score: seed_score,
-        metric_scores: archive.candidates.last().map(|c| c.metric_scores.clone()).unwrap_or_default(),
-        best_so_far: seed_score,
-        mutations: vec![],
-        generation: 0,
-        max_generations: options.max_candidates,
-    });
+    emit(
+        options,
+        OptEvent::PhaseChanged {
+            phase: OptPhase::Seeding,
+        },
+    );
+    emit(
+        options,
+        OptEvent::CandidateEvaluated {
+            candidate_id: seed_id,
+            parent_id: None,
+            score: seed_score,
+            metric_scores: archive
+                .candidates
+                .last()
+                .map(|c| c.metric_scores.clone())
+                .unwrap_or_default(),
+            best_so_far: seed_score,
+            mutations: vec![],
+            generation: 0,
+            max_generations: options.max_candidates,
+        },
+    );
     if options.event_tx.is_none() {
-        eprintln!(
-            "[optimizer] seed candidate: score={:.4}",
-            seed_score
-        );
+        eprintln!("[optimizer] seed candidate: score={:.4}", seed_score);
     }
 
     // Check early stop after seed
     if let Some(ts) = target_score {
         if seed_score >= ts {
-            emit(options, OptEvent::EarlyStopped { score: seed_score, target: ts });
+            emit(
+                options,
+                OptEvent::EarlyStopped {
+                    score: seed_score,
+                    target: ts,
+                },
+            );
             if options.event_tx.is_none() {
-                eprintln!("[optimizer] target score {:.4} reached by seed, stopping early", ts);
+                eprintln!(
+                    "[optimizer] target score {:.4} reached by seed, stopping early",
+                    ts
+                );
             }
             return Ok(());
         }
@@ -1307,9 +1524,11 @@ async fn run_evolutionary_into(
             case_results: vec![],
             total_cases: 0,
             cases_passed: 0,
+            passed_case_ids: vec![],
         };
         let tunable_id = archive.candidates.len();
-        let (score, metrics, cases, total, passed) = evaluate_candidate(ir, objective, &candidate, dataset, options, tunable_id).await?;
+        let (score, metrics, cases, total, passed, passed_ids) =
+            evaluate_candidate(ir, objective, &candidate, dataset, options, tunable_id).await?;
         let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
 
         archive.add(Candidate {
@@ -1318,25 +1537,33 @@ async fn run_evolutionary_into(
             case_results: cases,
             total_cases: total,
             cases_passed: passed,
+            passed_case_ids: passed_ids,
             ..candidate
         });
 
-        emit(options, OptEvent::PhaseChanged { phase: OptPhase::TunableSweep });
-        emit(options, OptEvent::CandidateEvaluated {
-            candidate_id: tunable_id,
-            parent_id: Some(seed_id),
-            score,
-            metric_scores: metrics,
-            best_so_far: best_before.max(score),
-            mutations: vec![],
-            generation: tunable_id,
-            max_generations: tunable_combos.len() + 1,
-        });
+        emit(
+            options,
+            OptEvent::PhaseChanged {
+                phase: OptPhase::TunableSweep,
+            },
+        );
+        emit(
+            options,
+            OptEvent::CandidateEvaluated {
+                candidate_id: tunable_id,
+                parent_id: Some(seed_id),
+                score,
+                metric_scores: metrics,
+                best_so_far: best_before.max(score),
+                mutations: vec![],
+                generation: tunable_id,
+                max_generations: tunable_combos.len() + 1,
+            },
+        );
         if options.event_tx.is_none() {
             eprintln!(
                 "[optimizer] tunable seed {}: score={:.4}",
-                tunable_id,
-                score
+                tunable_id, score
             );
         }
 
@@ -1355,9 +1582,26 @@ async fn run_evolutionary_into(
     // ── Phase 2: Evolutionary mutations ──
     // max_candidates = number of successful evolutionary generations (not total archive size).
     // Skipped/failed mutations do NOT count against the budget.
-    let mut allowed_mutations = topology
-        .map(|t| t.mutations.clone())
-        .unwrap_or_default();
+    let mut allowed_mutations = topology.map(|t| t.mutations.clone()).unwrap_or_default();
+
+    // Auto-include add_prompt_step when prompt/agent nodes exist so the optimizer
+    // can actually grow the graph with synthetic prompt nodes.
+    if ir
+        .nodes
+        .iter()
+        .any(|n| matches!(n.kind, NodeKindIR::Prompt | NodeKindIR::Agent))
+        && !allowed_mutations.contains(&"add_prompt_step".to_string())
+    {
+        allowed_mutations.push("add_prompt_step".to_string());
+    }
+
+    // insert_step only works when there is at least one node that can accept a
+    // single positional input value directly. Hide it otherwise.
+    if allowed_mutations.contains(&"insert_step".to_string())
+        && !has_single_input_compatible_node(ir)
+    {
+        allowed_mutations.retain(|m| m != "insert_step");
+    }
 
     // Auto-include set_config when tunables are declared so the meta-agent
     // (and random mutations) can propose config changes during evolution.
@@ -1366,7 +1610,12 @@ async fn run_evolutionary_into(
     }
 
     if allowed_mutations.is_empty() {
-        emit(options, OptEvent::Log { message: "no mutations configured, skipping evolutionary phase".into() });
+        emit(
+            options,
+            OptEvent::Log {
+                message: "no mutations configured, skipping evolutionary phase".into(),
+            },
+        );
         if options.event_tx.is_none() {
             eprintln!("[optimizer] no mutations configured, skipping evolutionary phase");
         }
@@ -1382,7 +1631,8 @@ async fn run_evolutionary_into(
     while successful_generations < max_generations && total_attempts < max_attempts {
         total_attempts += 1;
 
-        // Select parent — use novelty weighting only for random mutations;
+        // Select parent — sigmoid weighting favors high-scoring candidates.
+        // Novelty bonus (down-weight overused parents) only for random mode;
         // meta-agent provides its own diversity through LLM reasoning.
         let use_novelty = options.meta_model.is_none();
         let parent = select_parent(archive, &mut rng, use_novelty);
@@ -1398,74 +1648,10 @@ async fn run_evolutionary_into(
         let (mutation, meta_reasoning) = if let Some(ref meta_model) = options.meta_model {
             emit(options, OptEvent::MetaAgentThinking);
             // Clone parent for the meta-agent (borrow released)
-            let mut parent_clone = parent.clone();
+            let parent_clone = parent.clone();
 
-            // Lazy compression: estimate context size and compress failure
-            // outputs only if context would exceed the model's window.
-            // Context now includes ALL candidates' failure excerpts, so compress
-            // the entire archive when budget is exceeded.
-            let est_ctx_chars = crate::meta_agent::estimate_context_chars(
-                &parent_clone, archive, ir, objective, &allowed_mutations,
-            );
-            let ctx_budget_chars = 400_000; // ~100k tokens
-            if est_ctx_chars > ctx_budget_chars {
-                // Collect all case_results that need summarizing across the archive + parent
-                let mut all_excerpts: Vec<(usize, usize, String)> = Vec::new(); // (candidate_idx, case_idx, excerpt)
-                for (ci, cand) in archive.candidates.iter().enumerate() {
-                    for (ki, case) in cand.case_results.iter().enumerate() {
-                        if let Some(ref exc) = case.output_excerpt {
-                            if exc.len() > 300 {
-                                all_excerpts.push((ci, ki, exc.clone()));
-                            }
-                        }
-                    }
-                }
-                // Also include parent clone's case results
-                for (ki, case) in parent_clone.case_results.iter().enumerate() {
-                    if let Some(ref exc) = case.output_excerpt {
-                        if exc.len() > 300 {
-                            all_excerpts.push((usize::MAX, ki, exc.clone()));
-                        }
-                    }
-                }
-
-                if !all_excerpts.is_empty() {
-                    let total = all_excerpts.len();
-                    emit(options, OptEvent::SummarizingFailures { done: 0, total });
-
-                    // Build fake CaseResults for the summarizer
-                    let fake_cases: Vec<CaseResult> = all_excerpts.iter()
-                        .map(|(_, _, exc)| CaseResult {
-                            case_id: None, passed: false, checker_results: vec![],
-                            output_excerpt: Some(exc.clone()),
-                        })
-                        .collect();
-                    let summaries = summarize_failure_outputs(&fake_cases, options).await;
-                    let mut summarized = 0usize;
-                    for (idx, summary) in summaries.into_iter().enumerate() {
-                        if let Some(s) = summary {
-                            let (ci, ki, _) = &all_excerpts[idx];
-                            if *ci == usize::MAX {
-                                parent_clone.case_results[*ki].output_excerpt = Some(s);
-                            } else {
-                                archive.candidates[*ci].case_results[*ki].output_excerpt = Some(s);
-                            }
-                            summarized += 1;
-                        }
-                    }
-                    if summarized > 0 {
-                        emit(options, OptEvent::Log {
-                            message: format!(
-                                "Compressed {}/{} failure logs across archive (ctx was ~{}k chars, budget {}k)",
-                                summarized, total,
-                                est_ctx_chars / 1000, ctx_budget_chars / 1000,
-                            ),
-                        });
-                    }
-                }
-            }
-
-            let meta = crate::meta_agent::MetaAgent::new(meta_model);
+            let meta =
+                crate::meta_agent::MetaAgent::new(meta_model).with_log(options.meta_log.clone());
             match meta
                 .propose_mutation(&parent_clone, archive, ir, objective, &allowed_mutations)
                 .await
@@ -1486,8 +1672,9 @@ async fn run_evolutionary_into(
                         options,
                         OptEvent::Log {
                             message: format!(
-                                "Meta-agent: {} ({}) [ctx: ~{}k tokens]",
-                                proposal.reasoning, proposal.mutation.short_label(),
+                                "Meta-agent: {} ({}) [latest ctx: ~{}k tokens]",
+                                proposal.reasoning,
+                                proposal.mutation.short_label(),
                                 est_tokens / 1000,
                             ),
                         },
@@ -1495,28 +1682,81 @@ async fn run_evolutionary_into(
                     // Log the full content of rewrite mutations for debugging
                     match &proposal.mutation {
                         Mutation::RewritePrompt { node, new_template } => {
-                            emit(options, OptEvent::Log {
-                                message: format!(
-                                    "Rewrite template for '{}' ({} chars):\n{}",
-                                    node, new_template.len(), new_template
-                                ),
-                            });
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Rewrite template for '{}' ({} chars):\n{}",
+                                        node,
+                                        new_template.len(),
+                                        new_template
+                                    ),
+                                },
+                            );
                         }
                         Mutation::RewriteSystem { node, new_system } => {
-                            emit(options, OptEvent::Log {
-                                message: format!(
-                                    "Rewrite system for '{}' ({} chars):\n{}",
-                                    node, new_system.len(), new_system
-                                ),
-                            });
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Rewrite system for '{}' ({} chars):\n{}",
+                                        node,
+                                        new_system.len(),
+                                        new_system
+                                    ),
+                                },
+                            );
                         }
                         Mutation::RewriteShell { node, new_shell } => {
-                            emit(options, OptEvent::Log {
-                                message: format!(
-                                    "Rewrite shell for '{}' ({} chars):\n{}",
-                                    node, new_shell.len(), new_shell
-                                ),
-                            });
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Rewrite shell for '{}' ({} chars):\n{}",
+                                        node,
+                                        new_shell.len(),
+                                        new_shell
+                                    ),
+                                },
+                            );
+                        }
+                        Mutation::AddPromptStep {
+                            after_step,
+                            new_step_name,
+                            template,
+                            ..
+                        } => {
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Add prompt step '{}' after '{}' ({} chars):\n{}",
+                                        new_step_name,
+                                        after_step,
+                                        template.len(),
+                                        template
+                                    ),
+                                },
+                            );
+                        }
+                        Mutation::EditGraph {
+                            new_graph,
+                            new_nodes,
+                            description,
+                        } => {
+                            let graph_src =
+                                scaffold_ir::pretty::pretty_print_graph(new_graph);
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Edit graph '{}' ({} new nodes):\n{}",
+                                        description,
+                                        new_nodes.len(),
+                                        graph_src
+                                    ),
+                                },
+                            );
                         }
                         _ => {}
                     }
@@ -1533,7 +1773,16 @@ async fn run_evolutionary_into(
                 }
             }
         } else {
-            (generate_random_mutation(&parent_graph, ir, &allowed_mutations, &objective.tunables, &mut rng), None)
+            (
+                generate_random_mutation(
+                    &parent_graph,
+                    ir,
+                    &allowed_mutations,
+                    &objective.tunables,
+                    &mut rng,
+                ),
+                None,
+            )
         };
 
         let mutation = match mutation {
@@ -1561,22 +1810,144 @@ async fn run_evolutionary_into(
                         );
                     }
                     Mutation::RewriteSystem { node, new_system } => {
-                        overrides.insert(
-                            format!("{}.system", node),
-                            serde_json::json!(new_system),
-                        );
+                        overrides.insert(format!("{}.system", node), serde_json::json!(new_system));
                     }
                     Mutation::RewriteShell { node, new_shell } => {
-                        overrides.insert(
-                            format!("{}.shell", node),
-                            serde_json::json!(new_shell),
-                        );
+                        overrides.insert(format!("{}.shell", node), serde_json::json!(new_shell));
                     }
                     Mutation::SetConfig { node, field, value } => {
+                        overrides.insert(format!("{}.{}", node, field), value.clone());
+                    }
+                    Mutation::AddPromptStep {
+                        new_step_name,
+                        template,
+                        system,
+                        model,
+                        ..
+                    } => {
                         overrides.insert(
-                            format!("{}.{}", node, field),
-                            value.clone(),
+                            format!("_node.{}", new_step_name),
+                            serde_json::json!({"kind": "prompt"}),
                         );
+                        overrides.insert(
+                            format!("{}.template", new_step_name),
+                            serde_json::json!(template),
+                        );
+                        if let Some(sys) = system {
+                            overrides.insert(
+                                format!("{}.system", new_step_name),
+                                serde_json::json!(sys),
+                            );
+                        }
+                        if let Some(m) = model {
+                            overrides
+                                .insert(format!("{}.model", new_step_name), serde_json::json!(m));
+                        }
+                    }
+                    Mutation::EditGraph { new_nodes, .. } => {
+                        for node in new_nodes {
+                            if ir.nodes.iter().any(|n| n.name == node.name) {
+                                // Modified existing node: store field-level overrides
+                                if let Some(ref sof) = node.config.template {
+                                    let val = match sof {
+                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
+                                            value.clone()
+                                        }
+                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
+                                            path.clone()
+                                        }
+                                    };
+                                    overrides.insert(
+                                        format!("{}.template", node.name),
+                                        serde_json::json!(val),
+                                    );
+                                }
+                                if let Some(ref sof) = node.config.system {
+                                    let val = match sof {
+                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
+                                            value.clone()
+                                        }
+                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
+                                            path.clone()
+                                        }
+                                    };
+                                    overrides.insert(
+                                        format!("{}.system", node.name),
+                                        serde_json::json!(val),
+                                    );
+                                }
+                                if let Some(ref shell) = node.config.shell {
+                                    overrides.insert(
+                                        format!("{}.shell", node.name),
+                                        serde_json::json!(shell),
+                                    );
+                                }
+                                if let Some(ref model) = node.config.model {
+                                    overrides.insert(
+                                        format!("{}.model", node.name),
+                                        serde_json::json!(model),
+                                    );
+                                }
+                                if let Some(temp) = node.config.temperature {
+                                    overrides.insert(
+                                        format!("{}.temperature", node.name),
+                                        serde_json::json!(temp),
+                                    );
+                                }
+                            } else {
+                                // New node: synthetic node pattern (same as AddPromptStep)
+                                let kind_str = match node.kind {
+                                    scaffold_ir::ir::NodeKindIR::Tool => "tool",
+                                    scaffold_ir::ir::NodeKindIR::Agent => "agent",
+                                    scaffold_ir::ir::NodeKindIR::Verify => "verify",
+                                    _ => "prompt",
+                                };
+                                overrides.insert(
+                                    format!("_node.{}", node.name),
+                                    serde_json::json!({"kind": kind_str}),
+                                );
+                                if let Some(ref sof) = node.config.template {
+                                    let val = match sof {
+                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
+                                            value.clone()
+                                        }
+                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
+                                            path.clone()
+                                        }
+                                    };
+                                    overrides.insert(
+                                        format!("{}.template", node.name),
+                                        serde_json::json!(val),
+                                    );
+                                }
+                                if let Some(ref sof) = node.config.system {
+                                    let val = match sof {
+                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
+                                            value.clone()
+                                        }
+                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
+                                            path.clone()
+                                        }
+                                    };
+                                    overrides.insert(
+                                        format!("{}.system", node.name),
+                                        serde_json::json!(val),
+                                    );
+                                }
+                                if let Some(ref shell) = node.config.shell {
+                                    overrides.insert(
+                                        format!("{}.shell", node.name),
+                                        serde_json::json!(shell),
+                                    );
+                                }
+                                if let Some(ref model) = node.config.model {
+                                    overrides.insert(
+                                        format!("{}.model", node.name),
+                                        serde_json::json!(model),
+                                    );
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1595,37 +1966,48 @@ async fn run_evolutionary_into(
                     case_results: vec![],
                     total_cases: 0,
                     cases_passed: 0,
+                    passed_case_ids: vec![],
                 };
 
                 let cand_id = archive.candidates.len();
-                let (score, metrics, cases, total, passed) =
-                    evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id).await?;
+                let (score, metrics, cases, total, passed, passed_ids) =
+                    evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id)
+                        .await?;
 
                 successful_generations += 1;
 
                 if successful_generations == 1 {
-                    emit(options, OptEvent::PhaseChanged { phase: OptPhase::Evolutionary });
+                    emit(
+                        options,
+                        OptEvent::PhaseChanged {
+                            phase: OptPhase::Evolutionary,
+                        },
+                    );
                 }
                 let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
-                let mutation_labels: Vec<String> = candidate.mutations.iter().map(|m| m.short_label()).collect();
+                let mutation_labels: Vec<String> = candidate
+                    .mutations
+                    .iter()
+                    .map(|m| m.short_label())
+                    .collect();
 
-                emit(options, OptEvent::CandidateEvaluated {
-                    candidate_id: cand_id,
-                    parent_id: Some(parent_id),
-                    score,
-                    metric_scores: metrics.clone(),
-                    best_so_far: best_before.max(score),
-                    mutations: mutation_labels,
-                    generation: successful_generations,
-                    max_generations,
-                });
+                emit(
+                    options,
+                    OptEvent::CandidateEvaluated {
+                        candidate_id: cand_id,
+                        parent_id: Some(parent_id),
+                        score,
+                        metric_scores: metrics.clone(),
+                        best_so_far: best_before.max(score),
+                        mutations: mutation_labels,
+                        generation: successful_generations,
+                        max_generations,
+                    },
+                );
                 if options.event_tx.is_none() {
                     eprintln!(
                         "[optimizer] gen={}/{} candidate {}: score={:.4}",
-                        successful_generations,
-                        max_generations,
-                        cand_id,
-                        score
+                        successful_generations, max_generations, cand_id, score
                     );
                 }
 
@@ -1635,6 +2017,7 @@ async fn run_evolutionary_into(
                     case_results: cases,
                     total_cases: total,
                     cases_passed: passed,
+                    passed_case_ids: passed_ids,
                     ..candidate
                 });
 
@@ -1662,9 +2045,15 @@ async fn run_evolutionary_into(
     }
 
     if total_attempts >= max_attempts {
-        emit(options, OptEvent::Log {
-            message: format!("exhausted {} attempts with only {} successful generations", max_attempts, successful_generations),
-        });
+        emit(
+            options,
+            OptEvent::Log {
+                message: format!(
+                    "exhausted {} attempts with only {} successful generations",
+                    max_attempts, successful_generations
+                ),
+            },
+        );
         if options.event_tx.is_none() {
             eprintln!(
                 "[optimizer] exhausted {} attempts with only {} successful generations",
@@ -1683,7 +2072,11 @@ async fn run_evolutionary_into(
 /// candidates that have already been selected many times are down-weighted
 /// by a novelty bonus `1/(1+children)`. When the meta-agent is active,
 /// novelty is disabled since the LLM provides its own diversity.
-fn select_parent<'a>(archive: &'a Archive, rng: &mut SimpleRng, use_novelty: bool) -> Option<&'a Candidate> {
+fn select_parent<'a>(
+    archive: &'a Archive,
+    rng: &mut SimpleRng,
+    use_novelty: bool,
+) -> Option<&'a Candidate> {
     let evaluated: Vec<&Candidate> = archive
         .candidates
         .iter()
@@ -1785,20 +2178,36 @@ fn generate_random_mutation(
             })
         }
         "insert_step" => {
-            let prompt_nodes: Vec<&NodeIR> = ir
+            let compatible_nodes: Vec<&NodeIR> = ir
                 .nodes
                 .iter()
-                .filter(|n| n.kind == NodeKindIR::Prompt)
+                .filter(|n| has_single_input_compatible_type(ir, &n.input))
                 .collect();
-            if prompt_nodes.is_empty() {
+            if compatible_nodes.is_empty() {
                 return None;
             }
-            let node = &prompt_nodes[rng.next_usize() % prompt_nodes.len()];
+            let node = &compatible_nodes[rng.next_usize() % compatible_nodes.len()];
             let new_name = format!("inserted_{}", rng.next_usize() % 1000);
             Some(Mutation::InsertStep {
                 after_step: target_step.clone(),
                 new_step_name: new_name,
                 node: node.name.clone(),
+            })
+        }
+        "add_prompt_step" => {
+            let prompt_steps =
+                collect_steps_for_node_kinds(graph, ir, &[NodeKindIR::Prompt, NodeKindIR::Agent]);
+            if prompt_steps.is_empty() {
+                return None;
+            }
+            let after_step = &prompt_steps[rng.next_usize() % prompt_steps.len()];
+            let new_name = format!("review_{}", rng.next_usize() % 1000);
+            Some(Mutation::AddPromptStep {
+                after_step: after_step.clone(),
+                new_step_name: new_name,
+                template: "Improve the following output while preserving its intended format exactly. Return only the improved result.\n\n{{ input }}".to_string(),
+                system: None,
+                model: None,
             })
         }
         "remove_step" => Some(Mutation::RemoveStep {
@@ -1829,7 +2238,8 @@ fn generate_random_mutation(
             if tunable.domain.is_empty() || tunable.path.len() < 2 {
                 return None;
             }
-            let value = expr_to_json_value(&tunable.domain[rng.next_usize() % tunable.domain.len()]);
+            let value =
+                expr_to_json_value(&tunable.domain[rng.next_usize() % tunable.domain.len()]);
             let node = tunable.path[0].clone();
             let field = tunable.path[1..].join(".");
             Some(Mutation::SetConfig { node, field, value })
@@ -1838,8 +2248,72 @@ fn generate_random_mutation(
     }
 }
 
+fn has_single_input_compatible_node(ir: &ScaffoldIR) -> bool {
+    ir.nodes
+        .iter()
+        .any(|node| has_single_input_compatible_type(ir, &node.input))
+}
+
+fn has_single_input_compatible_type(ir: &ScaffoldIR, ty: &TypeIR) -> bool {
+    match ty {
+        TypeIR::Struct { .. } => false,
+        TypeIR::Named { name } => ir
+            .types
+            .iter()
+            .find(|t| t.name == *name)
+            .map(|t| has_single_input_compatible_type(ir, &t.ty))
+            .unwrap_or(true),
+        _ => true,
+    }
+}
+
+fn collect_steps_for_node_kinds(
+    graph: &GraphIR,
+    ir: &ScaffoldIR,
+    kinds: &[NodeKindIR],
+) -> Vec<String> {
+    let mut steps = Vec::new();
+    collect_steps_for_node_kinds_in_stmts(&graph.body, ir, kinds, &mut steps);
+    steps
+}
+
+fn collect_steps_for_node_kinds_in_stmts(
+    stmts: &[GraphStmtIR],
+    ir: &ScaffoldIR,
+    kinds: &[NodeKindIR],
+    out: &mut Vec<String>,
+) {
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(step) => {
+                if ir
+                    .nodes
+                    .iter()
+                    .find(|n| n.name == step.node)
+                    .map(|n| kinds.contains(&n.kind))
+                    .unwrap_or(false)
+                {
+                    out.push(step.name.clone());
+                }
+            }
+            GraphStmtIR::Loop(loop_stmt) => {
+                collect_steps_for_node_kinds_in_stmts(&loop_stmt.body, ir, kinds, out)
+            }
+            GraphStmtIR::If(if_stmt) => {
+                collect_steps_for_node_kinds_in_stmts(&if_stmt.then_body, ir, kinds, out);
+                collect_steps_for_node_kinds_in_stmts(&if_stmt.else_body, ir, kinds, out);
+            }
+            GraphStmtIR::Parallel(par_stmt) => {
+                collect_steps_for_node_kinds_in_stmts(&par_stmt.body, ir, kinds, out)
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Build the optimization report.
 fn build_report(
+    ir: &ScaffoldIR,
     objective: &ObjectiveIR,
     archive: &Archive,
     options: &OptimizationOptions,
@@ -1858,34 +2332,31 @@ fn build_report(
                 id: c.id,
                 parent_id: c.parent_id,
                 score: c.score,
-                mutations: c
-                    .mutations
-                    .iter()
-                    .map(|m| m.short_label())
-                    .collect(),
+                mutations: c.mutations.iter().map(|m| m.short_label()).collect(),
                 node_count: c.descriptor.node_count,
                 verify_count: c.descriptor.verify_count,
                 meta_reasoning: c.meta_reasoning.clone(),
             })
             .collect(),
         best_overrides: best.map(|c| c.overrides.clone()).filter(|o| !o.is_empty()),
-        best_metric_scores: best.map(|c| c.metric_scores.clone()).filter(|m| !m.is_empty()),
+        best_metric_scores: best
+            .map(|c| c.metric_scores.clone())
+            .filter(|m| !m.is_empty()),
     };
 
     // Write report to directory if configured
     if let Some(ref dir) = options.report_dir {
-        std::fs::create_dir_all(dir).map_err(|e| {
-            Error::Runtime(format!("failed to create report dir: {}", e))
-        })?;
-        let report_json =
-            serde_json::to_string_pretty(&report).unwrap_or_default();
-        std::fs::write(dir.join("report.json"), report_json).map_err(|e| {
-            Error::Runtime(format!("failed to write report: {}", e))
-        })?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Error::Runtime(format!("failed to create report dir: {}", e)))?;
+        let report_json = serde_json::to_string_pretty(&report).unwrap_or_default();
+        std::fs::write(dir.join("report.json"), report_json)
+            .map_err(|e| Error::Runtime(format!("failed to write report: {}", e)))?;
 
         // Write best candidate details (full mutations + overrides with rewritten prompts)
         if let Some(best) = best {
-            let mutations_json: Vec<serde_json::Value> = best.mutations.iter()
+            let mutations_json: Vec<serde_json::Value> = best
+                .mutations
+                .iter()
                 .filter_map(|m| serde_json::to_value(m).ok())
                 .collect();
             let best_detail = serde_json::json!({
@@ -1900,37 +2371,41 @@ fn build_report(
                 "total_cases": best.total_cases,
             });
             let best_json = serde_json::to_string_pretty(&best_detail).unwrap_or_default();
-            std::fs::write(dir.join("best_candidate.json"), best_json).map_err(|e| {
-                Error::Runtime(format!("failed to write best candidate: {}", e))
-            })?;
+            std::fs::write(dir.join("best_candidate.json"), best_json)
+                .map_err(|e| Error::Runtime(format!("failed to write best candidate: {}", e)))?;
         }
     }
 
-    // Write best candidate IR if configured
+    // Write best candidate source if configured
     if let Some(ref path) = options.write_best {
         if let Some(best) = best {
-            let mut best_ir = ScaffoldIR::default();
-            // Include the best graph
-            best_ir.graphs.push(best.graph.clone());
-            let json = serde_json::to_string_pretty(&best_ir).unwrap_or_default();
-            std::fs::write(path, json).map_err(|e| {
-                Error::Runtime(format!("failed to write best candidate: {}", e))
-            })?;
-
-            // Write overrides alongside (same dir, .overrides.json suffix)
-            if !best.overrides.is_empty() {
-                let overrides_path = path.with_extension("overrides.json");
-                let overrides_json = serde_json::to_string_pretty(&best.overrides).unwrap_or_default();
-                let _ = std::fs::write(overrides_path, overrides_json);
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        Error::Runtime(format!(
+                            "failed to create best candidate directory '{}': {}",
+                            parent.display(),
+                            e
+                        ))
+                    })?;
+                }
             }
+
+            let best_ir = materialize_best_candidate_ir(ir, objective, best);
+            let source = pretty_print(&best_ir);
+            std::fs::write(path, source)
+                .map_err(|e| Error::Runtime(format!("failed to write best candidate: {}", e)))?;
         }
     }
 
-    emit(options, OptEvent::Completed {
-        objective_name: objective.name.clone(),
-        best_score: report.best_score,
-        total_candidates: report.total_candidates,
-    });
+    emit(
+        options,
+        OptEvent::Completed {
+            objective_name: objective.name.clone(),
+            best_score: report.best_score,
+            total_candidates: report.total_candidates,
+        },
+    );
     if options.event_tx.is_none() {
         eprintln!(
             "[optimizer] done. {} candidates evaluated. best score: {:.4}",
@@ -1970,6 +2445,8 @@ impl SimpleRng {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -2058,6 +2535,7 @@ mod tests {
             case_results: vec![],
             total_cases: 0,
             cases_passed: 0,
+            passed_case_ids: vec![],
         });
 
         archive.add(Candidate {
@@ -2079,10 +2557,222 @@ mod tests {
             case_results: vec![],
             total_cases: 0,
             cases_passed: 0,
+            passed_case_ids: vec![],
         });
 
         let best = archive.best().unwrap();
         assert_eq!(best.score, Some(0.8));
+    }
+
+    #[test]
+    fn test_reset_meta_log_truncates_existing_file() {
+        let unique = format!(
+            "scaffold-meta-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        let path = dir.join("meta_debug.log");
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "old log contents").unwrap();
+
+        let options = OptimizationOptions {
+            meta_log: Some(path.clone()),
+            ..OptimizationOptions::default()
+        };
+
+        reset_meta_log(&options).unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.is_empty());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_bake_overrides_materializes_synthetic_prompt_node() {
+        let mut ir = ScaffoldIR::default();
+        let mut overrides = HashMap::new();
+        overrides.insert("_node.repair".into(), serde_json::json!({"kind": "prompt"}));
+        overrides.insert(
+            "repair.template".into(),
+            serde_json::json!("Fix this carefully."),
+        );
+        overrides.insert("repair.system".into(), serde_json::json!("Be exact."));
+        overrides.insert("repair.model".into(), serde_json::json!("gpt-4o"));
+        overrides.insert("repair.max_turns".into(), serde_json::json!(2));
+        overrides.insert("repair.timeout".into(), serde_json::json!(30));
+
+        bake_overrides_into_ir(&mut ir, &overrides);
+
+        let node = ir
+            .nodes
+            .iter()
+            .find(|node| node.name == "repair")
+            .expect("synthetic prompt node should be materialized");
+
+        assert_eq!(node.kind, NodeKindIR::Prompt);
+        assert!(matches!(node.input, TypeIR::String));
+        assert!(matches!(node.output, TypeIR::String));
+        assert!(matches!(
+            node.config.template,
+            Some(StringOrFileIR::Literal { ref value }) if value == "Fix this carefully."
+        ));
+        assert!(matches!(
+            node.config.system,
+            Some(StringOrFileIR::Literal { ref value }) if value == "Be exact."
+        ));
+        assert_eq!(node.config.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(node.config.max_turns, Some(2));
+        assert_eq!(node.config.timeout, Some(30));
+    }
+
+    #[test]
+    fn test_build_report_writes_best_candidate_scaffold_source() {
+        let unique = format!(
+            "scaffold-best-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        let path = dir.join("nested").join("best_candidate.scaffold");
+
+        let objective = ObjectiveIR {
+            name: "aider_polyglot".into(),
+            graph: "solve".into(),
+            dataset: DatasetSpecIR::Inline { cases: vec![] },
+            checkers: vec![],
+            judges: vec![],
+            metrics: vec![],
+            score: ExprIR::LitFloat { value: 0.0 },
+            repeats: None,
+            split: None,
+            select: None,
+            tunables: vec![],
+            topology: None,
+            subs: vec![],
+        };
+
+        let ir = ScaffoldIR {
+            version: "2.0.0".into(),
+            types: vec![],
+            nodes: vec![NodeIR {
+                name: "solve_code".into(),
+                kind: NodeKindIR::Prompt,
+                input: TypeIR::String,
+                output: TypeIR::String,
+                config: NodeConfigIR {
+                    template: Some(StringOrFileIR::Literal {
+                        value: "base".into(),
+                    }),
+                    ..NodeConfigIR::default()
+                },
+            }],
+            graphs: vec![GraphIR {
+                name: "solve".into(),
+                input: TypeIR::String,
+                output: TypeIR::String,
+                body: vec![
+                    GraphStmtIR::Step(StepIR {
+                        name: "attempt1".into(),
+                        node: "solve_code".into(),
+                        args: vec![StepArgIR::Positional {
+                            value: ExprIR::Ident {
+                                name: "input".into(),
+                            },
+                        }],
+                    }),
+                    GraphStmtIR::Emit(EmitIR::Direct {
+                        value: ExprIR::Ident {
+                            name: "attempt1".into(),
+                        },
+                    }),
+                ],
+            }],
+            objectives: vec![objective.clone()],
+        };
+
+        let best_graph = GraphIR {
+            name: "solve".into(),
+            input: TypeIR::String,
+            output: TypeIR::String,
+            body: vec![
+                GraphStmtIR::Step(StepIR {
+                    name: "attempt1".into(),
+                    node: "solve_code".into(),
+                    args: vec![StepArgIR::Positional {
+                        value: ExprIR::Ident {
+                            name: "input".into(),
+                        },
+                    }],
+                }),
+                GraphStmtIR::Step(StepIR {
+                    name: "repair".into(),
+                    node: "repair".into(),
+                    args: vec![StepArgIR::Positional {
+                        value: ExprIR::Ident {
+                            name: "attempt1".into(),
+                        },
+                    }],
+                }),
+                GraphStmtIR::Emit(EmitIR::Direct {
+                    value: ExprIR::Ident {
+                        name: "repair".into(),
+                    },
+                }),
+            ],
+        };
+
+        let mut overrides = HashMap::new();
+        overrides.insert("_node.repair".into(), serde_json::json!({"kind": "prompt"}));
+        overrides.insert(
+            "repair.template".into(),
+            serde_json::json!("Improve {{ input }}"),
+        );
+        overrides.insert("repair.system".into(), serde_json::json!("Be surgical."));
+
+        let mut archive = Archive::new();
+        archive.add(Candidate {
+            id: 0,
+            parent_id: None,
+            graph: best_graph.clone(),
+            overrides,
+            mutations: vec![],
+            score: Some(0.9),
+            metric_scores: HashMap::new(),
+            descriptor: GraphDescriptor::from_graph(&best_graph, &ir),
+            children_count: 0,
+            meta_reasoning: None,
+            case_results: vec![],
+            total_cases: 0,
+            cases_passed: 0,
+            passed_case_ids: vec![],
+        });
+
+        let options = OptimizationOptions {
+            write_best: Some(path.clone()),
+            ..OptimizationOptions::default()
+        };
+
+        build_report(&ir, &objective, &archive, &options).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("node solve_code: prompt"));
+        assert!(written.contains("node repair: prompt"));
+        assert!(written.contains("graph solve {"));
+        assert!(written.contains("step repair = repair(attempt1)"));
+        assert!(written.contains("objective aider_polyglot {"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn make_graph(name: &str, steps: Vec<(&str, &str)>) -> GraphIR {

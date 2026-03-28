@@ -1,12 +1,4 @@
 // Aider Polyglot Benchmark – Python subset
-//
-// Benchmarks scaffold's prompt optimization against the Aider polyglot
-// benchmark (Exercism exercises). Two-attempt flow: generate code, run
-// tests, optionally fix based on error output.
-//
-// Usage:
-//   scaffold run examples/aider_polyglot.scaffold
-//   scaffold optimize examples/aider_polyglot.scaffold --meta-model gpt-4o-mini --live
 
 // ── Types ──
 
@@ -25,7 +17,7 @@ node solve_code: prompt {
     out: string
     template: file("examples/prompts/aider_solve/template")
     system: file("examples/prompts/aider_solve/system")
-    model: "gpt-4o"
+    model: "openai/gpt-5.4-mini"
     temperature: 0.2
 }
 
@@ -34,7 +26,7 @@ node fix_code: prompt {
     out: string
     template: file("examples/prompts/aider_fix/template")
     system: file("examples/prompts/aider_solve/system")
-    model: "gpt-4o"
+    model: "openai/gpt-5.4-mini"
     temperature: 0.2
 }
 

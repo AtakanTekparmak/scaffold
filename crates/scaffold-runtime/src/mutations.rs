@@ -54,21 +54,30 @@ pub enum Mutation {
     },
 
     /// Rewrite a node's prompt template.
-    RewritePrompt {
-        node: String,
-        new_template: String,
-    },
+    RewritePrompt { node: String, new_template: String },
 
     /// Rewrite a node's system prompt.
-    RewriteSystem {
-        node: String,
-        new_system: String,
-    },
+    RewriteSystem { node: String, new_system: String },
 
     /// Rewrite a tool node's shell command.
-    RewriteShell {
-        node: String,
-        new_shell: String,
+    RewriteShell { node: String, new_shell: String },
+
+    /// Create a new prompt node and insert it as a step after an existing step.
+    /// The new step's output is available by name to all downstream steps via DSL scoping.
+    AddPromptStep {
+        after_step: String,
+        new_step_name: String,
+        template: String,
+        system: Option<String>,
+        model: Option<String>,
+    },
+
+    /// Replace the entire graph with a new one written as .scaffold DSL source.
+    /// Subsumes all structural mutations — the meta-agent gets full DSL expressiveness.
+    EditGraph {
+        new_graph: GraphIR,
+        new_nodes: Vec<NodeIR>,
+        description: String,
     },
 }
 
@@ -76,13 +85,25 @@ impl Mutation {
     /// Human-readable short label for TUI display.
     pub fn short_label(&self) -> String {
         match self {
-            Mutation::InsertVerify { after_step, verify_node, .. } => {
+            Mutation::InsertVerify {
+                after_step,
+                verify_node,
+                ..
+            } => {
                 format!("+verify({})@{}", verify_node, after_step)
             }
-            Mutation::WrapRetry { step, verify_node, max_retries } => {
+            Mutation::WrapRetry {
+                step,
+                verify_node,
+                max_retries,
+            } => {
                 format!("retry({}x{})@{}", verify_node, max_retries, step)
             }
-            Mutation::InsertStep { new_step_name: _, node, .. } => {
+            Mutation::InsertStep {
+                new_step_name: _,
+                node,
+                ..
+            } => {
                 format!("+step({})", node)
             }
             Mutation::RemoveStep { step } => format!("-step({})", step),
@@ -93,11 +114,22 @@ impl Mutation {
             Mutation::ReplaceWithSubgraph { step, graph } => {
                 format!("subgraph({}->{})", step, graph)
             }
-            Mutation::SetConfig { node, field, .. } => format!("cfg({}.{})", node, field),
+            Mutation::SetConfig { node, field, value } => {
+                format!("cfg({}.{}={})", node, field, format_json_value(value))
+            }
             Mutation::RewritePrompt { node, .. } => format!("rewrite_prompt({})", node),
             Mutation::RewriteSystem { node, .. } => format!("rewrite_system({})", node),
             Mutation::RewriteShell { node, .. } => format!("rewrite_shell({})", node),
+            Mutation::AddPromptStep { new_step_name, .. } => format!("+prompt({})", new_step_name),
+            Mutation::EditGraph { description, .. } => format!("edit: {}", description),
         }
+    }
+}
+
+fn format_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => format!("{:?}", s),
+        _ => value.to_string(),
     }
 }
 
@@ -153,36 +185,46 @@ pub fn apply_mutation(graph: &GraphIR, mutation: &Mutation, ir: &ScaffoldIR) -> 
 
         Mutation::RewritePrompt { node, .. } => {
             // Prompt rewrites don't change graph structure — overrides are applied separately.
-            if !ir.nodes.iter().any(|n| n.name == *node) {
+            // Accept both IR-defined nodes and synthetic nodes (steps referencing same-named node).
+            if !ir.nodes.iter().any(|n| n.name == *node) && !node_used_by_step(&graph.body, node) {
                 return MutationResult::Skipped(format!("node '{}' not found", node));
             }
             MutationResult::Ok(graph.clone())
         }
 
         Mutation::RewriteSystem { node, .. } => {
-            if !ir.nodes.iter().any(|n| n.name == *node) {
+            if !ir.nodes.iter().any(|n| n.name == *node) && !node_used_by_step(&graph.body, node) {
                 return MutationResult::Skipped(format!("node '{}' not found", node));
             }
             MutationResult::Ok(graph.clone())
         }
 
-        Mutation::RewriteShell { node, .. } => {
-            match ir.nodes.iter().find(|n| n.name == *node) {
-                None => MutationResult::Skipped(format!("node '{}' not found", node)),
-                Some(n) if n.kind != NodeKindIR::Tool => {
-                    MutationResult::Skipped(format!("node '{}' is not a tool node", node))
-                }
-                _ => MutationResult::Ok(graph.clone()),
+        Mutation::RewriteShell { node, .. } => match ir.nodes.iter().find(|n| n.name == *node) {
+            None => MutationResult::Skipped(format!("node '{}' not found", node)),
+            Some(n) if n.kind != NodeKindIR::Tool => {
+                MutationResult::Skipped(format!("node '{}' is not a tool node", node))
             }
+            _ => MutationResult::Ok(graph.clone()),
+        },
+
+        Mutation::AddPromptStep {
+            after_step,
+            new_step_name,
+            ..
+        } => {
+            let input_fields = resolve_graph_input_fields(graph, ir);
+            apply_add_prompt_step(graph, after_step, new_step_name, &input_fields)
+        }
+
+        Mutation::EditGraph { new_graph, .. } => {
+            // Validation already done during construction in parse_and_validate_graph_edit.
+            MutationResult::Ok(new_graph.clone())
         }
     }
 }
 
 /// Check if a mutation respects topology constraints.
-pub fn check_constraints(
-    graph: &GraphIR,
-    topology: &TopologyIR,
-) -> Vec<String> {
+pub fn check_constraints(graph: &GraphIR, topology: &TopologyIR) -> Vec<String> {
     let mut violations = Vec::new();
 
     // Check max_nodes
@@ -297,6 +339,81 @@ fn insert_verify_in_stmts(
                 (vec![stmt.clone(), verify_step], true)
             }
         }
+        GraphStmtIR::If(i) => {
+            let mut then_body = Vec::new();
+            let mut then_found = false;
+            for s in &i.then_body {
+                let (new_stmts, f) =
+                    insert_verify_in_stmts(s, after_step, verify_node, max_retries);
+                then_body.extend(new_stmts);
+                then_found = then_found || f;
+            }
+            let mut else_body = Vec::new();
+            let mut else_found = false;
+            for s in &i.else_body {
+                let (new_stmts, f) =
+                    insert_verify_in_stmts(s, after_step, verify_node, max_retries);
+                else_body.extend(new_stmts);
+                else_found = else_found || f;
+            }
+            if then_found || else_found {
+                (
+                    vec![GraphStmtIR::If(IfIR {
+                        cond: i.cond.clone(),
+                        then_body,
+                        else_body,
+                    })],
+                    true,
+                )
+            } else {
+                (vec![stmt.clone()], false)
+            }
+        }
+        GraphStmtIR::Loop(l) => {
+            let mut body = Vec::new();
+            let mut found = false;
+            for s in &l.body {
+                let (new_stmts, f) =
+                    insert_verify_in_stmts(s, after_step, verify_node, max_retries);
+                body.extend(new_stmts);
+                found = found || f;
+            }
+            if found {
+                (
+                    vec![GraphStmtIR::Loop(LoopIR {
+                        max: l.max.clone(),
+                        while_cond: l.while_cond.clone(),
+                        body,
+                    })],
+                    true,
+                )
+            } else {
+                (vec![stmt.clone()], false)
+            }
+        }
+        GraphStmtIR::Parallel(p) => {
+            let mut body = Vec::new();
+            let mut found = false;
+            for s in &p.body {
+                let (new_stmts, f) =
+                    insert_verify_in_stmts(s, after_step, verify_node, max_retries);
+                body.extend(new_stmts);
+                found = found || f;
+            }
+            if found {
+                (
+                    vec![GraphStmtIR::Parallel(ParallelIR {
+                        var: p.var.clone(),
+                        collection: p.collection.clone(),
+                        reduce: p.reduce.clone(),
+                        body,
+                    })],
+                    true,
+                )
+            } else {
+                (vec![stmt.clone()], false)
+            }
+        }
         _ => (vec![stmt.clone()], false),
     }
 }
@@ -307,12 +424,29 @@ fn apply_wrap_retry(
     verify_node: &str,
     max_retries: u32,
 ) -> MutationResult {
-    let mut new_body = Vec::new();
-    let mut found = false;
+    let (new_body, found) = wrap_retry_in_stmts(&graph.body, step_name, verify_node, max_retries);
 
-    for stmt in &graph.body {
-        if let GraphStmtIR::Step(s) = stmt {
-            if s.name == step_name {
+    if !found {
+        return MutationResult::Skipped(format!("step '{}' not found", step_name));
+    }
+
+    MutationResult::Ok(GraphIR {
+        body: new_body,
+        ..graph.clone()
+    })
+}
+
+fn wrap_retry_in_stmts(
+    stmts: &[GraphStmtIR],
+    step_name: &str,
+    verify_node: &str,
+    max_retries: u32,
+) -> (Vec<GraphStmtIR>, bool) {
+    let mut result = Vec::new();
+    let mut found = false;
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.name == step_name => {
                 found = true;
                 let verify_step_name = format!("{}_check", s.name);
                 let loop_body = vec![
@@ -327,7 +461,7 @@ fn apply_wrap_retry(
                         }],
                     }),
                 ];
-                new_body.push(GraphStmtIR::Loop(LoopIR {
+                result.push(GraphStmtIR::Loop(LoopIR {
                     max: ExprIR::LitInt {
                         value: max_retries as i64 + 1,
                     },
@@ -341,20 +475,42 @@ fn apply_wrap_retry(
                     },
                     body: loop_body,
                 }));
-                continue;
             }
+            GraphStmtIR::If(i) => {
+                let (then_body, f1) =
+                    wrap_retry_in_stmts(&i.then_body, step_name, verify_node, max_retries);
+                let (else_body, f2) =
+                    wrap_retry_in_stmts(&i.else_body, step_name, verify_node, max_retries);
+                result.push(GraphStmtIR::If(IfIR {
+                    cond: i.cond.clone(),
+                    then_body,
+                    else_body,
+                }));
+                found = found || f1 || f2;
+            }
+            GraphStmtIR::Loop(l) => {
+                let (body, f) = wrap_retry_in_stmts(&l.body, step_name, verify_node, max_retries);
+                result.push(GraphStmtIR::Loop(LoopIR {
+                    max: l.max.clone(),
+                    while_cond: l.while_cond.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            GraphStmtIR::Parallel(p) => {
+                let (body, f) = wrap_retry_in_stmts(&p.body, step_name, verify_node, max_retries);
+                result.push(GraphStmtIR::Parallel(ParallelIR {
+                    var: p.var.clone(),
+                    collection: p.collection.clone(),
+                    reduce: p.reduce.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            _ => result.push(stmt.clone()),
         }
-        new_body.push(stmt.clone());
     }
-
-    if !found {
-        return MutationResult::Skipped(format!("step '{}' not found", step_name));
-    }
-
-    MutationResult::Ok(GraphIR {
-        body: new_body,
-        ..graph.clone()
-    })
+    (result, found)
 }
 
 fn apply_insert_step(
@@ -363,26 +519,7 @@ fn apply_insert_step(
     new_name: &str,
     node: &str,
 ) -> MutationResult {
-    let mut new_body = Vec::new();
-    let mut found = false;
-
-    for stmt in &graph.body {
-        new_body.push(stmt.clone());
-        if let GraphStmtIR::Step(s) = stmt {
-            if s.name == after_step {
-                found = true;
-                new_body.push(GraphStmtIR::Step(StepIR {
-                    name: new_name.to_string(),
-                    node: node.to_string(),
-                    args: vec![StepArgIR::Positional {
-                        value: ExprIR::Ident {
-                            name: s.name.clone(),
-                        },
-                    }],
-                }));
-            }
-        }
-    }
+    let (new_body, found) = insert_step_in_stmts(&graph.body, after_step, new_name, node);
 
     if !found {
         return MutationResult::Skipped(format!("step '{}' not found", after_step));
@@ -394,46 +531,68 @@ fn apply_insert_step(
     })
 }
 
-fn apply_remove_step(graph: &GraphIR, step_name: &str) -> MutationResult {
-    let new_body: Vec<GraphStmtIR> = graph
-        .body
-        .iter()
-        .filter(|stmt| {
-            if let GraphStmtIR::Step(s) = stmt {
-                s.name != step_name
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect();
-
-    if new_body.len() == graph.body.len() {
-        return MutationResult::Skipped(format!("step '{}' not found", step_name));
-    }
-
-    MutationResult::Ok(GraphIR {
-        body: new_body,
-        ..graph.clone()
-    })
-}
-
-fn apply_replace_component(
-    graph: &GraphIR,
-    step_name: &str,
-    new_node: &str,
-) -> MutationResult {
-    let mut new_body = graph.body.clone();
+fn insert_step_in_stmts(
+    stmts: &[GraphStmtIR],
+    after_step: &str,
+    new_name: &str,
+    node: &str,
+) -> (Vec<GraphStmtIR>, bool) {
+    let mut result = Vec::new();
     let mut found = false;
-
-    for stmt in &mut new_body {
-        if let GraphStmtIR::Step(s) = stmt {
-            if s.name == step_name {
-                s.node = new_node.to_string();
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.name == after_step => {
+                result.push(stmt.clone());
+                result.push(GraphStmtIR::Step(StepIR {
+                    name: new_name.to_string(),
+                    node: node.to_string(),
+                    args: vec![StepArgIR::Positional {
+                        value: ExprIR::Ident {
+                            name: s.name.clone(),
+                        },
+                    }],
+                }));
                 found = true;
             }
+            GraphStmtIR::If(i) => {
+                let (then_body, f1) =
+                    insert_step_in_stmts(&i.then_body, after_step, new_name, node);
+                let (else_body, f2) =
+                    insert_step_in_stmts(&i.else_body, after_step, new_name, node);
+                result.push(GraphStmtIR::If(IfIR {
+                    cond: i.cond.clone(),
+                    then_body,
+                    else_body,
+                }));
+                found = found || f1 || f2;
+            }
+            GraphStmtIR::Loop(l) => {
+                let (body, f) = insert_step_in_stmts(&l.body, after_step, new_name, node);
+                result.push(GraphStmtIR::Loop(LoopIR {
+                    max: l.max.clone(),
+                    while_cond: l.while_cond.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            GraphStmtIR::Parallel(p) => {
+                let (body, f) = insert_step_in_stmts(&p.body, after_step, new_name, node);
+                result.push(GraphStmtIR::Parallel(ParallelIR {
+                    var: p.var.clone(),
+                    collection: p.collection.clone(),
+                    reduce: p.reduce.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            _ => result.push(stmt.clone()),
         }
     }
+    (result, found)
+}
+
+fn apply_remove_step(graph: &GraphIR, step_name: &str) -> MutationResult {
+    let (new_body, found) = remove_step_in_stmts(&graph.body, step_name);
 
     if !found {
         return MutationResult::Skipped(format!("step '{}' not found", step_name));
@@ -445,28 +604,153 @@ fn apply_replace_component(
     })
 }
 
+fn remove_step_in_stmts(stmts: &[GraphStmtIR], step_name: &str) -> (Vec<GraphStmtIR>, bool) {
+    let mut result = Vec::new();
+    let mut found = false;
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.name == step_name => {
+                found = true;
+                // skip — remove it
+            }
+            GraphStmtIR::If(i) => {
+                let (then_body, f1) = remove_step_in_stmts(&i.then_body, step_name);
+                let (else_body, f2) = remove_step_in_stmts(&i.else_body, step_name);
+                result.push(GraphStmtIR::If(IfIR {
+                    cond: i.cond.clone(),
+                    then_body,
+                    else_body,
+                }));
+                found = found || f1 || f2;
+            }
+            GraphStmtIR::Loop(l) => {
+                let (body, f) = remove_step_in_stmts(&l.body, step_name);
+                result.push(GraphStmtIR::Loop(LoopIR {
+                    max: l.max.clone(),
+                    while_cond: l.while_cond.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            GraphStmtIR::Parallel(p) => {
+                let (body, f) = remove_step_in_stmts(&p.body, step_name);
+                result.push(GraphStmtIR::Parallel(ParallelIR {
+                    var: p.var.clone(),
+                    collection: p.collection.clone(),
+                    reduce: p.reduce.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            _ => result.push(stmt.clone()),
+        }
+    }
+    (result, found)
+}
+
+fn apply_replace_component(graph: &GraphIR, step_name: &str, new_node: &str) -> MutationResult {
+    let (new_body, found) = replace_node_in_stmts(&graph.body, step_name, new_node);
+
+    if !found {
+        return MutationResult::Skipped(format!("step '{}' not found", step_name));
+    }
+
+    MutationResult::Ok(GraphIR {
+        body: new_body,
+        ..graph.clone()
+    })
+}
+
+/// Recursively replace the node a step invokes. Used by both ReplaceComponent and ReplaceWithSubgraph.
+fn replace_node_in_stmts(
+    stmts: &[GraphStmtIR],
+    step_name: &str,
+    new_node: &str,
+) -> (Vec<GraphStmtIR>, bool) {
+    let mut result = Vec::new();
+    let mut found = false;
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.name == step_name => {
+                result.push(GraphStmtIR::Step(StepIR {
+                    name: s.name.clone(),
+                    node: new_node.to_string(),
+                    args: s.args.clone(),
+                }));
+                found = true;
+            }
+            GraphStmtIR::If(i) => {
+                let (then_body, f1) = replace_node_in_stmts(&i.then_body, step_name, new_node);
+                let (else_body, f2) = replace_node_in_stmts(&i.else_body, step_name, new_node);
+                result.push(GraphStmtIR::If(IfIR {
+                    cond: i.cond.clone(),
+                    then_body,
+                    else_body,
+                }));
+                found = found || f1 || f2;
+            }
+            GraphStmtIR::Loop(l) => {
+                let (body, f) = replace_node_in_stmts(&l.body, step_name, new_node);
+                result.push(GraphStmtIR::Loop(LoopIR {
+                    max: l.max.clone(),
+                    while_cond: l.while_cond.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            GraphStmtIR::Parallel(p) => {
+                let (body, f) = replace_node_in_stmts(&p.body, step_name, new_node);
+                result.push(GraphStmtIR::Parallel(ParallelIR {
+                    var: p.var.clone(),
+                    collection: p.collection.clone(),
+                    reduce: p.reduce.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            _ => result.push(stmt.clone()),
+        }
+    }
+    (result, found)
+}
+
 fn apply_fan_out(
     graph: &GraphIR,
     step_name: &str,
     split_node: &str,
     reduce_node: &str,
 ) -> MutationResult {
-    let mut new_body = Vec::new();
-    let mut found = false;
+    let (new_body, found) = fan_out_in_stmts(&graph.body, step_name, split_node, reduce_node);
 
-    for stmt in &graph.body {
-        if let GraphStmtIR::Step(s) = stmt {
-            if s.name == step_name {
+    if !found {
+        return MutationResult::Skipped(format!("step '{}' not found", step_name));
+    }
+
+    MutationResult::Ok(GraphIR {
+        body: new_body,
+        ..graph.clone()
+    })
+}
+
+fn fan_out_in_stmts(
+    stmts: &[GraphStmtIR],
+    step_name: &str,
+    split_node: &str,
+    reduce_node: &str,
+) -> (Vec<GraphStmtIR>, bool) {
+    let mut result = Vec::new();
+    let mut found = false;
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.name == step_name => {
                 found = true;
-                // Add split step
                 let split_step_name = format!("{}_split", s.name);
-                new_body.push(GraphStmtIR::Step(StepIR {
+                result.push(GraphStmtIR::Step(StepIR {
                     name: split_step_name.clone(),
                     node: split_node.to_string(),
                     args: s.args.clone(),
                 }));
-                // Add parallel with the original step inside
-                new_body.push(GraphStmtIR::Parallel(ParallelIR {
+                result.push(GraphStmtIR::Parallel(ParallelIR {
                     var: "item".to_string(),
                     collection: ExprIR::Ident {
                         name: split_step_name,
@@ -482,38 +766,46 @@ fn apply_fan_out(
                         }],
                     })],
                 }));
-                continue;
             }
+            GraphStmtIR::If(i) => {
+                let (then_body, f1) =
+                    fan_out_in_stmts(&i.then_body, step_name, split_node, reduce_node);
+                let (else_body, f2) =
+                    fan_out_in_stmts(&i.else_body, step_name, split_node, reduce_node);
+                result.push(GraphStmtIR::If(IfIR {
+                    cond: i.cond.clone(),
+                    then_body,
+                    else_body,
+                }));
+                found = found || f1 || f2;
+            }
+            GraphStmtIR::Loop(l) => {
+                let (body, f) = fan_out_in_stmts(&l.body, step_name, split_node, reduce_node);
+                result.push(GraphStmtIR::Loop(LoopIR {
+                    max: l.max.clone(),
+                    while_cond: l.while_cond.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            GraphStmtIR::Parallel(p) => {
+                let (body, f) = fan_out_in_stmts(&p.body, step_name, split_node, reduce_node);
+                result.push(GraphStmtIR::Parallel(ParallelIR {
+                    var: p.var.clone(),
+                    collection: p.collection.clone(),
+                    reduce: p.reduce.clone(),
+                    body,
+                }));
+                found = found || f;
+            }
+            _ => result.push(stmt.clone()),
         }
-        new_body.push(stmt.clone());
     }
-
-    if !found {
-        return MutationResult::Skipped(format!("step '{}' not found", step_name));
-    }
-
-    MutationResult::Ok(GraphIR {
-        body: new_body,
-        ..graph.clone()
-    })
+    (result, found)
 }
 
-fn apply_replace_with_subgraph(
-    graph: &GraphIR,
-    step_name: &str,
-    subgraph: &str,
-) -> MutationResult {
-    let mut new_body = graph.body.clone();
-    let mut found = false;
-
-    for stmt in &mut new_body {
-        if let GraphStmtIR::Step(s) = stmt {
-            if s.name == step_name {
-                s.node = subgraph.to_string();
-                found = true;
-            }
-        }
-    }
+fn apply_replace_with_subgraph(graph: &GraphIR, step_name: &str, subgraph: &str) -> MutationResult {
+    let (new_body, found) = replace_node_in_stmts(&graph.body, step_name, subgraph);
 
     if !found {
         return MutationResult::Skipped(format!("step '{}' not found", step_name));
@@ -556,6 +848,138 @@ fn apply_set_config(
     MutationResult::Ok(graph.clone())
 }
 
+/// Resolve the field names of a graph's input type.
+/// Returns field names for struct types (inline or via Named reference), empty for scalars.
+pub fn resolve_graph_input_fields(graph: &GraphIR, ir: &ScaffoldIR) -> Vec<String> {
+    resolve_type_fields_for_graph(&graph.input, ir)
+}
+
+fn resolve_type_fields_for_graph(ty: &TypeIR, ir: &ScaffoldIR) -> Vec<String> {
+    match ty {
+        TypeIR::Struct { fields } => fields.iter().map(|f| f.name.clone()).collect(),
+        TypeIR::Named { name } => ir
+            .types
+            .iter()
+            .find(|t| t.name == *name)
+            .map(|td| resolve_type_fields_for_graph(&td.ty, ir))
+            .unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
+fn apply_add_prompt_step(
+    graph: &GraphIR,
+    after_step: &str,
+    new_step_name: &str,
+    graph_input_fields: &[String],
+) -> MutationResult {
+    let (new_body, found) =
+        add_prompt_step_in_stmts(&graph.body, after_step, new_step_name, graph_input_fields);
+
+    if !found {
+        return MutationResult::Skipped(format!("step '{}' not found", after_step));
+    }
+
+    MutationResult::Ok(GraphIR {
+        body: new_body,
+        ..graph.clone()
+    })
+}
+
+/// Insert a synthetic prompt step after `after_step`.
+/// Recurses into If/Loop/Parallel to find the target step.
+///
+/// The new step's output is bound to `new_step_name` in scope and available to all
+/// downstream steps — no rewiring is performed. The DSL's scoping rules mean any
+/// subsequent step (or a future `rewrite_prompt` mutation) can reference the new step's
+/// output by name. This keeps the insertion safe regardless of how `after_step`'s output
+/// is used in expressions, conditions, or function calls.
+///
+/// When `graph_input_fields` is non-empty, the new step receives named args that forward
+/// all graph input fields (e.g. `instructions: input.instructions`) in addition to the
+/// `input` arg carrying the previous step's output. This lets the template reference
+/// `{{ instructions }}`, `{{ stub_content }}`, etc.
+fn add_prompt_step_in_stmts(
+    stmts: &[GraphStmtIR],
+    after_step: &str,
+    new_step_name: &str,
+    graph_input_fields: &[String],
+) -> (Vec<GraphStmtIR>, bool) {
+    let mut result = Vec::new();
+    let mut found = false;
+
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.name == after_step && !found => {
+                result.push(stmt.clone());
+
+                // Build args: always include `input` (previous step output),
+                // plus named args forwarding each graph input field.
+                let mut args = vec![StepArgIR::Named {
+                    name: "input".to_string(),
+                    value: ExprIR::Ident {
+                        name: s.name.clone(),
+                    },
+                }];
+                for field in graph_input_fields {
+                    args.push(StepArgIR::Named {
+                        name: field.clone(),
+                        value: ExprIR::FieldAccess {
+                            base: Box::new(ExprIR::Ident {
+                                name: "input".to_string(),
+                            }),
+                            field: field.clone(),
+                        },
+                    });
+                }
+
+                result.push(GraphStmtIR::Step(StepIR {
+                    name: new_step_name.to_string(),
+                    node: new_step_name.to_string(),
+                    args,
+                }));
+                found = true;
+            }
+            GraphStmtIR::If(i) if !found => {
+                let (then_body, f1) =
+                    add_prompt_step_in_stmts(&i.then_body, after_step, new_step_name, graph_input_fields);
+                let (else_body, f2) =
+                    add_prompt_step_in_stmts(&i.else_body, after_step, new_step_name, graph_input_fields);
+                result.push(GraphStmtIR::If(IfIR {
+                    cond: i.cond.clone(),
+                    then_body,
+                    else_body,
+                }));
+                found = f1 || f2;
+            }
+            GraphStmtIR::Loop(l) if !found => {
+                let (body, f) =
+                    add_prompt_step_in_stmts(&l.body, after_step, new_step_name, graph_input_fields);
+                result.push(GraphStmtIR::Loop(LoopIR {
+                    max: l.max.clone(),
+                    while_cond: l.while_cond.clone(),
+                    body,
+                }));
+                found = f;
+            }
+            GraphStmtIR::Parallel(p) if !found => {
+                let (body, f) =
+                    add_prompt_step_in_stmts(&p.body, after_step, new_step_name, graph_input_fields);
+                result.push(GraphStmtIR::Parallel(ParallelIR {
+                    var: p.var.clone(),
+                    collection: p.collection.clone(),
+                    reduce: p.reduce.clone(),
+                    body,
+                }));
+                found = f;
+            }
+            _ => result.push(stmt.clone()),
+        }
+    }
+    (result, found)
+}
+
+
 // ── Helpers ──
 
 fn count_steps(stmts: &[GraphStmtIR]) -> u64 {
@@ -591,6 +1015,45 @@ fn measure_depth(stmts: &[GraphStmtIR]) -> u64 {
         max_depth = max_depth.max(d);
     }
     max_depth
+}
+
+/// Public accessor for `node_used_by_step` (used by meta_agent for synthetic node validation).
+pub fn node_used_by_step_pub(stmts: &[GraphStmtIR], node_name: &str) -> bool {
+    node_used_by_step(stmts, node_name)
+}
+
+/// Public accessor for `step_exists` (used by meta_agent for preserve validation).
+pub fn step_exists_pub(stmts: &[GraphStmtIR], name: &str) -> bool {
+    step_exists(stmts, name)
+}
+
+/// Check if any step in the graph body references a node by name.
+/// Used to detect synthetic nodes (from AddPromptStep) that aren't in ir.nodes.
+fn node_used_by_step(stmts: &[GraphStmtIR], node_name: &str) -> bool {
+    for stmt in stmts {
+        match stmt {
+            GraphStmtIR::Step(s) if s.node == node_name => return true,
+            GraphStmtIR::Loop(l) => {
+                if node_used_by_step(&l.body, node_name) {
+                    return true;
+                }
+            }
+            GraphStmtIR::If(i) => {
+                if node_used_by_step(&i.then_body, node_name)
+                    || node_used_by_step(&i.else_body, node_name)
+                {
+                    return true;
+                }
+            }
+            GraphStmtIR::Parallel(p) => {
+                if node_used_by_step(&p.body, node_name) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn step_exists(stmts: &[GraphStmtIR], name: &str) -> bool {
@@ -669,8 +1132,8 @@ pub fn collect_graph_refs_from_body(
 
 /// Compute a structural fingerprint of a graph (for novelty search).
 pub fn topology_hash(graph: &GraphIR) -> u64 {
-    use std::hash::Hasher;
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
     let mut hasher = DefaultHasher::new();
     hash_stmts(&graph.body, &mut hasher);
     hasher.finish()
@@ -917,5 +1380,394 @@ mod tests {
         assert_eq!(desc.node_count, 1);
         assert_eq!(desc.verify_count, 0);
         assert_eq!(desc.max_depth, 0);
+    }
+
+    #[test]
+    fn test_set_config_short_label_includes_value() {
+        let mutation = Mutation::SetConfig {
+            node: "fix_code".to_string(),
+            field: "temperature".to_string(),
+            value: serde_json::json!(0.2),
+        };
+        assert_eq!(mutation.short_label(), "cfg(fix_code.temperature=0.2)");
+    }
+
+    /// Helper: graph with a step inside an if-block (the bug scenario).
+    fn make_nested_graph() -> GraphIR {
+        GraphIR {
+            name: "solve".to_string(),
+            input: TypeIR::String,
+            output: TypeIR::String,
+            body: vec![
+                GraphStmtIR::Step(StepIR {
+                    name: "s1".to_string(),
+                    node: "solver".to_string(),
+                    args: vec![StepArgIR::Positional {
+                        value: ExprIR::Ident {
+                            name: "input".to_string(),
+                        },
+                    }],
+                }),
+                GraphStmtIR::If(IfIR {
+                    cond: ExprIR::LitBool { value: true },
+                    then_body: vec![GraphStmtIR::Step(StepIR {
+                        name: "s2".to_string(),
+                        node: "solver".to_string(),
+                        args: vec![StepArgIR::Positional {
+                            value: ExprIR::Ident {
+                                name: "s1".to_string(),
+                            },
+                        }],
+                    })],
+                    else_body: vec![],
+                }),
+                GraphStmtIR::Emit(EmitIR::Direct {
+                    value: ExprIR::Ident {
+                        name: "s2".to_string(),
+                    },
+                }),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_replace_component_nested() {
+        let graph = make_nested_graph();
+        match apply_replace_component(&graph, "s2", "checker") {
+            MutationResult::Ok(new_graph) => {
+                // s2 is inside the if-then; verify it was replaced
+                if let GraphStmtIR::If(i) = &new_graph.body[1] {
+                    if let GraphStmtIR::Step(s) = &i.then_body[0] {
+                        assert_eq!(s.name, "s2");
+                        assert_eq!(s.node, "checker");
+                    } else {
+                        panic!("expected step in then_body");
+                    }
+                } else {
+                    panic!("expected if");
+                }
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_remove_step_nested() {
+        let graph = make_nested_graph();
+        match apply_remove_step(&graph, "s2") {
+            MutationResult::Ok(new_graph) => {
+                let names = collect_step_names(&new_graph.body);
+                assert!(names.contains(&"s1".to_string()));
+                assert!(!names.contains(&"s2".to_string()));
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_insert_step_nested() {
+        let graph = make_nested_graph();
+        match apply_insert_step(&graph, "s2", "s3", "solver") {
+            MutationResult::Ok(new_graph) => {
+                let names = collect_step_names(&new_graph.body);
+                assert!(names.contains(&"s3".to_string()));
+                // s3 should be inside the if-then body
+                if let GraphStmtIR::If(i) = &new_graph.body[1] {
+                    assert_eq!(i.then_body.len(), 2); // s2, s3
+                } else {
+                    panic!("expected if");
+                }
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_wrap_retry_nested() {
+        let graph = make_nested_graph();
+        match apply_wrap_retry(&graph, "s2", "checker", 2) {
+            MutationResult::Ok(new_graph) => {
+                // s2 should be wrapped in a loop inside the if-then body
+                if let GraphStmtIR::If(i) = &new_graph.body[1] {
+                    assert!(matches!(&i.then_body[0], GraphStmtIR::Loop(_)));
+                } else {
+                    panic!("expected if");
+                }
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_add_prompt_step_nested_no_rewire() {
+        // s2 is inside an if-then block, emit at outer level references s2.
+        // add_prompt_step after s2 should:
+        //   1. Insert "review" step inside the if-then after s2
+        //   2. Leave outer emit unchanged (no rewiring — DSL scoping handles references)
+        let graph = make_nested_graph();
+        // Graph has scalar (String) input, so no graph input fields forwarded.
+        match apply_add_prompt_step(&graph, "s2", "review", &[]) {
+            MutationResult::Ok(new_graph) => {
+                // New step should be inside the if-then body
+                if let GraphStmtIR::If(i) = &new_graph.body[1] {
+                    assert_eq!(i.then_body.len(), 2); // s2, review
+                    if let GraphStmtIR::Step(s) = &i.then_body[1] {
+                        assert_eq!(s.name, "review");
+                        assert_eq!(s.node, "review");
+                        // Should have named `input` arg
+                        assert_eq!(s.args.len(), 1);
+                        match &s.args[0] {
+                            StepArgIR::Named { name, value } => {
+                                assert_eq!(name, "input");
+                                assert!(matches!(value, ExprIR::Ident { name } if name == "s2"));
+                            }
+                            _ => panic!("expected named arg 'input'"),
+                        }
+                    } else {
+                        panic!("expected review step");
+                    }
+                } else {
+                    panic!("expected if");
+                }
+                // Outer emit should still reference "s2" (no rewiring)
+                if let GraphStmtIR::Emit(EmitIR::Direct { value }) = &new_graph.body[2] {
+                    if let ExprIR::Ident { name } = value {
+                        assert_eq!(name, "s2", "outer emit should NOT be rewired");
+                    } else {
+                        panic!("expected ident in emit");
+                    }
+                } else {
+                    panic!("expected emit");
+                }
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_add_prompt_step_top_level() {
+        // Verify top-level case: insert after s1, emit stays unchanged (no rewiring).
+        let graph = make_test_graph();
+        // Graph has scalar (String) input, so no graph input fields forwarded.
+        match apply_add_prompt_step(&graph, "s1", "review", &[]) {
+            MutationResult::Ok(new_graph) => {
+                assert_eq!(new_graph.body.len(), 3); // s1, review, emit
+                // Check the new step has named `input` arg
+                if let GraphStmtIR::Step(s) = &new_graph.body[1] {
+                    assert_eq!(s.name, "review");
+                    assert_eq!(s.args.len(), 1);
+                    match &s.args[0] {
+                        StepArgIR::Named { name, value } => {
+                            assert_eq!(name, "input");
+                            assert!(matches!(value, ExprIR::Ident { name } if name == "s1"));
+                        }
+                        _ => panic!("expected named arg 'input'"),
+                    }
+                } else {
+                    panic!("expected step");
+                }
+                // Emit should still reference "s1" (no rewiring — DSL scoping handles references)
+                if let GraphStmtIR::Emit(EmitIR::Direct { value }) = &new_graph.body[2] {
+                    if let ExprIR::Ident { name } = value {
+                        assert_eq!(name, "s1", "emit should NOT be rewired");
+                    } else {
+                        panic!("expected ident in emit");
+                    }
+                } else {
+                    panic!("expected emit");
+                }
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_add_prompt_step_forwards_graph_inputs() {
+        // Graph with struct input — verify field forwarding.
+        let graph = GraphIR {
+            name: "solve".to_string(),
+            input: TypeIR::Struct {
+                fields: vec![
+                    FieldIR {
+                        name: "instructions".to_string(),
+                        ty: TypeIR::String,
+                    },
+                    FieldIR {
+                        name: "stub_content".to_string(),
+                        ty: TypeIR::String,
+                    },
+                ],
+            },
+            output: TypeIR::String,
+            body: vec![
+                GraphStmtIR::Step(StepIR {
+                    name: "s1".to_string(),
+                    node: "solver".to_string(),
+                    args: vec![StepArgIR::Positional {
+                        value: ExprIR::Ident {
+                            name: "input".to_string(),
+                        },
+                    }],
+                }),
+                GraphStmtIR::Emit(EmitIR::Direct {
+                    value: ExprIR::Ident {
+                        name: "s1".to_string(),
+                    },
+                }),
+            ],
+        };
+        let fields = vec!["instructions".to_string(), "stub_content".to_string()];
+        match apply_add_prompt_step(&graph, "s1", "review", &fields) {
+            MutationResult::Ok(new_graph) => {
+                assert_eq!(new_graph.body.len(), 3); // s1, review, emit
+                if let GraphStmtIR::Step(s) = &new_graph.body[1] {
+                    assert_eq!(s.name, "review");
+                    // Should have 3 named args: input, instructions, stub_content
+                    assert_eq!(s.args.len(), 3);
+                    // First: input = s1
+                    match &s.args[0] {
+                        StepArgIR::Named { name, value } => {
+                            assert_eq!(name, "input");
+                            assert!(matches!(value, ExprIR::Ident { name } if name == "s1"));
+                        }
+                        _ => panic!("expected named arg 'input'"),
+                    }
+                    // Second: instructions = input.instructions
+                    match &s.args[1] {
+                        StepArgIR::Named { name, value } => {
+                            assert_eq!(name, "instructions");
+                            match value {
+                                ExprIR::FieldAccess { base, field } => {
+                                    assert!(matches!(base.as_ref(), ExprIR::Ident { name } if name == "input"));
+                                    assert_eq!(field, "instructions");
+                                }
+                                _ => panic!("expected field access for instructions"),
+                            }
+                        }
+                        _ => panic!("expected named arg 'instructions'"),
+                    }
+                    // Third: stub_content = input.stub_content
+                    match &s.args[2] {
+                        StepArgIR::Named { name, value } => {
+                            assert_eq!(name, "stub_content");
+                            match value {
+                                ExprIR::FieldAccess { base, field } => {
+                                    assert!(matches!(base.as_ref(), ExprIR::Ident { name } if name == "input"));
+                                    assert_eq!(field, "stub_content");
+                                }
+                                _ => panic!("expected field access for stub_content"),
+                            }
+                        }
+                        _ => panic!("expected named arg 'stub_content'"),
+                    }
+                } else {
+                    panic!("expected step");
+                }
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_resolve_graph_input_fields_named_type() {
+        let ir = ScaffoldIR {
+            version: "2.0.0".to_string(),
+            types: vec![TypeDefIR {
+                name: "ExerciseInput".to_string(),
+                ty: TypeIR::Struct {
+                    fields: vec![
+                        FieldIR {
+                            name: "instructions".to_string(),
+                            ty: TypeIR::String,
+                        },
+                        FieldIR {
+                            name: "language".to_string(),
+                            ty: TypeIR::String,
+                        },
+                    ],
+                },
+            }],
+            nodes: vec![],
+            graphs: vec![],
+            objectives: vec![],
+        };
+        let graph = GraphIR {
+            name: "solve".to_string(),
+            input: TypeIR::Named {
+                name: "ExerciseInput".to_string(),
+            },
+            output: TypeIR::String,
+            body: vec![],
+        };
+        let fields = resolve_graph_input_fields(&graph, &ir);
+        assert_eq!(fields, vec!["instructions", "language"]);
+    }
+
+    #[test]
+    fn test_resolve_graph_input_fields_scalar() {
+        let ir = make_test_ir();
+        let graph = make_test_graph(); // has TypeIR::String input
+        let fields = resolve_graph_input_fields(&graph, &ir);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn test_edit_graph_apply_returns_new_graph() {
+        let ir = make_test_ir();
+        let graph = make_test_graph();
+        let new_graph = GraphIR {
+            name: "solve".to_string(),
+            input: TypeIR::String,
+            output: TypeIR::String,
+            body: vec![
+                GraphStmtIR::Step(StepIR {
+                    name: "s1".to_string(),
+                    node: "solver".to_string(),
+                    args: vec![StepArgIR::Positional {
+                        value: ExprIR::Ident {
+                            name: "input".to_string(),
+                        },
+                    }],
+                }),
+                GraphStmtIR::Step(StepIR {
+                    name: "s2".to_string(),
+                    node: "checker".to_string(),
+                    args: vec![StepArgIR::Positional {
+                        value: ExprIR::Ident {
+                            name: "s1".to_string(),
+                        },
+                    }],
+                }),
+                GraphStmtIR::Emit(EmitIR::Direct {
+                    value: ExprIR::Ident {
+                        name: "s2".to_string(),
+                    },
+                }),
+            ],
+        };
+        let mutation = Mutation::EditGraph {
+            new_graph: new_graph.clone(),
+            new_nodes: vec![],
+            description: "add checker step".to_string(),
+        };
+        match apply_mutation(&graph, &mutation, &ir) {
+            MutationResult::Ok(result) => {
+                assert_eq!(result.body.len(), 3); // s1, s2, emit
+                let names = collect_step_names(&result.body);
+                assert!(names.contains(&"s1".to_string()));
+                assert!(names.contains(&"s2".to_string()));
+            }
+            MutationResult::Skipped(msg) => panic!("unexpected skip: {}", msg),
+        }
+    }
+
+    #[test]
+    fn test_edit_graph_short_label() {
+        let mutation = Mutation::EditGraph {
+            new_graph: make_test_graph(),
+            new_nodes: vec![],
+            description: "add planning step".to_string(),
+        };
+        assert_eq!(mutation.short_label(), "edit: add planning step");
     }
 }
