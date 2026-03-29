@@ -124,7 +124,7 @@ impl fmt::Display for StructType {
         write!(f, "{{ ")?;
         let mut first = true;
         let mut fields: Vec<_> = self.fields.iter().collect();
-        fields.sort_by_key(|(k, _)| k.clone());
+        fields.sort_by_key(|(k, _)| *k);
         for (name, ty) in fields {
             if !first {
                 write!(f, ", ")?;

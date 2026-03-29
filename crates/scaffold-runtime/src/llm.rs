@@ -416,21 +416,6 @@ pub async fn query_structured_with_config(
     Ok(json_to_value(json_value))
 }
 
-#[cfg(test)]
-pub(crate) fn set_mock_structured_sequence(values: Vec<serde_json::Value>) {
-    *structured_mock_queue()
-        .lock()
-        .expect("structured mock queue lock poisoned") = values.into();
-}
-
-#[cfg(test)]
-pub(crate) fn clear_mock_structured_sequence() {
-    structured_mock_queue()
-        .lock()
-        .expect("structured mock queue lock poisoned")
-        .clear();
-}
-
 /// Extract JSON from a response that might be wrapped in markdown code blocks
 fn extract_json(response: &str) -> &str {
     let trimmed = response.trim();

@@ -184,7 +184,7 @@ const STRUCTURAL_MUTATIONS: &[&str] = &[
     "insert_step",
     "remove_step",
     "replace_component",
-    "fan_out_parallel",
+    "fan_out",
     "replace_with_subgraph",
     "add_prompt_step",
 ];
