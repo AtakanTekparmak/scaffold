@@ -148,6 +148,11 @@ enum Commands {
         /// Restart meta-agent context every N generations to prevent context bloat.
         #[arg(long)]
         meta_restart: Option<usize>,
+
+        /// Show full execution traces for all failed cases in meta-agent context.
+        /// Also enables changed-case trace analysis between generations.
+        #[arg(long)]
+        meta_full_traces: bool,
     },
 
     /// Pretty-print IR back to scaffold source
@@ -192,6 +197,7 @@ fn main() -> ExitCode {
             meta_model,
             meta_log,
             meta_restart,
+            meta_full_traces,
         } => cmd_optimize(
             &file,
             &objective,
@@ -204,6 +210,7 @@ fn main() -> ExitCode {
             meta_model,
             meta_log,
             meta_restart,
+            meta_full_traces,
         ),
         Commands::Print { file } => cmd_print(&file),
     }
@@ -580,6 +587,7 @@ fn cmd_optimize(
     meta_model: Option<String>,
     meta_log: Option<PathBuf>,
     meta_restart: Option<usize>,
+    meta_full_traces: bool,
 ) -> ExitCode {
     let ir = match load_ir(file) {
         Ok(ir) => ir,
@@ -615,6 +623,7 @@ fn cmd_optimize(
             meta_model: meta_model.clone(),
             meta_log: meta_log.clone(),
             meta_context_restart: meta_restart,
+            meta_full_traces,
         };
 
         let obj_name = objective_name.to_string();
@@ -649,6 +658,7 @@ fn cmd_optimize(
             meta_model,
             meta_log,
             meta_context_restart: meta_restart,
+            meta_full_traces,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();

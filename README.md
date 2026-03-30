@@ -33,6 +33,7 @@ scaffold evaluate FILE --objective OBJ  # evaluate on dataset
 scaffold optimize FILE --objective OBJ  # evolutionary optimization
   --max-candidates N                    # evolutionary generations
   --meta-model MODEL                    # enable LLM-guided meta-agent
+  --meta-full-traces                    # full execution traces for meta-agent
   --concurrency N                       # parallel case evaluation
   --live                                # TUI visualization
   --report-dir DIR                      # persist reports
@@ -49,6 +50,8 @@ The optimizer runs in three phases:
 
 **Meta-agent** (`--meta-model`): Instead of random mutations, an LLM analyzes the archive (scores, failures, templates) and proposes targeted mutations. Content rewrites use an instructions-only approach that mechanically preserves data bindings and format blocks from the original template.
 
+**Full execution traces** (`--meta-full-traces`): Sends full step-by-step execution traces for all failed cases to the meta-agent (instead of only the first 5). Also adds changed-case trace analysis showing traces for cases that flipped between generations, giving the meta-agent concrete evidence of what each mutation changed.
+
 **Hierarchical optimization**: Objectives with `sub` blocks optimize sub-graphs first, freeze the best results into the IR, then optimize the parent graph.
 
 Repository Layout
@@ -64,6 +67,7 @@ Examples
 --------
 - `examples/long_memory_oracle_mini.scaffold` — hierarchical memory retrieval benchmark
 - `examples/aider_polyglot.scaffold` — Aider polyglot coding benchmark (Python)
+- `examples/text_classification.scaffold` — text classification benchmark (Meta-Harness comparison)
 
 For LLMs
 --------

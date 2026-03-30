@@ -60,10 +60,11 @@ impl MetaAgent {
         objective: &ObjectiveIR,
         allowed_mutations: &[String],
         epoch_start_id: Option<usize>,
+        meta_full_traces: bool,
     ) -> Result<MutationProposal> {
         const MAX_RETRIES: usize = 10;
 
-        let base_context = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id);
+        let base_context = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id, meta_full_traces);
         let system_chars = SYSTEM_PROMPT.len();
         let llm_config = LlmConfig::new()
             .with_model(&self.model)
@@ -421,9 +422,10 @@ pub fn estimate_context_chars(
     objective: &ObjectiveIR,
     allowed_mutations: &[String],
     epoch_start_id: Option<usize>,
+    meta_full_traces: bool,
 ) -> usize {
     // Building the full string is cheap (no I/O), so just measure it directly.
-    let ctx = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id);
+    let ctx = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id, meta_full_traces);
     ctx.len() + SYSTEM_PROMPT.len()
 }
 
@@ -439,6 +441,7 @@ fn build_context(
     objective: &ObjectiveIR,
     allowed_mutations: &[String],
     epoch_start_id: Option<usize>,
+    meta_full_traces: bool,
 ) -> String {
     let mut ctx = String::with_capacity(4096);
     let epoch_start = epoch_start_id.unwrap_or(0);
@@ -972,13 +975,16 @@ fn build_context(
 
             // Detailed failures: show model output + test errors for the first N,
             // then one-liner summaries for the rest.
-            let detailed_limit = 5;
+            // When meta_full_traces is enabled, show full traces for ALL failed cases.
+            let failed_count = parent.case_results.iter().filter(|c| !c.passed).count();
+            let detailed_limit = if meta_full_traces { failed_count } else { 5 };
 
+            let failed_cases: Vec<_> = parent.case_results.iter().filter(|c| !c.passed).collect();
             ctx.push_str(&format!(
                 "\nFailed cases ({}):\n",
-                parent.case_results.len()
+                failed_cases.len()
             ));
-            for (i, case) in parent.case_results.iter().enumerate() {
+            for (i, case) in failed_cases.iter().enumerate() {
                 let repair_tag = case
                     .case_id
                     .as_deref()
@@ -992,7 +998,7 @@ fn build_context(
                     if i == detailed_limit {
                         ctx.push_str(&format!(
                             "\n  Other failures ({}):\n",
-                            parent.case_results.len() - detailed_limit,
+                            failed_cases.len() - detailed_limit,
                         ));
                     }
                     let id = case.case_id.as_deref().unwrap_or("?");
@@ -1015,6 +1021,13 @@ fn build_context(
 
     push_lineage_evidence(&mut ctx, archive, &lineage, ir);
     ctx.push('\n');
+
+    // 4b. Execution traces for changed cases (when meta_full_traces is enabled).
+    // Shows full step traces for cases that flipped between the parent's parent and the parent,
+    // giving the meta-agent concrete evidence of what mutations actually changed.
+    if meta_full_traces {
+        push_changed_case_traces(&mut ctx, archive, parent, ir);
+    }
 
     // 5. Available nodes with DSL source + override annotations
     ctx.push_str("## Available Nodes\n");
@@ -2103,6 +2116,51 @@ fn push_lineage_evidence(
         }
         ctx.push('\n');
     }
+}
+
+/// Show full execution traces for cases that flipped (passed↔failed) between
+/// the parent's parent and the parent. This gives the meta-agent concrete evidence
+/// of what the most recent mutation actually changed.
+fn push_changed_case_traces(
+    ctx: &mut String,
+    archive: &Archive,
+    parent: &Candidate,
+    ir: &ScaffoldIR,
+) {
+    // Find the grandparent (parent's parent)
+    let grandparent = parent
+        .parent_id
+        .and_then(|pid| archive.candidates.iter().find(|c| c.id == pid));
+
+    let grandparent = match grandparent {
+        Some(gp) => gp,
+        None => return, // seed candidate, no prior generation to compare
+    };
+
+    let delta = candidate_case_delta(grandparent, parent);
+    if delta.fixed.is_empty() && delta.broken.is_empty() {
+        return; // no flips, nothing to show
+    }
+
+    ctx.push_str("## Execution Traces for Changed Cases\n");
+    ctx.push_str("Full step traces for cases that flipped between the grandparent and parent.\n\n");
+
+    // Fixed cases: show the parent's trace (the successful execution)
+    for case_id in &delta.fixed {
+        if let Some(case) = find_case_result(parent, case_id) {
+            ctx.push_str(&format!("### {} (FIXED: F → P)\n", case_id));
+            push_case_evidence(ctx, parent, case, ir, 4000, None);
+        }
+    }
+
+    // Broken cases: show the parent's trace (the failing execution)
+    for case_id in &delta.broken {
+        if let Some(case) = find_case_result(parent, case_id) {
+            ctx.push_str(&format!("### {} (BROKEN: P → F)\n", case_id));
+            push_case_evidence(ctx, parent, case, ir, 4000, None);
+        }
+    }
+    ctx.push('\n');
 }
 
 fn find_case_result<'a>(
@@ -3511,6 +3569,7 @@ mod tests {
             &objective,
             &["add_prompt_step".into(), "set_config".into()],
             None,
+            false,
         );
 
         assert!(ctx.contains("## Failure Decomposition Hints"));
@@ -3756,6 +3815,7 @@ mod tests {
             &objective,
             &["insert_step".into(), "remove_step".into()],
             None,
+            false,
         );
 
         // Should show edit_graph instead of individual structural mutations

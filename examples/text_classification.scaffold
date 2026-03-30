@@ -1,0 +1,92 @@
+// Text Classification Benchmark
+// Replicates Meta-Harness (Stanford, 2026) text classification setup.
+
+// ── Types ──
+
+type ClassifyInput = {
+    task_text: string,
+    label_guide: string,
+    expected_label: string
+}
+
+// ── Nodes ──
+
+node classify_text: prompt {
+    in: { task_text: string, label_guide: string }
+    out: string
+    template: file("examples/prompts/classify/template")
+    system: file("examples/prompts/classify/system")
+    model: "openrouter/openai/gpt-oss-120b"
+    temperature: 0.0
+}
+
+node retry_classify: prompt {
+    in: { task_text: string, label_guide: string, previous_prediction: string, eval_feedback: string }
+    out: string
+    template: file("examples/prompts/classify_retry/template")
+    system: file("examples/prompts/classify/system")
+    model: "openrouter/openai/gpt-oss-120b"
+    temperature: 0.0
+}
+
+node eval_classify: tool {
+    in: { prediction: string, expected_label: string }
+    out: string
+    shell: "python3 tools/eval_classify.py --expected \"{{expected_label}}\" <<'SCAFFOLD_HEREDOC_8b2c'\n{{prediction}}\nSCAFFOLD_HEREDOC_8b2c"
+    timeout: 30
+}
+
+// ── Graph ──
+
+graph classify {
+    in: ClassifyInput
+    out: string
+
+    // Attempt 1: classify from text + label guide
+    step attempt1 = classify_text(
+        task_text: input.task_text,
+        label_guide: input.label_guide
+    )
+    step result1 = eval_classify(
+        prediction: attempt1,
+        expected_label: input.expected_label
+    )
+
+    // Attempt 2: retry with feedback (only if attempt 1 failed)
+    if json_parse(result1).passed == false {
+        step attempt2 = retry_classify(
+            task_text: input.task_text,
+            label_guide: input.label_guide,
+            previous_prediction: attempt1,
+            eval_feedback: json_parse(result1).predicted
+        )
+        step result2 = eval_classify(
+            prediction: attempt2,
+            expected_label: input.expected_label
+        )
+        emit result2
+    } else {
+        emit result1
+    }
+}
+
+// ── Objective ──
+
+objective text_classify {
+    graph: classify
+    dataset: file("examples/datasets/symptom2disease.jsonl")
+
+    checker correct { json_parse(output).passed == true }
+    metric accuracy { checker: correct }
+    score: accuracy
+
+    split { train: 0.28, val: 0.17, test: 0.55 }
+    select { primary: accuracy }
+
+    tune {
+        classify_text.temperature in [0.0, 0.2, 0.5, 0.7, 1.0]
+        retry_classify.temperature in [0.0, 0.2, 0.5]
+    }
+
+    topology { mutations: [set_config, insert_step, remove_step, replace_component] max_nodes: 8 target_score: 0.9 }
+}

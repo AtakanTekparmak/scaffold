@@ -134,6 +134,10 @@ pub struct OptimizationOptions {
     /// When set, the meta-agent's context is compacted by only showing candidates
     /// from the current "epoch". The TUI still shows full lineage.
     pub meta_context_restart: Option<usize>,
+    /// When true, show full execution traces for all failed cases in meta-agent context
+    /// (instead of only the first 5). Also stores traces for passed cases so that
+    /// changed-case analysis can show traces for cases that flipped.
+    pub meta_full_traces: bool,
 }
 
 impl Default for OptimizationOptions {
@@ -148,6 +152,7 @@ impl Default for OptimizationOptions {
             meta_model: None,
             meta_log: None,
             meta_context_restart: None,
+            meta_full_traces: false,
         }
     }
 }
@@ -1154,7 +1159,7 @@ async fn evaluate_candidate(
                     } else {
                         (None, None, None)
                     };
-                    let trace = if !p { step_trace } else { Vec::new() };
+                    let trace = step_trace; // always keep full trace
                     (p, bits, excerpt, raw, model_resp, trace)
                 }
                 Err(e) => {
@@ -1194,18 +1199,16 @@ async fn evaluate_candidate(
             }
         }
 
-        // Only store failed cases — these are what the meta-agent learns from.
-        if !passed {
-            case_results.push(CaseResult {
-                case_id: case.id.clone(),
-                passed,
-                checker_results: checker_bits,
-                output_excerpt,
-                raw_output,
-                model_response,
-                step_trace,
-            });
-        }
+        // Store all cases — full traces enable richer meta-agent context.
+        case_results.push(CaseResult {
+            case_id: case.id.clone(),
+            passed,
+            checker_results: checker_bits,
+            output_excerpt,
+            raw_output,
+            model_response,
+            step_trace,
+        });
 
         emit(
             options,
@@ -1664,7 +1667,7 @@ async fn run_evolutionary_into(
             let meta =
                 crate::meta_agent::MetaAgent::new(meta_model).with_log(options.meta_log.clone());
             match meta
-                .propose_mutation(&parent_clone, archive, ir, objective, &allowed_mutations, epoch_start_id)
+                .propose_mutation(&parent_clone, archive, ir, objective, &allowed_mutations, epoch_start_id, options.meta_full_traces)
                 .await
             {
                 Ok(proposal) => {
