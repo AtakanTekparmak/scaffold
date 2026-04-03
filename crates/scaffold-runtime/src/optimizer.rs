@@ -11,11 +11,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use scaffold_ir::ir::*;
 use scaffold_ir::pretty::pretty_print;
 
 use crate::error::{Error, Result};
+use crate::example_bank::{EvalCaseForBank, ExampleBank};
 use crate::executor::{GraphExecutor, TunableOverrides};
 use crate::mutations::{
     apply_mutation, check_constraints, collect_step_names, GraphDescriptor, Mutation,
@@ -138,6 +140,15 @@ pub struct OptimizationOptions {
     /// (instead of only the first 5). Also stores traces for passed cases so that
     /// changed-case analysis can show traces for cases that flipped.
     pub meta_full_traces: bool,
+    /// Number of training cases to sample per generation for meta-agent context.
+    /// None = use all training cases.
+    pub batch_size: Option<usize>,
+    /// When true, pool train+val cases and sample a fresh random subset for each
+    /// candidate evaluation. Prevents overfitting to a small fixed val set.
+    pub rotating_val: bool,
+    /// When true, meta-agent proposed tool nodes can access the network.
+    /// The filesystem sandbox remains in place.
+    pub online: bool,
 }
 
 impl Default for OptimizationOptions {
@@ -153,6 +164,9 @@ impl Default for OptimizationOptions {
             meta_log: None,
             meta_context_restart: None,
             meta_full_traces: false,
+            batch_size: None,
+            rotating_val: false,
+            online: false,
         }
     }
 }
@@ -221,93 +235,323 @@ pub struct CaseResult {
     pub model_response: Option<String>,
     /// Per-step outputs captured during graph execution (step_name → output).
     pub step_trace: Vec<(String, String)>,
+    /// Truncated expected value for failed cases (for output-pattern analysis).
+    pub expected_excerpt: Option<String>,
 }
 
-/// A candidate in the search archive.
+/// Search-space representation: lineage + delta.
+/// This is what the archive stores and the meta-agent reasons about.
 #[derive(Debug, Clone)]
-pub struct Candidate {
+pub struct CandidateDelta {
     /// Unique candidate ID.
     pub id: usize,
-    /// Parent candidate ID (0 = seed).
+    /// Parent candidate ID (None = seed).
     pub parent_id: Option<usize>,
-    /// The graph IR for this candidate.
+    /// The graph IR for this candidate (structural mutations applied).
     pub graph: GraphIR,
-    /// Tunable overrides.
+    /// Tunable overrides (content mutations + synthetic nodes).
     pub overrides: TunableOverrides,
     /// Mutations applied from parent.
     pub mutations: Vec<Mutation>,
-    /// Evaluation score (None if not yet evaluated).
-    pub score: Option<f64>,
-    /// Per-metric scores.
-    pub metric_scores: HashMap<String, f64>,
     /// Graph structural descriptor.
     pub descriptor: GraphDescriptor,
     /// Number of times this candidate has been selected as a parent.
     pub children_count: usize,
     /// Meta-agent reasoning (if mutation was proposed by the meta-agent).
     pub meta_reasoning: Option<String>,
-    /// Per-case evaluation results (for meta-agent learning).
-    pub case_results: Vec<CaseResult>,
-    /// Total dataset cases evaluated.
-    pub total_cases: usize,
-    /// Number of cases that passed the primary checker.
-    pub cases_passed: usize,
-    /// IDs of cases that passed (for computing diffs between candidates).
+}
+
+/// Fully materialized IR snapshot. Unit of execution.
+/// Produced by resolve() — the ONLY path from delta to executable.
+pub struct ResolvedCandidate {
+    pub ir: ScaffoldIR,
+    pub graph_name: String,
+    pub semantic_hash: u64,
+    /// Raw overrides carried through for runtime fields not baked into the IR
+    /// (e.g. `_tool_spec`, `_example_policy`).
+    pub overrides: HashMap<String, serde_json::Value>,
+}
+
+/// Compute a semantic hash of a resolved candidate's IR + runtime overrides.
+/// Includes graph topology, all node config content, and runtime-only overrides
+/// (e.g. `_example_policy`, `_checker.*`) that affect execution but aren't baked into the IR.
+fn compute_semantic_hash(ir: &ScaffoldIR, graph_name: &str, overrides: &HashMap<String, serde_json::Value>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+
+    // Hash graph topology
+    if let Some(graph) = ir.graphs.iter().find(|g| g.name == graph_name) {
+        "graph".hash(&mut hasher);
+        graph.name.hash(&mut hasher);
+        crate::mutations::hash_stmts_pub(&graph.body, &mut hasher);
+    }
+
+    // Hash all node configs, sorted by name for determinism
+    let mut nodes: Vec<&scaffold_ir::NodeIR> = ir.nodes.iter().collect();
+    nodes.sort_by(|a, b| a.name.cmp(&b.name));
+    for node in &nodes {
+        node.name.hash(&mut hasher);
+        format!("{:?}", node.kind).hash(&mut hasher);
+        hash_node_config(&node.config, &mut hasher);
+    }
+
+    // Hash runtime-only overrides that aren't materialized into the IR
+    // (e.g. _example_policy, _checker.*). Sorted for determinism.
+    let mut runtime_keys: Vec<&String> = overrides.keys()
+        .filter(|k| {
+            // _node.* overrides are baked into IR — skip those.
+            // All other _ prefixed keys and field overrides already in IR are harmless to re-hash.
+            !k.starts_with("_node.")
+        })
+        .collect();
+    runtime_keys.sort();
+    for key in runtime_keys {
+        key.hash(&mut hasher);
+        overrides[key].to_string().hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+/// Hash all content-bearing fields of a node config.
+fn hash_node_config(config: &scaffold_ir::NodeConfigIR, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    if let Some(ref t) = config.template {
+        "template".hash(hasher);
+        match t {
+            scaffold_ir::StringOrFileIR::Literal { value } => value.hash(hasher),
+            scaffold_ir::StringOrFileIR::File { path } => path.hash(hasher),
+        }
+    }
+    if let Some(ref s) = config.system {
+        "system".hash(hasher);
+        match s {
+            scaffold_ir::StringOrFileIR::Literal { value } => value.hash(hasher),
+            scaffold_ir::StringOrFileIR::File { path } => path.hash(hasher),
+        }
+    }
+    if let Some(ref m) = config.model {
+        "model".hash(hasher);
+        m.hash(hasher);
+    }
+    if let Some(t) = config.temperature {
+        "temperature".hash(hasher);
+        t.to_bits().hash(hasher);
+    }
+    if let Some(mt) = config.max_tokens {
+        "max_tokens".hash(hasher);
+        mt.hash(hasher);
+    }
+    if let Some(ref sh) = config.shell {
+        "shell".hash(hasher);
+        sh.hash(hasher);
+    }
+    for tool in &config.tools {
+        "tool".hash(hasher);
+        tool.hash(hasher);
+    }
+}
+
+/// Execution receipt for reproducibility auditing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionReceipt {
+    pub timestamp: u64,
+    pub semantic_hash: u64,
+    pub executor_version: String,
+}
+
+impl ExecutionReceipt {
+    fn now(semantic_hash: u64) -> Self {
+        Self {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            semantic_hash,
+            executor_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+/// Training eval: full case detail for meta-agent learning.
+#[derive(Debug, Clone)]
+pub struct TrainEval {
+    pub score: f64,
+    pub metric_scores: HashMap<String, f64>,
+    pub cases: Vec<CaseResult>,
+    pub total: usize,
+    pub passed: usize,
     pub passed_case_ids: Vec<String>,
+}
+
+/// Validation eval: blind aggregate only. No cases, no IDs.
+/// The type system enforces that val case detail can never leak.
+#[derive(Debug, Clone)]
+pub struct BlindEval {
+    pub score: f64,
+    pub metric_scores: HashMap<String, f64>,
+    pub total: usize,
+    pub passed: usize,
+}
+
+/// Eval results, stored alongside delta in the archive.
+#[derive(Debug, Clone)]
+pub struct EvalResults {
+    /// Validation (or main when no split) eval — blind aggregate only.
+    pub val: Option<BlindEval>,
+    /// Training eval with full case detail (for meta-agent learning).
+    pub train: Option<TrainEval>,
+}
+
+impl EvalResults {
+    /// Overall score: val score when available, else train score.
+    pub fn score(&self) -> Option<f64> {
+        self.val.as_ref().map(|v| v.score).or(self.train.as_ref().map(|t| t.score))
+    }
+
+    /// Per-metric scores: val metrics when available, else train.
+    pub fn metric_scores(&self) -> &HashMap<String, f64> {
+        static EMPTY: std::sync::LazyLock<HashMap<String, f64>> = std::sync::LazyLock::new(HashMap::new);
+        self.val.as_ref().map(|v| &v.metric_scores)
+            .or(self.train.as_ref().map(|t| &t.metric_scores))
+            .unwrap_or(&*EMPTY)
+    }
+
+    /// Total cases evaluated (val when available, else train).
+    pub fn total_cases(&self) -> usize {
+        self.val.as_ref().map(|v| v.total)
+            .or(self.train.as_ref().map(|t| t.total))
+            .unwrap_or(0)
+    }
+
+    /// Cases passed (val when available, else train).
+    pub fn cases_passed(&self) -> usize {
+        self.val.as_ref().map(|v| v.passed)
+            .or(self.train.as_ref().map(|t| t.passed))
+            .unwrap_or(0)
+    }
+
+    /// Train case results (empty if no train eval).
+    pub fn train_case_results(&self) -> &[CaseResult] {
+        self.train.as_ref().map(|t| t.cases.as_slice()).unwrap_or(&[])
+    }
+
+    /// Train passed case IDs (empty if no train eval).
+    pub fn train_passed_case_ids(&self) -> &[String] {
+        self.train.as_ref().map(|t| t.passed_case_ids.as_slice()).unwrap_or(&[])
+    }
+
+    /// Train total cases (0 if no train eval).
+    pub fn train_total(&self) -> usize {
+        self.train.as_ref().map(|t| t.total).unwrap_or(0)
+    }
+
+    /// Train passed count (0 if no train eval).
+    pub fn train_passed(&self) -> usize {
+        self.train.as_ref().map(|t| t.passed).unwrap_or(0)
+    }
+}
+
+impl Default for EvalResults {
+    fn default() -> Self {
+        Self {
+            val: None,
+            train: None,
+        }
+    }
+}
+
+/// Archive entry = delta + eval.
+#[derive(Debug, Clone)]
+pub struct ArchiveEntry {
+    pub delta: CandidateDelta,
+    pub eval: EvalResults,
+}
+
+/// Val checkpoint: recorded when a new best candidate is found during optimization.
+/// Used purely as advisory signal for the meta-agent (not for selection).
+#[derive(Debug, Clone)]
+pub struct ValCheckpoint {
+    pub candidate_id: usize,
+    pub train_score: f64,
+    pub val_score: f64,
 }
 
 /// The optimization archive.
 pub struct Archive {
-    pub candidates: Vec<Candidate>,
+    pub entries: Vec<ArchiveEntry>,
     next_id: usize,
+    /// Semantic hashes of all evaluated candidates (for dedup).
+    seen_hashes: std::collections::HashSet<u64>,
+    /// Val checkpoints recorded on new-best events.
+    pub val_checkpoints: Vec<ValCheckpoint>,
 }
 
 impl Archive {
     pub fn new() -> Self {
         Self {
-            candidates: Vec::new(),
+            entries: Vec::new(),
             next_id: 0,
+            seen_hashes: std::collections::HashSet::new(),
+            val_checkpoints: Vec::new(),
         }
     }
 
-    pub fn add(&mut self, candidate: Candidate) -> usize {
+    pub fn add(&mut self, delta: CandidateDelta, eval: EvalResults) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        self.candidates.push(Candidate { id, ..candidate });
+        self.entries.push(ArchiveEntry {
+            delta: CandidateDelta { id, ..delta },
+            eval,
+        });
         id
     }
 
-    /// Get the best candidate by score.
-    pub fn best(&self) -> Option<&Candidate> {
-        self.candidates
+    /// Record a semantic hash as seen. Returns true if it was new (not a duplicate).
+    pub fn record_hash(&mut self, hash: u64) -> bool {
+        self.seen_hashes.insert(hash)
+    }
+
+    /// Check if a semantic hash has been seen before.
+    pub fn has_semantic_hash(&self, hash: u64) -> bool {
+        self.seen_hashes.contains(&hash)
+    }
+
+    /// Get the best entry by score.
+    pub fn best(&self) -> Option<&ArchiveEntry> {
+        self.entries
             .iter()
-            .filter(|c| c.score.is_some())
+            .filter(|e| e.eval.score().is_some())
             .max_by(|a, b| {
-                a.score
+                a.eval
+                    .score()
                     .unwrap()
-                    .partial_cmp(&b.score.unwrap())
+                    .partial_cmp(&b.eval.score().unwrap())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     }
 
     /// Increment the children count for a parent candidate.
     pub fn increment_children(&mut self, parent_id: usize) {
-        if let Some(c) = self.candidates.iter_mut().find(|c| c.id == parent_id) {
-            c.children_count += 1;
+        if let Some(e) = self.entries.iter_mut().find(|e| e.delta.id == parent_id) {
+            e.delta.children_count += 1;
         }
     }
 
-    /// Get evaluated candidates sorted by score descending.
-    pub fn ranked(&self) -> Vec<&Candidate> {
-        let mut evaluated: Vec<&Candidate> = self
-            .candidates
+    /// Get evaluated entries sorted by score descending.
+    pub fn ranked(&self) -> Vec<&ArchiveEntry> {
+        let mut evaluated: Vec<&ArchiveEntry> = self
+            .entries
             .iter()
-            .filter(|c| c.score.is_some())
+            .filter(|e| e.eval.score().is_some())
             .collect();
         evaluated.sort_by(|a, b| {
-            b.score
+            b.eval
+                .score()
                 .unwrap()
-                .partial_cmp(&a.score.unwrap())
+                .partial_cmp(&a.eval.score().unwrap())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         evaluated
@@ -329,6 +573,33 @@ pub struct OptimizationReport {
     /// Best candidate's per-metric scores.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_metric_scores: Option<HashMap<String, f64>>,
+    /// Val set score (held-out validation, only evaluated at the end on best candidate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_score: Option<f64>,
+    /// Val set per-metric scores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_metric_scores: Option<HashMap<String, f64>>,
+    /// Total val cases evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_cases_total: Option<usize>,
+    /// Val cases that passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_cases_passed: Option<usize>,
+    /// Test set score (only when split is active and test set is non-empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_score: Option<f64>,
+    /// Test set per-metric scores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_metric_scores: Option<HashMap<String, f64>>,
+    /// Total test cases evaluated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_cases_total: Option<usize>,
+    /// Test cases that passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_cases_passed: Option<usize>,
+    /// Execution receipt for the test evaluation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_receipt: Option<ExecutionReceipt>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -389,8 +660,31 @@ pub async fn optimize(
             ))
         })?;
 
-    // Load dataset
-    let dataset = load_dataset_from_spec(&objective.dataset)?;
+    // Load and partition dataset
+    let all_cases = load_dataset_from_spec(&objective.dataset)?;
+    let split = partition_dataset(all_cases, objective.split.as_ref());
+
+    if objective.split.is_some() {
+        emit(
+            options,
+            OptEvent::Log {
+                message: format!(
+                    "Dataset split: train={}, val={}, test={}",
+                    split.train.len(),
+                    split.val.len(),
+                    split.test.len(),
+                ),
+            },
+        );
+        if options.event_tx.is_none() {
+            eprintln!(
+                "[optimizer] dataset split: train={}, val={}, test={}",
+                split.train.len(),
+                split.val.len(),
+                split.test.len(),
+            );
+        }
+    }
 
     // Notify TUI of harness models and meta-agent early so the UI
     // reflects them from the very first frame (including during seeding).
@@ -414,9 +708,9 @@ pub async fn optimize(
     }
 
     match options.backend {
-        OptimizationBackend::Grid => run_grid_search(ir, objective, graph, &dataset, options).await,
+        OptimizationBackend::Grid => run_grid_search(ir, objective, graph, &split, options).await,
         OptimizationBackend::Evolutionary => {
-            run_evolutionary(ir, objective, graph, &dataset, options).await
+            run_evolutionary(ir, objective, graph, &split, options).await
         }
     }
 }
@@ -690,25 +984,35 @@ async fn optimize_and_extract(
             ))
         })?;
 
-    let dataset = load_dataset_from_spec(&objective.dataset)?;
+    let all_cases = load_dataset_from_spec(&objective.dataset)?;
+    let split = partition_dataset(all_cases, objective.split.as_ref());
+    let pool;
+    let val_dataset: &[DatasetCase] = if options.rotating_val && !split.val.is_empty() {
+        pool = split.train.iter().chain(split.val.iter()).cloned().collect::<Vec<_>>();
+        &pool
+    } else if split.val.is_empty() {
+        &split.train[..]
+    } else {
+        &split.val[..]
+    };
 
     let mut archive = Archive::new();
 
     match options.backend {
         OptimizationBackend::Grid => {
-            run_grid_search_into(ir, objective, graph, &dataset, options, &mut archive).await?;
+            run_grid_search_into(ir, objective, graph, val_dataset, options, &mut archive).await?;
         }
         OptimizationBackend::Evolutionary => {
-            run_evolutionary_into(ir, objective, graph, &dataset, options, &mut archive).await?;
+            run_evolutionary_into(ir, objective, graph, &split, options, &mut archive).await?;
         }
     }
 
-    let best_graph = archive.best().map(|c| c.graph.clone());
+    let best_graph = archive.best().map(|e| e.delta.graph.clone());
     let best_overrides = archive
         .best()
-        .map(|c| c.overrides.clone())
+        .map(|e| e.delta.overrides.clone())
         .filter(|o| !o.is_empty());
-    let report = build_report(ir, objective, &archive, options)?;
+    let report = build_report(ir, objective, &archive, &split, options).await?;
 
     Ok(OptimizationResult {
         report,
@@ -794,12 +1098,21 @@ fn bake_overrides_into_ir(ir: &mut ScaffoldIR, overrides: &HashMap<String, serde
         }
     }
 
+    // Collect node names so we can match dotted names like "_motif.result.shortlist.template".
+    // We try each known node name as a prefix: if the key is "<node_name>.<field>", we match.
+    let node_names: Vec<String> = ir.nodes.iter().map(|n| n.name.clone()).collect();
+
     for (key, value) in overrides {
-        let parts: Vec<&str> = key.splitn(2, '.').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let (node_name, field) = (parts[0], parts[1]);
+        // Find the longest matching node name prefix (longest wins to handle nested dots).
+        let matched = node_names
+            .iter()
+            .filter(|name| key.starts_with(name.as_str()) && key.get(name.len()..name.len() + 1) == Some("."))
+            .max_by_key(|name| name.len());
+
+        let (node_name, field) = match matched {
+            Some(name) => (name.as_str(), &key[name.len() + 1..]),
+            None => continue,
+        };
 
         if let Some(node) = ir.nodes.iter_mut().find(|n| n.name == node_name) {
             match field {
@@ -845,25 +1158,74 @@ fn bake_overrides_into_ir(ir: &mut ScaffoldIR, overrides: &HashMap<String, serde
     }
 }
 
-fn materialize_best_candidate_ir(
+/// Resolve a CandidateDelta into a fully materialized IR snapshot.
+/// This is the ONLY path from search representation to executable IR.
+fn resolve(
+    delta: &CandidateDelta,
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
-    best: &Candidate,
-) -> ScaffoldIR {
-    let mut best_ir = ir.clone();
+) -> ResolvedCandidate {
+    let mut resolved_ir = ir.clone();
 
-    if let Some(graph) = best_ir
+    if let Some(graph) = resolved_ir
         .graphs
         .iter_mut()
         .find(|graph| graph.name == objective.graph)
     {
-        *graph = best.graph.clone();
+        *graph = delta.graph.clone();
     } else {
-        best_ir.graphs.push(best.graph.clone());
+        resolved_ir.graphs.push(delta.graph.clone());
     }
 
-    bake_overrides_into_ir(&mut best_ir, &best.overrides);
-    best_ir
+    bake_overrides_into_ir(&mut resolved_ir, &delta.overrides);
+    let graph_name = objective.graph.clone();
+    let semantic_hash = compute_semantic_hash(&resolved_ir, &graph_name, &delta.overrides);
+    ResolvedCandidate {
+        ir: resolved_ir,
+        graph_name,
+        semantic_hash,
+        overrides: delta.overrides.clone(),
+    }
+}
+
+fn materialize_best_candidate_ir(
+    ir: &ScaffoldIR,
+    objective: &ObjectiveIR,
+    best: &ArchiveEntry,
+) -> ScaffoldIR {
+    resolve(&best.delta, ir, objective).ir
+}
+
+/// Find the primary emit node: the last prompt/agent step before the emit statement.
+/// This is the node that produces the final answer and should receive few-shot examples.
+fn find_primary_emit_node(graph: &GraphIR, ir: &ScaffoldIR) -> String {
+    let prompt_nodes: std::collections::HashSet<&str> = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.kind, NodeKindIR::Prompt | NodeKindIR::Agent))
+        .map(|n| n.name.as_str())
+        .collect();
+
+    let mut last_prompt_step: Option<String> = None;
+    for stmt in &graph.body {
+        match stmt {
+            GraphStmtIR::Step(step) => {
+                if prompt_nodes.contains(step.node.as_str()) {
+                    last_prompt_step = Some(step.node.clone());
+                }
+            }
+            GraphStmtIR::Emit(_) => break,
+            _ => {}
+        }
+    }
+    last_prompt_step.unwrap_or_else(|| {
+        // Fallback: first prompt node
+        ir.nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKindIR::Prompt | NodeKindIR::Agent))
+            .map(|n| n.name.clone())
+            .unwrap_or_default()
+    })
 }
 
 /// A single dataset case for evaluation.
@@ -872,6 +1234,212 @@ pub struct DatasetCase {
     pub input: Value,
     pub expected: Value,
     pub id: Option<String>,
+    /// Optional domain/category label for domain-conditioned example selection.
+    pub domain: Option<String>,
+}
+
+/// Dataset partitioned into train/val/test splits.
+pub struct DatasetSplit {
+    pub train: Vec<DatasetCase>,
+    pub val: Vec<DatasetCase>,
+    pub test: Vec<DatasetCase>,
+}
+
+/// Partition dataset cases into train/val/test splits.
+///
+/// - If all case IDs have `train-`/`val-`/`test-` prefixes → partition by prefix
+/// - Otherwise → deterministic shuffle (seed 12345) + ratio-based partition
+/// - No split declared (`None`) → all cases in `train`, empty val/test
+pub fn partition_dataset(
+    cases: Vec<DatasetCase>,
+    split: Option<&SplitIR>,
+) -> DatasetSplit {
+    let split = match split {
+        Some(s) => s,
+        None => {
+            return DatasetSplit {
+                train: cases,
+                val: vec![],
+                test: vec![],
+            };
+        }
+    };
+
+    // Check if all cases have prefix-based IDs
+    let all_prefixed = !cases.is_empty()
+        && cases.iter().all(|c| {
+            c.id.as_ref()
+                .map(|id| id.starts_with("train-") || id.starts_with("val-") || id.starts_with("test-"))
+                .unwrap_or(false)
+        });
+
+    if all_prefixed {
+        let mut train = Vec::new();
+        let mut val = Vec::new();
+        let mut test = Vec::new();
+        for case in cases {
+            let prefix = case.id.as_deref().unwrap_or("");
+            if prefix.starts_with("train-") {
+                train.push(case);
+            } else if prefix.starts_with("val-") {
+                val.push(case);
+            } else if prefix.starts_with("test-") {
+                test.push(case);
+            }
+        }
+        DatasetSplit { train, val, test }
+    } else {
+        // Deterministic shuffle + ratio-based partition
+        let mut indices: Vec<usize> = (0..cases.len()).collect();
+        let mut rng = SimpleRng::new(12345);
+        // Fisher-Yates shuffle
+        for i in (1..indices.len()).rev() {
+            let j = rng.next_usize() % (i + 1);
+            indices.swap(i, j);
+        }
+
+        let n = cases.len();
+        let train_end = ((split.train * n as f64).round() as usize).min(n);
+        let val_end = (train_end + (split.val * n as f64).round() as usize).min(n);
+
+        // Move cases into a vec we can index-swap from
+        let mut pool: Vec<Option<DatasetCase>> = cases.into_iter().map(Some).collect();
+        let mut train = Vec::with_capacity(train_end);
+        let mut val = Vec::with_capacity(val_end - train_end);
+        let mut test = Vec::with_capacity(n - val_end);
+
+        for (pos, &idx) in indices.iter().enumerate() {
+            let case = pool[idx].take().unwrap();
+            if pos < train_end {
+                train.push(case);
+            } else if pos < val_end {
+                val.push(case);
+            } else {
+                test.push(case);
+            }
+        }
+
+        DatasetSplit { train, val, test }
+    }
+}
+
+/// Extract domain prefix from a case ID by splitting on the first `_`.
+///
+/// E.g. `"s2d_train-015-malaria"` → `"s2d"`, `"usp_val-003"` → `"usp"`.
+/// Returns `""` for IDs with no underscore or missing IDs.
+fn extract_domain(id: &str) -> &str {
+    id.split('_').next().unwrap_or("")
+}
+
+/// Select a stratified batch of N cases from the training set.
+///
+/// Groups cases by domain prefix (first `_`-delimited segment of the case ID).
+/// When ≥2 domains exist, allocates ≥1 case per domain, distributes the
+/// remainder proportionally, and shuffles within each group. Falls back to
+/// pure-random partial Fisher-Yates when <2 domains are detected.
+fn select_train_batch(
+    train: &[DatasetCase],
+    batch_size: Option<usize>,
+    rng: &mut SimpleRng,
+) -> Vec<DatasetCase> {
+    let n = train.len();
+    if n == 0 {
+        return vec![];
+    }
+    let k = match batch_size {
+        Some(b) if b < n => b,
+        _ => return train.to_vec(),
+    };
+
+    // Group case indices by domain prefix
+    let mut domain_groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, case) in train.iter().enumerate() {
+        let domain = case
+            .id
+            .as_deref()
+            .map(extract_domain)
+            .unwrap_or("")
+            .to_string();
+        if let Some(entry) = domain_groups.iter_mut().find(|(d, _)| *d == domain) {
+            entry.1.push(i);
+        } else {
+            domain_groups.push((domain, vec![i]));
+        }
+    }
+
+    // Fall back to pure-random when <2 domains
+    if domain_groups.len() < 2 {
+        let mut indices: Vec<usize> = (0..n).collect();
+        for i in 0..k {
+            let j = i + rng.next_usize() % (n - i);
+            indices.swap(i, j);
+        }
+        return indices[..k].iter().map(|&i| train[i].clone()).collect();
+    }
+
+    // Stratified allocation: ≥1 per domain, remainder distributed proportionally
+    let num_domains = domain_groups.len();
+    let guaranteed = 1usize;
+    let remainder = if k > num_domains * guaranteed {
+        k - num_domains * guaranteed
+    } else {
+        0
+    };
+
+    let mut selected_indices: Vec<usize> = Vec::with_capacity(k);
+    for (_domain, indices) in &mut domain_groups {
+        // Fisher-Yates shuffle within group
+        let group_n = indices.len();
+        for i in (1..group_n).rev() {
+            let j = rng.next_usize() % (i + 1);
+            indices.swap(i, j);
+        }
+
+        // Allocate: guaranteed + proportional share of remainder
+        let proportional = if n > 0 {
+            (remainder as f64 * group_n as f64 / n as f64).round() as usize
+        } else {
+            0
+        };
+        let alloc = (guaranteed + proportional).min(group_n);
+        selected_indices.extend_from_slice(&indices[..alloc]);
+    }
+
+    // Trim or pad to exactly k
+    if selected_indices.len() > k {
+        // Shuffle and truncate
+        let sel_n = selected_indices.len();
+        for i in (1..sel_n).rev() {
+            let j = rng.next_usize() % (i + 1);
+            selected_indices.swap(i, j);
+        }
+        selected_indices.truncate(k);
+    } else if selected_indices.len() < k {
+        // Collect unused indices and fill remaining slots
+        let selected_set: std::collections::HashSet<usize> =
+            selected_indices.iter().copied().collect();
+        let mut unused: Vec<usize> = (0..n)
+            .filter(|i| !selected_set.contains(i))
+            .collect();
+        for i in (1..unused.len()).rev() {
+            let j = rng.next_usize() % (i + 1);
+            unused.swap(i, j);
+        }
+        let need = k - selected_indices.len();
+        selected_indices.extend_from_slice(&unused[..need.min(unused.len())]);
+    }
+
+    // Final shuffle so order is random
+    let sel_n = selected_indices.len();
+    for i in (1..sel_n).rev() {
+        let j = rng.next_usize() % (i + 1);
+        selected_indices.swap(i, j);
+    }
+
+    selected_indices
+        .iter()
+        .map(|&i| train[i].clone())
+        .collect()
 }
 
 /// Load dataset from objective spec.
@@ -884,6 +1452,7 @@ pub fn load_dataset_from_spec(spec: &DatasetSpecIR) -> Result<Vec<DatasetCase>> 
                     input: expr_to_value(&case.input),
                     expected: expr_to_value(&case.expected),
                     id: case.id.clone(),
+                    domain: None,
                 });
             }
             Ok(result)
@@ -916,10 +1485,16 @@ pub fn load_dataset_from_spec(spec: &DatasetSpecIR) -> Result<Vec<DatasetCase>> 
                     .get("id")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let domain = json
+                    .get("domain")
+                    .or_else(|| json.get("category"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 cases.push(DatasetCase {
                     input,
                     expected,
                     id,
+                    domain,
                 });
             }
             Ok(cases)
@@ -951,13 +1526,52 @@ fn expr_to_value(expr: &ExprIR) -> Value {
 ///
 /// `display_id` is the ID shown in TUI events (since `candidate.id` is always
 /// 0 before `archive.add()` assigns the real one).
-async fn evaluate_candidate(
+///
+/// `parent_score` enables relative early stopping: when set and the candidate's
+/// pass rate falls below `parent_score * 0.4` after enough cases, evaluation
+/// aborts early to save cost on clearly hopeless candidates.
+/// Evaluate on a training dataset: returns full case detail for meta-agent learning.
+async fn evaluate_train(
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
-    candidate: &Candidate,
+    resolved: &ResolvedCandidate,
     dataset: &[DatasetCase],
     options: &OptimizationOptions,
     display_id: usize,
+    parent_score: Option<f64>,
+    example_bank: Option<Arc<ExampleBank>>,
+) -> Result<TrainEval> {
+    let (score, metric_scores, cases, total, passed, passed_case_ids) =
+        evaluate_candidate_inner(ir, objective, resolved, dataset, options, display_id, parent_score, example_bank).await?;
+    Ok(TrainEval { score, metric_scores, cases, total, passed, passed_case_ids })
+}
+
+/// Evaluate on a validation dataset: returns blind aggregate only. No cases, no IDs.
+async fn evaluate_val_blind(
+    ir: &ScaffoldIR,
+    objective: &ObjectiveIR,
+    resolved: &ResolvedCandidate,
+    dataset: &[DatasetCase],
+    options: &OptimizationOptions,
+    display_id: usize,
+    parent_score: Option<f64>,
+    example_bank: Option<Arc<ExampleBank>>,
+) -> Result<BlindEval> {
+    let (score, metric_scores, _cases, total, passed, _passed_case_ids) =
+        evaluate_candidate_inner(ir, objective, resolved, dataset, options, display_id, parent_score, example_bank).await?;
+    Ok(BlindEval { score, metric_scores, total, passed })
+}
+
+/// Core evaluation function. Returns raw results for wrappers to shape.
+async fn evaluate_candidate_inner(
+    _ir: &ScaffoldIR,
+    objective: &ObjectiveIR,
+    resolved: &ResolvedCandidate,
+    dataset: &[DatasetCase],
+    options: &OptimizationOptions,
+    display_id: usize,
+    parent_score: Option<f64>,
+    example_bank: Option<Arc<ExampleBank>>,
 ) -> Result<(
     f64,
     HashMap<String, f64>,
@@ -968,15 +1582,12 @@ async fn evaluate_candidate(
 )> {
     use futures::stream::{self, StreamExt};
 
-    // Build a modified IR with the candidate's graph
-    let mut modified_ir = ir.clone();
-    for g in &mut modified_ir.graphs {
-        if g.name == objective.graph {
-            *g = candidate.graph.clone();
-        }
+    let mut executor = GraphExecutor::new(resolved.ir.clone())
+        .with_overrides(resolved.overrides.clone())
+        .with_online(options.online);
+    if let Some(bank) = example_bank {
+        executor = executor.with_example_bank(bank);
     }
-
-    let executor = GraphExecutor::new(modified_ir).with_overrides(candidate.overrides.clone());
 
     let case_count = dataset.len();
     if case_count == 0 {
@@ -1013,10 +1624,10 @@ async fn evaluate_candidate(
     // Run cases concurrently with controlled parallelism.
     // buffer_unordered polls up to `concurrency` futures at once on the
     // same task (no Send required), yielding results as they complete.
-    let graph_name = &objective.graph;
+    let graph_name = &resolved.graph_name;
     let executor_ref = &executor;
     // Identify prompt/agent node names so we can extract model responses from step traces.
-    let prompt_node_names: Vec<&str> = ir
+    let prompt_node_names: Vec<&str> = resolved.ir
         .nodes
         .iter()
         .filter(|n| matches!(n.kind, NodeKindIR::Prompt | NodeKindIR::Agent))
@@ -1024,10 +1635,10 @@ async fn evaluate_candidate(
         .collect();
     // Map step → node for the graph, so we know which steps are prompt calls.
     let step_node_map: HashMap<String, String> = {
-        let graph_ir = ir
+        let graph_ir = resolved.ir
             .graphs
             .iter()
-            .find(|g| g.name == objective.graph)
+            .find(|g| g.name == resolved.graph_name)
             .unwrap();
         let step_names = crate::mutations::collect_step_names(&graph_ir.body);
         step_names
@@ -1077,7 +1688,7 @@ async fn evaluate_candidate(
         let case = &dataset[idx];
         completed += 1;
 
-        let (passed, checker_bits, output_excerpt, raw_output, model_response, step_trace) =
+        let (passed, checker_bits, output_excerpt, raw_output, model_response, step_trace, expected_excerpt) =
             match result {
                 Ok((output, step_trace)) => {
                     let mut primary_pass = true;
@@ -1101,8 +1712,18 @@ async fn evaluate_candidate(
                     } else {
                         all_pass
                     };
+                    // Always compute expected_excerpt (needed for step-transition attribution on passed cases too)
+                    let expected_str = {
+                        let e = case.expected.to_string();
+                        if e.len() > 120 {
+                            let s: String = e.chars().take(120).collect();
+                            format!("{}...", s)
+                        } else {
+                            e
+                        }
+                    };
                     // For failed cases, extract test output and model response from step trace
-                    let (excerpt, raw, model_resp) = if !p {
+                    let (excerpt, raw, model_resp, exp_excerpt) = if !p {
                         let out_str = output.to_string();
                         let truncated: String = if out_str.len() > 300 {
                             let s: String = out_str.chars().take(300).collect();
@@ -1114,8 +1735,9 @@ async fn evaluate_candidate(
                             options,
                             OptEvent::Log {
                                 message: format!(
-                                    "Case {} FAILED — output: {}",
+                                    "Case {} FAILED — expected: {} | got: {}",
                                     case.id.as_deref().unwrap_or("?"),
+                                    expected_str,
                                     truncated,
                                 ),
                             },
@@ -1132,7 +1754,11 @@ async fn evaluate_candidate(
                             };
                         let max_len = 1500;
                         let excerpt = if useful.len() > max_len {
-                            Some(format!("{}...", &useful[..max_len]))
+                            let mut end = max_len;
+                            while end > 0 && !useful.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            Some(format!("{}...", &useful[..end]))
                         } else {
                             Some(useful.clone())
                         };
@@ -1155,12 +1781,12 @@ async fn evaluate_candidate(
                                     format!("[{}] {}", step_name, value)
                                 }
                             });
-                        (excerpt, Some(useful), model_resp)
+                        (excerpt, Some(useful), model_resp, Some(expected_str))
                     } else {
-                        (None, None, None)
+                        (None, None, None, Some(expected_str))
                     };
                     let trace = step_trace; // always keep full trace
-                    (p, bits, excerpt, raw, model_resp, trace)
+                    (p, bits, excerpt, raw, model_resp, trace, exp_excerpt)
                 }
                 Err(e) => {
                     // Log graph execution errors so template / rendering failures
@@ -1188,6 +1814,7 @@ async fn evaluate_candidate(
                         Some(err_str),
                         None,
                         Vec::new(),
+                        None,
                     )
                 }
             };
@@ -1208,6 +1835,7 @@ async fn evaluate_candidate(
             raw_output,
             model_response,
             step_trace,
+            expected_excerpt,
         });
 
         emit(
@@ -1220,9 +1848,50 @@ async fn evaluate_candidate(
                 case_id: case.id.clone(),
             },
         );
+
+        // Early stopping: if enough cases have been evaluated and none passed,
+        // the candidate is catastrophically broken — abort to save time/cost.
+        let early_stop_min = 15.min(case_count / 3).max(10).min(case_count);
+        if completed >= early_stop_min && cases_passed == 0 {
+            emit(
+                options,
+                OptEvent::Log {
+                    message: format!(
+                        "Early stop: 0/{} passed — aborting evaluation",
+                        completed,
+                    ),
+                },
+            );
+            break;
+        }
+
+        // Relative early stopping: if the candidate's pass rate is far below
+        // the parent's score, it's unlikely to recover — abort to save cost.
+        // Threshold 0.4 is conservative: parent at 68% → candidate needs >27%.
+        if let Some(ps) = parent_score {
+            if ps > 0.0 && completed >= early_stop_min {
+                let current_pass_rate = cases_passed as f64 / completed as f64;
+                if current_pass_rate < ps * 0.4 {
+                    emit(
+                        options,
+                        OptEvent::Log {
+                            message: format!(
+                                "Early stop: {}/{} ({:.1}%) vs parent {:.1}% — aborting",
+                                cases_passed,
+                                completed,
+                                current_pass_rate * 100.0,
+                                ps * 100.0,
+                            ),
+                        },
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     // Compute metric averages (each metric references a checker)
+    // Note: when early-stopped, unevaluated cases count as failures (denominator = case_count).
     let mut metric_avgs: HashMap<String, f64> = HashMap::new();
     for metric in &objective.metrics {
         let checker_total = checker_totals.get(&metric.checker).copied().unwrap_or(0.0);
@@ -1281,12 +1950,18 @@ async fn run_grid_search(
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
     graph: &GraphIR,
-    dataset: &[DatasetCase],
+    split: &DatasetSplit,
     options: &OptimizationOptions,
 ) -> Result<OptimizationReport> {
     let mut archive = Archive::new();
-    run_grid_search_into(ir, objective, graph, dataset, options, &mut archive).await?;
-    build_report(ir, objective, &archive, options)
+    // Grid search evaluates on train; val+test evaluated at the end in build_report.
+    let train_dataset: &[DatasetCase] = if split.train.is_empty() {
+        &split.val // fallback when no split
+    } else {
+        &split.train
+    };
+    run_grid_search_into(ir, objective, graph, train_dataset, options, &mut archive).await?;
+    build_report(ir, objective, &archive, split, options).await
 }
 
 async fn run_grid_search_into(
@@ -1305,27 +1980,24 @@ async fn run_grid_search_into(
             break;
         }
 
-        let candidate = Candidate {
+        let delta = CandidateDelta {
             id: 0,
             parent_id: None,
             graph: graph.clone(),
             overrides: overrides.clone(),
             mutations: vec![],
-            score: None,
-            metric_scores: HashMap::new(),
             descriptor: GraphDescriptor::from_graph(graph, ir),
             children_count: 0,
             meta_reasoning: None,
-            case_results: vec![],
-            total_cases: 0,
-            cases_passed: 0,
-            passed_case_ids: vec![],
         };
 
-        let cand_id = archive.candidates.len();
-        let (score, metrics, cases, total, passed, passed_ids) =
-            evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id).await?;
-        let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
+        let resolved = resolve(&delta, ir, objective);
+        archive.record_hash(resolved.semantic_hash);
+        let cand_id = archive.entries.len();
+        let train_eval =
+            evaluate_train(ir, objective, &resolved, dataset, options, cand_id, None, None).await?;
+        let score = train_eval.score;
+        let best_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
 
         emit(
             options,
@@ -1333,7 +2005,7 @@ async fn run_grid_search_into(
                 candidate_id: cand_id,
                 parent_id: None,
                 score,
-                metric_scores: metrics.clone(),
+                metric_scores: train_eval.metric_scores.clone(),
                 best_so_far: best_before.max(score),
                 mutations: vec![],
                 generation: i + 1,
@@ -1349,14 +2021,9 @@ async fn run_grid_search_into(
             );
         }
 
-        archive.add(Candidate {
-            score: Some(score),
-            metric_scores: metrics,
-            case_results: cases,
-            total_cases: total,
-            cases_passed: passed,
-            passed_case_ids: passed_ids,
-            ..candidate
+        archive.add(delta, EvalResults {
+            val: None,
+            train: Some(train_eval),
         });
     }
 
@@ -1410,58 +2077,117 @@ async fn run_evolutionary(
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
     graph: &GraphIR,
-    dataset: &[DatasetCase],
+    split: &DatasetSplit,
     options: &OptimizationOptions,
 ) -> Result<OptimizationReport> {
     let mut archive = Archive::new();
-    run_evolutionary_into(ir, objective, graph, dataset, options, &mut archive).await?;
-    build_report(ir, objective, &archive, options)
+    run_evolutionary_into(ir, objective, graph, split, options, &mut archive).await?;
+    build_report(ir, objective, &archive, split, options).await
 }
 
 async fn run_evolutionary_into(
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
     graph: &GraphIR,
-    dataset: &[DatasetCase],
+    split: &DatasetSplit,
     options: &OptimizationOptions,
     archive: &mut Archive,
 ) -> Result<()> {
     let mut rng = SimpleRng::new(42);
+    // Train dataset: used for all per-candidate evaluation. Val+test evaluated at the end.
+    let train_dataset: &[DatasetCase] = if split.train.is_empty() {
+        // No split → all cases treated as train
+        if split.val.is_empty() { &[] } else { &split.val }
+    } else {
+        &split.train
+    };
 
     let topology = objective.topology.as_ref();
     let target_score = topology.and_then(|t| t.target_score);
 
     // ── Phase 1: Seed candidates (uncapped) ──
     // The original graph is always the first seed.
-    let seed = Candidate {
+    let seed_delta = CandidateDelta {
         id: 0,
         parent_id: None,
         graph: graph.clone(),
         overrides: HashMap::new(),
         mutations: vec![],
-        score: None,
-        metric_scores: HashMap::new(),
         descriptor: GraphDescriptor::from_graph(graph, ir),
         children_count: 0,
         meta_reasoning: None,
-        case_results: vec![],
-        total_cases: 0,
-        cases_passed: 0,
-        passed_case_ids: vec![],
     };
 
-    let next_id = archive.candidates.len();
-    let (seed_score, seed_metrics, seed_cases, seed_total, seed_passed, seed_passed_ids) =
-        evaluate_candidate(ir, objective, &seed, dataset, options, next_id).await?;
-    let seed_id = archive.add(Candidate {
-        score: Some(seed_score),
-        metric_scores: seed_metrics,
-        case_results: seed_cases,
-        total_cases: seed_total,
-        cases_passed: seed_passed,
-        passed_case_ids: seed_passed_ids,
-        ..seed
+    let seed_resolved = resolve(&seed_delta, ir, objective);
+    archive.record_hash(seed_resolved.semantic_hash);
+    let next_id = archive.entries.len();
+
+    // Train eval only — bank not built yet, pass None
+    let seed_batch = select_train_batch(train_dataset, options.batch_size, &mut rng);
+    let seed_train = Some(
+        evaluate_train(ir, objective, &seed_resolved, &seed_batch, options, next_id, None, None).await?
+    );
+
+    let seed_score = seed_train.as_ref().map(|t| t.score).unwrap_or(0.0);
+
+    let seed_id = archive.add(seed_delta, EvalResults {
+        val: None,
+        train: seed_train,
     });
+
+    // Build example bank from seed train results for few-shot injection.
+    let example_bank: Option<Arc<ExampleBank>> = archive.entries.last()
+        .and_then(|e| e.eval.train.as_ref())
+        .map(|train| {
+            let emit_node = find_primary_emit_node(graph, ir);
+            let cases_for_bank: Vec<EvalCaseForBank> = train.cases.iter()
+                .filter_map(|cr| {
+                    let case_id = cr.case_id.as_ref()?;
+                    // Find the matching dataset case to get input/expected
+                    let ds_case = split.train.iter()
+                        .chain(split.val.iter())
+                        .find(|dc| dc.id.as_deref() == Some(case_id.as_str()));
+                    let ds_case = ds_case?;
+                    Some(EvalCaseForBank {
+                        case_id: case_id.clone(),
+                        input_excerpt: {
+                            let s = ds_case.input.to_string();
+                            if s.len() > 200 {
+                                let mut end = 200;
+                                while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+                                s[..end].to_string()
+                            } else { s }
+                        },
+                        expected_output: {
+                            let s = ds_case.expected.to_string();
+                            if s.len() > 200 {
+                                let mut end = 200;
+                                while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+                                s[..end].to_string()
+                            } else { s }
+                        },
+                        passed: cr.passed,
+                        domain: ds_case.domain.clone(),
+                    })
+                })
+                .collect();
+            if cases_for_bank.is_empty() {
+                return Arc::new(ExampleBank::new());
+            }
+            emit(
+                options,
+                OptEvent::Log {
+                    message: format!(
+                        "ExampleBank: built {} examples for node '{}' ({} passed, {} failed)",
+                        cases_for_bank.len(),
+                        emit_node,
+                        cases_for_bank.iter().filter(|c| c.passed).count(),
+                        cases_for_bank.iter().filter(|c| !c.passed).count(),
+                    ),
+                },
+            );
+            Arc::new(ExampleBank::build_from_eval(&cases_for_bank, &emit_node))
+        });
 
     emit(
         options,
@@ -1476,9 +2202,9 @@ async fn run_evolutionary_into(
             parent_id: None,
             score: seed_score,
             metric_scores: archive
-                .candidates
+                .entries
                 .last()
-                .map(|c| c.metric_scores.clone())
+                .map(|e| e.eval.metric_scores().clone())
                 .unwrap_or_default(),
             best_so_far: seed_score,
             mutations: vec![],
@@ -1518,35 +2244,33 @@ async fn run_evolutionary_into(
         generate_tunable_combinations(&objective.tunables)
     };
     for overrides in &tunable_combos {
-        let candidate = Candidate {
+        let tun_delta = CandidateDelta {
             id: 0,
             parent_id: Some(seed_id),
             graph: graph.clone(),
             overrides: overrides.clone(),
             mutations: vec![],
-            score: None,
-            metric_scores: HashMap::new(),
             descriptor: GraphDescriptor::from_graph(graph, ir),
             children_count: 0,
             meta_reasoning: None,
-            case_results: vec![],
-            total_cases: 0,
-            cases_passed: 0,
-            passed_case_ids: vec![],
         };
-        let tunable_id = archive.candidates.len();
-        let (score, metrics, cases, total, passed, passed_ids) =
-            evaluate_candidate(ir, objective, &candidate, dataset, options, tunable_id).await?;
-        let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
+        let tun_resolved = resolve(&tun_delta, ir, objective);
+        archive.record_hash(tun_resolved.semantic_hash);
+        let tunable_id = archive.entries.len();
 
-        archive.add(Candidate {
-            score: Some(score),
-            metric_scores: metrics.clone(),
-            case_results: cases,
-            total_cases: total,
-            cases_passed: passed,
-            passed_case_ids: passed_ids,
-            ..candidate
+        // Train eval only (val+test at the end)
+        let tun_batch = select_train_batch(train_dataset, options.batch_size, &mut rng);
+        let tun_train = Some(
+            evaluate_train(ir, objective, &tun_resolved, &tun_batch, options, tunable_id, None, example_bank.clone()).await?
+        );
+
+        let score = tun_train.as_ref().map(|t| t.score).unwrap_or(0.0);
+        let metrics = tun_train.as_ref().map(|t| t.metric_scores.clone()).unwrap_or_default();
+        let best_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
+
+        archive.add(tun_delta, EvalResults {
+            val: None,
+            train: tun_train,
         });
 
         emit(
@@ -1641,33 +2365,103 @@ async fn run_evolutionary_into(
     // by only showing candidates from the current epoch.
     let mut epoch_start_id: Option<usize> = None;
     let mut epoch_generation_count: usize = 0;
+    let mut consecutive_non_improving: usize = 0;
 
     while successful_generations < max_generations && total_attempts < max_attempts {
         total_attempts += 1;
 
+        // Recombination: try with 20% probability or after 3 consecutive non-improving mutations
+        let try_recombine = archive.entries.len() >= 2
+            && (consecutive_non_improving >= 3 || rng.next_usize() % 5 == 0);
+        if try_recombine {
+            let parent_a = select_parent(archive, &mut rng, true, epoch_start_id);
+            let parent_b = select_parent(archive, &mut rng, true, epoch_start_id);
+            if let (Some(a), Some(b)) = (parent_a, parent_b) {
+                if a.delta.id != b.delta.id {
+                    if let Some(recombined) = recombine(a, b, ir) {
+                        let recombined_resolved = resolve(&recombined, ir, objective);
+                        if !archive.has_semantic_hash(recombined_resolved.semantic_hash) {
+                            archive.record_hash(recombined_resolved.semantic_hash);
+                            let cand_id = archive.entries.len();
+                            let evo_batch = select_train_batch(train_dataset, options.batch_size, &mut rng);
+                            let evo_train = Some(
+                                evaluate_train(ir, objective, &recombined_resolved, &evo_batch, options, cand_id, None, example_bank.clone()).await?
+                            );
+                            let score = evo_train.as_ref().map(|t| t.score).unwrap_or(0.0);
+                            let metrics = evo_train.as_ref().map(|t| t.metric_scores.clone()).unwrap_or_default();
+                            let best_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
+
+                            successful_generations += 1;
+                            epoch_generation_count += 1;
+                            if score > best_before {
+                                consecutive_non_improving = 0;
+                            }
+
+                            emit(
+                                options,
+                                OptEvent::CandidateEvaluated {
+                                    candidate_id: cand_id,
+                                    parent_id: recombined.parent_id,
+                                    score,
+                                    metric_scores: metrics,
+                                    best_so_far: best_before.max(score),
+                                    mutations: vec!["recombine".to_string()],
+                                    generation: successful_generations,
+                                    max_generations,
+                                },
+                            );
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Recombination candidate {}: score={:.4}",
+                                        cand_id, score,
+                                    ),
+                                },
+                            );
+
+                            archive.add(recombined, EvalResults {
+                                val: None,
+                                train: evo_train,
+                            });
+
+                            // Check early stop
+                            if let Some(ts) = target_score {
+                                if score >= ts {
+                                    emit(options, OptEvent::EarlyStopped { score, target: ts });
+                                    return Ok(());
+                                }
+                            }
+                            continue; // Recombination done, skip normal mutation path
+                        }
+                    }
+                }
+            }
+        }
+
         // Select parent — sigmoid weighting favors high-scoring candidates.
-        // Novelty bonus (down-weight overused parents) only for random mode;
-        // meta-agent provides its own diversity through LLM reasoning.
-        let use_novelty = options.meta_model.is_none();
-        let parent = select_parent(archive, &mut rng, use_novelty, epoch_start_id);
-        if parent.is_none() {
+        // Novelty bonus (down-weight overused parents) is always enabled to
+        // prevent the search from getting stuck exploiting one parent.
+        let parent_entry = select_parent(archive, &mut rng, true, epoch_start_id);
+        if parent_entry.is_none() {
             break;
         }
-        let parent = parent.unwrap();
-        let parent_id = parent.id;
-        let parent_graph = parent.graph.clone();
-        let parent_overrides = parent.overrides.clone();
+        let parent_entry = parent_entry.unwrap();
+        let parent_id = parent_entry.delta.id;
+        let parent_graph = parent_entry.delta.graph.clone();
+        let parent_overrides = parent_entry.delta.overrides.clone();
 
         // Generate mutation: LLM-guided or random
         let (mutation, meta_reasoning) = if let Some(ref meta_model) = options.meta_model {
             emit(options, OptEvent::MetaAgentThinking);
             // Clone parent for the meta-agent (borrow released)
-            let parent_clone = parent.clone();
+            let parent_delta_clone = parent_entry.delta.clone();
+            let parent_eval_clone = parent_entry.eval.clone();
 
             let meta =
                 crate::meta_agent::MetaAgent::new(meta_model).with_log(options.meta_log.clone());
             match meta
-                .propose_mutation(&parent_clone, archive, ir, objective, &allowed_mutations, epoch_start_id, options.meta_full_traces)
+                .propose_mutation(&parent_delta_clone, &parent_eval_clone, archive, ir, objective, &allowed_mutations, epoch_start_id, options.meta_full_traces, options.online)
                 .await
             {
                 Ok(proposal) => {
@@ -1734,6 +2528,20 @@ async fn run_evolutionary_into(
                                 },
                             );
                         }
+                        Mutation::RewriteToolSpec { node, spec } => {
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Rewrite tool spec for '{}': argv={:?}, net={}, timeout={}s",
+                                        node,
+                                        spec.argv,
+                                        spec.net,
+                                        spec.timeout,
+                                    ),
+                                },
+                            );
+                        }
                         Mutation::AddPromptStep {
                             after_step,
                             new_step_name,
@@ -1753,21 +2561,44 @@ async fn run_evolutionary_into(
                                 },
                             );
                         }
-                        Mutation::EditGraph {
-                            new_graph,
-                            new_nodes,
-                            description,
+                        Mutation::ProposeDecomposition {
+                            target_step,
+                            motif,
+                            reason,
+                            ..
                         } => {
-                            let graph_src =
-                                scaffold_ir::pretty::pretty_print_graph(new_graph);
                             emit(
                                 options,
                                 OptEvent::Log {
                                     message: format!(
-                                        "Edit graph '{}' ({} new nodes):\n{}",
-                                        description,
-                                        new_nodes.len(),
-                                        graph_src
+                                        "Decompose step '{}' with motif '{}': {}",
+                                        target_step, motif, reason
+                                    ),
+                                },
+                            );
+                        }
+                        Mutation::AttachExamplePolicy { node, policy } => {
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Attach example policy to '{}': k={}",
+                                        node, policy.k
+                                    ),
+                                },
+                            );
+                        }
+                        Mutation::AddLocalChecker {
+                            node,
+                            checker_name,
+                            expr,
+                        } => {
+                            emit(
+                                options,
+                                OptEvent::Log {
+                                    message: format!(
+                                        "Add local checker '{}.{}': {}",
+                                        node, checker_name, expr
                                     ),
                                 },
                             );
@@ -1829,6 +2660,12 @@ async fn run_evolutionary_into(
                     Mutation::RewriteShell { node, new_shell } => {
                         overrides.insert(format!("{}.shell", node), serde_json::json!(new_shell));
                     }
+                    Mutation::RewriteToolSpec { node, spec } => {
+                        overrides.insert(
+                            format!("{}._tool_spec", node),
+                            serde_json::to_value(spec).unwrap_or(serde_json::Value::Null),
+                        );
+                    }
                     Mutation::SetConfig { node, field, value } => {
                         overrides.insert(format!("{}.{}", node, field), value.clone());
                     }
@@ -1858,135 +2695,112 @@ async fn run_evolutionary_into(
                                 .insert(format!("{}.model", new_step_name), serde_json::json!(m));
                         }
                     }
-                    Mutation::EditGraph { new_nodes, .. } => {
-                        for node in new_nodes {
-                            if ir.nodes.iter().any(|n| n.name == node.name) {
-                                // Modified existing node: store field-level overrides
-                                if let Some(ref sof) = node.config.template {
-                                    let val = match sof {
-                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
-                                            value.clone()
-                                        }
-                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
-                                            path.clone()
-                                        }
-                                    };
-                                    overrides.insert(
-                                        format!("{}.template", node.name),
-                                        serde_json::json!(val),
-                                    );
-                                }
-                                if let Some(ref sof) = node.config.system {
-                                    let val = match sof {
-                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
-                                            value.clone()
-                                        }
-                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
-                                            path.clone()
-                                        }
-                                    };
-                                    overrides.insert(
-                                        format!("{}.system", node.name),
-                                        serde_json::json!(val),
-                                    );
-                                }
-                                if let Some(ref shell) = node.config.shell {
-                                    overrides.insert(
-                                        format!("{}.shell", node.name),
-                                        serde_json::json!(shell),
-                                    );
-                                }
-                                if let Some(ref model) = node.config.model {
-                                    overrides.insert(
-                                        format!("{}.model", node.name),
-                                        serde_json::json!(model),
-                                    );
-                                }
-                                if let Some(temp) = node.config.temperature {
-                                    overrides.insert(
-                                        format!("{}.temperature", node.name),
-                                        serde_json::json!(temp),
-                                    );
-                                }
-                            } else {
-                                // New node: synthetic node pattern (same as AddPromptStep)
-                                let kind_str = match node.kind {
+                    Mutation::ProposeDecomposition {
+                        motif, target_step, config, ..
+                    } => {
+                        // Re-apply motif against the ORIGINAL parent graph to get synthetic nodes.
+                        // apply_mutation already changed the graph topology; here we extract overrides.
+                        if let Ok(application) = crate::motifs::apply_motif(motif, &parent_graph, target_step, config, ir) {
+                            for syn in &application.synthetic_nodes {
+                                let kind_str = match syn.kind {
                                     scaffold_ir::ir::NodeKindIR::Tool => "tool",
                                     scaffold_ir::ir::NodeKindIR::Agent => "agent",
                                     scaffold_ir::ir::NodeKindIR::Verify => "verify",
                                     _ => "prompt",
                                 };
                                 overrides.insert(
-                                    format!("_node.{}", node.name),
+                                    format!("_node.{}", syn.name),
                                     serde_json::json!({"kind": kind_str}),
                                 );
-                                if let Some(ref sof) = node.config.template {
-                                    let val = match sof {
-                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
-                                            value.clone()
-                                        }
-                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
-                                            path.clone()
-                                        }
-                                    };
+                                overrides.insert(
+                                    format!("{}.template", syn.name),
+                                    serde_json::json!(syn.template),
+                                );
+                                if let Some(ref sys) = syn.system {
                                     overrides.insert(
-                                        format!("{}.template", node.name),
-                                        serde_json::json!(val),
+                                        format!("{}.system", syn.name),
+                                        serde_json::json!(sys),
                                     );
                                 }
-                                if let Some(ref sof) = node.config.system {
-                                    let val = match sof {
-                                        scaffold_ir::ir::StringOrFileIR::Literal { value } => {
-                                            value.clone()
-                                        }
-                                        scaffold_ir::ir::StringOrFileIR::File { path } => {
-                                            path.clone()
-                                        }
-                                    };
+                                if let Some(ref shell) = syn.shell {
                                     overrides.insert(
-                                        format!("{}.system", node.name),
-                                        serde_json::json!(val),
-                                    );
-                                }
-                                if let Some(ref shell) = node.config.shell {
-                                    overrides.insert(
-                                        format!("{}.shell", node.name),
+                                        format!("{}.shell", syn.name),
                                         serde_json::json!(shell),
                                     );
                                 }
-                                if let Some(ref model) = node.config.model {
+                                if let Some(ref tool_spec) = syn.tool_spec_json {
                                     overrides.insert(
-                                        format!("{}.model", node.name),
-                                        serde_json::json!(model),
+                                        format!("{}._tool_spec", syn.name),
+                                        tool_spec.clone(),
                                     );
                                 }
                             }
+                            for checker in &application.local_checkers {
+                                overrides.insert(
+                                    format!("_checker.{}.{}", checker.node, checker.name),
+                                    serde_json::json!(checker.expr),
+                                );
+                            }
                         }
+                    }
+                    Mutation::AttachExamplePolicy { node, policy } => {
+                        overrides.insert(
+                            format!("{}._example_policy", node),
+                            serde_json::to_value(policy).unwrap_or(serde_json::Value::Null),
+                        );
+                    }
+                    Mutation::AddLocalChecker {
+                        node,
+                        checker_name,
+                        expr,
+                    } => {
+                        overrides.insert(
+                            format!("_checker.{}.{}", node, checker_name),
+                            serde_json::json!(expr),
+                        );
                     }
                     _ => {}
                 }
 
-                let candidate = Candidate {
+                let evo_delta = CandidateDelta {
                     id: 0,
                     parent_id: Some(parent_id),
                     graph: new_graph.clone(),
                     overrides,
                     mutations: vec![mutation],
-                    score: None,
-                    metric_scores: HashMap::new(),
                     descriptor: GraphDescriptor::from_graph(&new_graph, ir),
                     children_count: 0,
                     meta_reasoning,
-                    case_results: vec![],
-                    total_cases: 0,
-                    cases_passed: 0,
-                    passed_case_ids: vec![],
                 };
 
-                let cand_id = archive.candidates.len();
-                let (score, metrics, cases, total, passed, passed_ids) =
-                    evaluate_candidate(ir, objective, &candidate, dataset, options, cand_id)
-                        .await?;
+                let evo_resolved = resolve(&evo_delta, ir, objective);
+
+                // Semantic dedup: skip candidates with identical resolved IR
+                if archive.has_semantic_hash(evo_resolved.semantic_hash) {
+                    emit(
+                        options,
+                        OptEvent::Log {
+                            message: format!(
+                                "Skipped duplicate candidate (hash={:#x})",
+                                evo_resolved.semantic_hash,
+                            ),
+                        },
+                    );
+                    // Does not count against budget — try again
+                    continue;
+                }
+                archive.record_hash(evo_resolved.semantic_hash);
+
+                let cand_id = archive.entries.len();
+
+                // Train eval only — val+test evaluated at the end in build_report
+                let evo_batch = select_train_batch(train_dataset, options.batch_size, &mut rng);
+                let evo_train = Some(
+                    evaluate_train(ir, objective, &evo_resolved, &evo_batch, options, cand_id, None, example_bank.clone()).await?
+                );
+
+                let score = evo_train.as_ref().map(|t| t.score).unwrap_or(0.0);
+                let metrics = evo_train.as_ref().map(|t| t.metric_scores.clone()).unwrap_or_default();
 
                 successful_generations += 1;
                 epoch_generation_count += 1;
@@ -1999,8 +2813,13 @@ async fn run_evolutionary_into(
                         },
                     );
                 }
-                let best_before = archive.best().and_then(|c| c.score).unwrap_or(0.0);
-                let mutation_labels: Vec<String> = candidate
+                let best_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
+                if score > best_before {
+                    consecutive_non_improving = 0;
+                } else {
+                    consecutive_non_improving += 1;
+                }
+                let mutation_labels: Vec<String> = evo_delta
                     .mutations
                     .iter()
                     .map(|m| m.short_label())
@@ -2026,25 +2845,49 @@ async fn run_evolutionary_into(
                     );
                 }
 
-                archive.add(Candidate {
-                    score: Some(score),
-                    metric_scores: metrics,
-                    case_results: cases,
-                    total_cases: total,
-                    cases_passed: passed,
-                    passed_case_ids: passed_ids,
-                    ..candidate
+                archive.add(evo_delta, EvalResults {
+                    val: None,
+                    train: evo_train,
                 });
 
                 // Track parent usage for novelty weighting
                 archive.increment_children(parent_id);
+
+                // Val checkpoint: evaluate new best on val to track generalization gap
+                if score > best_before && !split.val.is_empty() {
+                    let last_entry = archive.entries.last().unwrap();
+                    let ckpt_delta = last_entry.delta.clone();
+                    let ckpt_id = ckpt_delta.id;
+                    let ckpt_resolved = resolve(&ckpt_delta, ir, objective);
+                    match evaluate_val_blind(ir, objective, &ckpt_resolved, &split.val, options, ckpt_id, None, example_bank.clone()).await {
+                        Ok(val_eval) => {
+                            let gap = score - val_eval.score;
+                            archive.val_checkpoints.push(ValCheckpoint {
+                                candidate_id: ckpt_id,
+                                train_score: score,
+                                val_score: val_eval.score,
+                            });
+                            emit(options, OptEvent::Log {
+                                message: format!(
+                                    "Val checkpoint: train={:.4}, val={:.4}, gap={:.4}",
+                                    score, val_eval.score, gap,
+                                ),
+                            });
+                        }
+                        Err(e) => {
+                            emit(options, OptEvent::Log {
+                                message: format!("Val checkpoint failed: {}", e),
+                            });
+                        }
+                    }
+                }
 
                 // Check if we should start a new epoch (context compaction).
                 // Done after archive.add() so the just-evaluated candidate is
                 // visible to archive.best().
                 if let Some(restart_interval) = options.meta_context_restart {
                     if epoch_generation_count >= restart_interval {
-                        let best_id = archive.best().map(|c| c.id).unwrap_or(0);
+                        let best_id = archive.best().map(|e| e.delta.id).unwrap_or(0);
                         epoch_start_id = Some(best_id);
                         epoch_generation_count = 0;
                         emit(
@@ -2112,12 +2955,12 @@ fn select_parent<'a>(
     rng: &mut SimpleRng,
     use_novelty: bool,
     epoch_start_id: Option<usize>,
-) -> Option<&'a Candidate> {
+) -> Option<&'a ArchiveEntry> {
     let epoch_start = epoch_start_id.unwrap_or(0);
-    let evaluated: Vec<&Candidate> = archive
-        .candidates
+    let evaluated: Vec<&ArchiveEntry> = archive
+        .entries
         .iter()
-        .filter(|c| c.score.is_some() && c.id >= epoch_start)
+        .filter(|e| e.eval.score().is_some() && e.delta.id >= epoch_start)
         .collect();
 
     if evaluated.is_empty() {
@@ -2125,19 +2968,21 @@ fn select_parent<'a>(
     }
 
     // Dynamic midpoint: average of top-3 scores
-    let mut scores: Vec<f64> = evaluated.iter().map(|c| c.score.unwrap()).collect();
+    let mut scores: Vec<f64> = evaluated.iter().map(|e| e.eval.score().unwrap()).collect();
     scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let m = 3.min(scores.len());
     let alpha_mid: f64 = scores[..m].iter().sum::<f64>() / m as f64;
 
-    // Sigmoid transform, with optional novelty bonus
-    let lambda = 10.0;
+    // Sigmoid transform with novelty bonus.
+    // lambda=7 gives moderate selection pressure: enough to prefer better
+    // candidates but not so steep that the best dominates in small archives.
+    let lambda = 7.0;
     let weights: Vec<f64> = evaluated
         .iter()
-        .map(|c| {
-            let si = 1.0 / (1.0 + (-lambda * (c.score.unwrap() - alpha_mid)).exp());
+        .map(|e| {
+            let si = 1.0 / (1.0 + (-lambda * (e.eval.score().unwrap() - alpha_mid)).exp());
             if use_novelty {
-                let hi = 1.0 / (1.0 + c.children_count as f64);
+                let hi = 1.0 / (1.0 + e.delta.children_count as f64);
                 si * hi
             } else {
                 si
@@ -2159,6 +3004,100 @@ fn select_parent<'a>(
         }
     }
     Some(evaluated.last().unwrap())
+}
+
+/// Recombine two archive entries to create a new candidate.
+///
+/// Uses the higher-scoring parent's graph topology. Merges overrides: starts with
+/// the secondary parent's overrides, then overlays the primary's (primary wins conflicts).
+/// Removes orphan overrides referencing nodes not present in the primary graph.
+/// Returns None if parents are identical (same topology + overrides).
+fn recombine(
+    parent_a: &ArchiveEntry,
+    parent_b: &ArchiveEntry,
+    ir: &ScaffoldIR,
+) -> Option<CandidateDelta> {
+    let score_a = parent_a.eval.score().unwrap_or(0.0);
+    let score_b = parent_b.eval.score().unwrap_or(0.0);
+
+    let (primary, secondary) = if score_a >= score_b {
+        (&parent_a.delta, &parent_b.delta)
+    } else {
+        (&parent_b.delta, &parent_a.delta)
+    };
+
+    // Skip if identical topology and overrides
+    let same_graph = scaffold_ir::pretty::pretty_print_graph(&primary.graph)
+        == scaffold_ir::pretty::pretty_print_graph(&secondary.graph);
+    if same_graph && primary.overrides == secondary.overrides {
+        return None;
+    }
+
+    // Merge overrides: start with secondary, overlay primary (primary wins conflicts)
+    let mut merged_overrides = secondary.overrides.clone();
+    for (k, v) in &primary.overrides {
+        merged_overrides.insert(k.clone(), v.clone());
+    }
+
+    // Collect valid node names from the primary graph for orphan detection
+    let step_names: std::collections::HashSet<String> =
+        collect_step_names(&primary.graph.body).into_iter().collect();
+    let ir_node_names: std::collections::HashSet<&str> =
+        ir.nodes.iter().map(|n| n.name.as_str()).collect();
+    // Pre-collect synthetic node names to avoid borrowing merged_overrides inside retain
+    let synthetic_node_names: std::collections::HashSet<String> = merged_overrides
+        .keys()
+        .filter_map(|k| k.strip_prefix("_node.").map(|n| n.to_string()))
+        .collect();
+
+    // Remove orphan overrides: those referencing nodes not in primary graph or IR
+    merged_overrides.retain(|key, _| {
+        // Keep _node.* and _checker.* synthetic overrides always
+        if key.starts_with("_node.") || key.starts_with("_checker.") {
+            return true;
+        }
+        // Keep _example_policy overrides
+        if key.contains("._example_policy") {
+            return true;
+        }
+        // For "node.field" keys, check that node exists.
+        // Synthetic node names can contain dots (e.g. _motif.result.repair),
+        // so we must check prefixes, not just split on the first dot.
+        for syn_name in &synthetic_node_names {
+            if key.starts_with(syn_name.as_str())
+                && key.get(syn_name.len()..syn_name.len() + 1) == Some(".")
+            {
+                return true;
+            }
+        }
+        // For simple (non-dotted) node names, split on first dot
+        if let Some(node_name) = key.split('.').next() {
+            if ir_node_names.contains(node_name) || step_names.contains(node_name) {
+                return true;
+            }
+        }
+        false
+    });
+
+    let graph = primary.graph.clone();
+    let descriptor = GraphDescriptor::from_graph(&graph, ir);
+
+    Some(CandidateDelta {
+        id: 0,
+        parent_id: Some(primary.id),
+        graph,
+        overrides: merged_overrides,
+        mutations: Vec::new(), // Recombination is not a single mutation
+        descriptor,
+        children_count: 0,
+        meta_reasoning: Some(format!(
+            "Recombined #{} (score={:.4}) with #{} (score={:.4})",
+            primary.id,
+            if score_a >= score_b { score_a } else { score_b },
+            secondary.id,
+            if score_a >= score_b { score_b } else { score_a },
+        )),
+    })
 }
 
 /// Generate a random mutation for the given graph.
@@ -2349,36 +3288,112 @@ fn collect_steps_for_node_kinds_in_stmts(
 }
 
 /// Build the optimization report.
-fn build_report(
+///
+/// Evaluates the best candidate on held-out val and test splits (each evaluated once).
+/// During optimization, only train eval runs per candidate — this is the sole holdout check.
+async fn build_report(
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
     archive: &Archive,
+    split: &DatasetSplit,
     options: &OptimizationOptions,
 ) -> Result<OptimizationReport> {
     let best = archive.best();
 
+    // Evaluate best candidate on val set if non-empty (held-out validation)
+    let (val_score, val_metric_scores, val_cases_total, val_cases_passed) =
+        if !split.val.is_empty() {
+            if let Some(best_entry) = best {
+                let best_resolved = resolve(&best_entry.delta, ir, objective);
+                let val_eval =
+                    evaluate_val_blind(ir, objective, &best_resolved, &split.val, options, best_entry.delta.id, None, None)
+                        .await?;
+                emit(
+                    options,
+                    OptEvent::Log {
+                        message: format!(
+                            "Val set evaluation: score={:.4}, passed={}/{}",
+                            val_eval.score, val_eval.passed, val_eval.total,
+                        ),
+                    },
+                );
+                if options.event_tx.is_none() {
+                    eprintln!(
+                        "[optimizer] val set: score={:.4}, passed={}/{}",
+                        val_eval.score, val_eval.passed, val_eval.total,
+                    );
+                }
+                (Some(val_eval.score), Some(val_eval.metric_scores), Some(val_eval.total), Some(val_eval.passed))
+            } else {
+                (None, None, None, None)
+            }
+        } else {
+            (None, None, None, None)
+        };
+
+    // Evaluate best candidate on test set if non-empty
+    let (test_score, test_metric_scores, test_cases_total, test_cases_passed, test_receipt) =
+        if !split.test.is_empty() {
+            if let Some(best_entry) = best {
+                let best_resolved = resolve(&best_entry.delta, ir, objective);
+                let receipt = ExecutionReceipt::now(best_resolved.semantic_hash);
+                let test_eval =
+                    evaluate_val_blind(ir, objective, &best_resolved, &split.test, options, best_entry.delta.id, None, None)
+                        .await?;
+                emit(
+                    options,
+                    OptEvent::Log {
+                        message: format!(
+                            "Test set evaluation: score={:.4}, passed={}/{}",
+                            test_eval.score, test_eval.passed, test_eval.total,
+                        ),
+                    },
+                );
+                if options.event_tx.is_none() {
+                    eprintln!(
+                        "[optimizer] test set: score={:.4}, passed={}/{}",
+                        test_eval.score, test_eval.passed, test_eval.total,
+                    );
+                }
+                (Some(test_eval.score), Some(test_eval.metric_scores), Some(test_eval.total), Some(test_eval.passed), Some(receipt))
+            } else {
+                (None, None, None, None, None)
+            }
+        } else {
+            (None, None, None, None, None)
+        };
+
     let report = OptimizationReport {
         objective_name: objective.name.clone(),
-        total_candidates: archive.candidates.len(),
-        best_score: best.map(|c| c.score.unwrap()),
-        best_candidate_id: best.map(|c| c.id),
+        total_candidates: archive.entries.len(),
+        best_score: best.map(|e| e.eval.score().unwrap()),
+        best_candidate_id: best.map(|e| e.delta.id),
         candidate_scores: archive
-            .candidates
+            .entries
             .iter()
-            .map(|c| CandidateScore {
-                id: c.id,
-                parent_id: c.parent_id,
-                score: c.score,
-                mutations: c.mutations.iter().map(|m| m.short_label()).collect(),
-                node_count: c.descriptor.node_count,
-                verify_count: c.descriptor.verify_count,
-                meta_reasoning: c.meta_reasoning.clone(),
+            .map(|e| CandidateScore {
+                id: e.delta.id,
+                parent_id: e.delta.parent_id,
+                score: e.eval.score(),
+                mutations: e.delta.mutations.iter().map(|m| m.short_label()).collect(),
+                node_count: e.delta.descriptor.node_count,
+                verify_count: e.delta.descriptor.verify_count,
+                meta_reasoning: e.delta.meta_reasoning.clone(),
             })
             .collect(),
-        best_overrides: best.map(|c| c.overrides.clone()).filter(|o| !o.is_empty()),
+        best_overrides: best.map(|e| e.delta.overrides.clone()).filter(|o| !o.is_empty()),
         best_metric_scores: best
-            .map(|c| c.metric_scores.clone())
+            .map(|e| e.eval.metric_scores().clone())
             .filter(|m| !m.is_empty()),
+        val_score,
+        val_metric_scores: val_metric_scores.and_then(|m| if m.is_empty() { None } else { Some(m) }),
+        val_cases_total,
+        val_cases_passed,
+        test_score,
+        test_metric_scores: test_metric_scores.filter(|m| !m.is_empty()),
+        test_cases_total,
+        test_cases_passed,
+        test_receipt,
     };
 
     // Write report to directory if configured
@@ -2390,22 +3405,23 @@ fn build_report(
             .map_err(|e| Error::Runtime(format!("failed to write report: {}", e)))?;
 
         // Write best candidate details (full mutations + overrides with rewritten prompts)
-        if let Some(best) = best {
-            let mutations_json: Vec<serde_json::Value> = best
+        if let Some(best_entry) = best {
+            let mutations_json: Vec<serde_json::Value> = best_entry
+                .delta
                 .mutations
                 .iter()
                 .filter_map(|m| serde_json::to_value(m).ok())
                 .collect();
             let best_detail = serde_json::json!({
-                "id": best.id,
-                "parent_id": best.parent_id,
-                "score": best.score,
-                "metric_scores": best.metric_scores,
+                "id": best_entry.delta.id,
+                "parent_id": best_entry.delta.parent_id,
+                "score": best_entry.eval.score(),
+                "metric_scores": best_entry.eval.metric_scores(),
                 "mutations": mutations_json,
-                "overrides": best.overrides,
-                "meta_reasoning": best.meta_reasoning,
-                "cases_passed": best.cases_passed,
-                "total_cases": best.total_cases,
+                "overrides": best_entry.delta.overrides,
+                "meta_reasoning": best_entry.delta.meta_reasoning,
+                "cases_passed": best_entry.eval.cases_passed(),
+                "total_cases": best_entry.eval.total_cases(),
             });
             let best_json = serde_json::to_string_pretty(&best_detail).unwrap_or_default();
             std::fs::write(dir.join("best_candidate.json"), best_json)
@@ -2415,7 +3431,7 @@ fn build_report(
 
     // Write best candidate source if configured
     if let Some(ref path) = options.write_best {
-        if let Some(best) = best {
+        if let Some(best_entry) = best {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
@@ -2428,7 +3444,7 @@ fn build_report(
                 }
             }
 
-            let best_ir = materialize_best_candidate_ir(ir, objective, best);
+            let best_ir = materialize_best_candidate_ir(ir, objective, best_entry);
             let source = pretty_print(&best_ir);
             std::fs::write(path, source)
                 .map_err(|e| Error::Runtime(format!("failed to write best candidate: {}", e)))?;
@@ -2553,52 +3569,52 @@ mod tests {
             max_depth: 0,
         };
 
-        archive.add(Candidate {
-            id: 0,
-            parent_id: None,
-            graph: GraphIR {
-                name: "test".to_string(),
-                input: TypeIR::String,
-                output: TypeIR::String,
-                body: vec![],
+        archive.add(
+            CandidateDelta {
+                id: 0,
+                parent_id: None,
+                graph: GraphIR {
+                    name: "test".to_string(),
+                    input: TypeIR::String,
+                    output: TypeIR::String,
+                    body: vec![],
+                },
+                overrides: HashMap::new(),
+                mutations: vec![],
+                descriptor: desc.clone(),
+                children_count: 0,
+                meta_reasoning: None,
             },
-            overrides: HashMap::new(),
-            mutations: vec![],
-            score: Some(0.5),
-            metric_scores: HashMap::new(),
-            descriptor: desc.clone(),
-            children_count: 0,
-            meta_reasoning: None,
-            case_results: vec![],
-            total_cases: 0,
-            cases_passed: 0,
-            passed_case_ids: vec![],
-        });
+            EvalResults {
+                val: Some(BlindEval { score: 0.5, metric_scores: HashMap::new(), total: 10, passed: 5 }),
+                ..EvalResults::default()
+            },
+        );
 
-        archive.add(Candidate {
-            id: 0,
-            parent_id: None,
-            graph: GraphIR {
-                name: "test".to_string(),
-                input: TypeIR::String,
-                output: TypeIR::String,
-                body: vec![],
+        archive.add(
+            CandidateDelta {
+                id: 0,
+                parent_id: None,
+                graph: GraphIR {
+                    name: "test".to_string(),
+                    input: TypeIR::String,
+                    output: TypeIR::String,
+                    body: vec![],
+                },
+                overrides: HashMap::new(),
+                mutations: vec![],
+                descriptor: desc,
+                children_count: 0,
+                meta_reasoning: None,
             },
-            overrides: HashMap::new(),
-            mutations: vec![],
-            score: Some(0.8),
-            metric_scores: HashMap::new(),
-            descriptor: desc,
-            children_count: 0,
-            meta_reasoning: None,
-            case_results: vec![],
-            total_cases: 0,
-            cases_passed: 0,
-            passed_case_ids: vec![],
-        });
+            EvalResults {
+                val: Some(BlindEval { score: 0.8, metric_scores: HashMap::new(), total: 10, passed: 8 }),
+                ..EvalResults::default()
+            },
+        );
 
         let best = archive.best().unwrap();
-        assert_eq!(best.score, Some(0.8));
+        assert_eq!(best.eval.score(), Some(0.8));
     }
 
     #[test]
@@ -2670,7 +3686,43 @@ mod tests {
     }
 
     #[test]
-    fn test_build_report_writes_best_candidate_scaffold_source() {
+    fn test_bake_overrides_handles_dotted_node_names() {
+        let mut ir = ScaffoldIR::default();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "_node._motif.result.shortlist".into(),
+            serde_json::json!({"kind": "prompt"}),
+        );
+        overrides.insert(
+            "_motif.result.shortlist.template".into(),
+            serde_json::json!("Shortlist {{input}}"),
+        );
+        overrides.insert(
+            "_motif.result.shortlist.system".into(),
+            serde_json::json!("Be precise."),
+        );
+
+        bake_overrides_into_ir(&mut ir, &overrides);
+
+        let node = ir
+            .nodes
+            .iter()
+            .find(|node| node.name == "_motif.result.shortlist")
+            .expect("synthetic dotted-name node should be materialized");
+
+        assert_eq!(node.kind, NodeKindIR::Prompt);
+        assert!(matches!(
+            node.config.template,
+            Some(StringOrFileIR::Literal { ref value }) if value == "Shortlist {{input}}"
+        ));
+        assert!(matches!(
+            node.config.system,
+            Some(StringOrFileIR::Literal { ref value }) if value == "Be precise."
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_build_report_writes_best_candidate_scaffold_source() {
         let unique = format!(
             "scaffold-best-write-{}-{}",
             std::process::id(),
@@ -2777,29 +3829,30 @@ mod tests {
         overrides.insert("repair.system".into(), serde_json::json!("Be surgical."));
 
         let mut archive = Archive::new();
-        archive.add(Candidate {
-            id: 0,
-            parent_id: None,
-            graph: best_graph.clone(),
-            overrides,
-            mutations: vec![],
-            score: Some(0.9),
-            metric_scores: HashMap::new(),
-            descriptor: GraphDescriptor::from_graph(&best_graph, &ir),
-            children_count: 0,
-            meta_reasoning: None,
-            case_results: vec![],
-            total_cases: 0,
-            cases_passed: 0,
-            passed_case_ids: vec![],
-        });
+        archive.add(
+            CandidateDelta {
+                id: 0,
+                parent_id: None,
+                graph: best_graph.clone(),
+                overrides,
+                mutations: vec![],
+                descriptor: GraphDescriptor::from_graph(&best_graph, &ir),
+                children_count: 0,
+                meta_reasoning: None,
+            },
+            EvalResults {
+                val: Some(BlindEval { score: 0.9, metric_scores: HashMap::new(), total: 10, passed: 9 }),
+                ..EvalResults::default()
+            },
+        );
 
         let options = OptimizationOptions {
             write_best: Some(path.clone()),
             ..OptimizationOptions::default()
         };
 
-        build_report(&ir, &objective, &archive, &options).unwrap();
+        let empty_split = DatasetSplit { train: vec![], val: vec![], test: vec![] };
+        build_report(&ir, &objective, &archive, &empty_split, &options).await.unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("node solve_code: prompt"));

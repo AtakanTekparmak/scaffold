@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::llm::{self, LlmConfig};
 use crate::mutations::Mutation;
 
-use crate::optimizer::{Archive, Candidate};
+use crate::optimizer::{Archive, ArchiveEntry, CandidateDelta, EvalResults};
 
 /// A mutation proposal from the meta-agent, with reasoning.
 #[derive(Debug, Clone)]
@@ -54,17 +54,42 @@ impl MetaAgent {
     /// self-correct. Never falls back to random mutations.
     pub async fn propose_mutation(
         &self,
-        parent: &Candidate,
+        parent: &CandidateDelta,
+        parent_eval: &EvalResults,
         archive: &Archive,
         ir: &ScaffoldIR,
         objective: &ObjectiveIR,
         allowed_mutations: &[String],
         epoch_start_id: Option<usize>,
         meta_full_traces: bool,
+        online: bool,
     ) -> Result<MutationProposal> {
         const MAX_RETRIES: usize = 10;
 
-        let base_context = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id, meta_full_traces);
+        let mut base_context = build_context(parent, parent_eval, archive, ir, objective, allowed_mutations, epoch_start_id, meta_full_traces);
+        if online {
+            base_context.push_str(r#"
+## Network Access — ENABLED
+
+Tool nodes CAN access the internet. This is a major advantage — USE IT. The filesystem sandbox restricts access to the working directory, but network calls (curl, wget, python requests/urllib) are fully available.
+
+**You should strongly consider creating tool nodes that leverage the internet**, especially when LLM-only approaches are plateauing. Concrete strategies:
+
+1. **Reference fetching**: fetch Wikipedia summaries, documentation, or domain knowledge to augment LLM context
+   - `node fetch_info: tool { in: { query: string } out: string shell: "curl -sL 'https://en.wikipedia.org/api/rest_v1/page/summary/{{query}}' | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"extract\",\"\"))'" }`
+
+2. **External classification APIs**: call specialized APIs for domain-specific tasks
+   - `node web_search: tool { in: { text: string } out: string shell: "python3 -c 'import urllib.request,urllib.parse,json; q=urllib.parse.quote(sys.argv[1][:200]); ...' '{{text}}'" }`
+
+3. **Library-powered tools**: use python libraries (scikit-learn, nltk, etc.) for feature extraction, text analysis, or rule-based pre-classification
+   - `node detect_domain: tool { in: { text: string } out: string shell: "python3 -c 'import sys; t=sys.argv[1]; print(\"legal\" if any(c > chr(0x4e00) for c in t) else \"medical\" if any(w in t.lower() for w in [\"symptom\",\"pain\",\"fever\"]) else \"chemistry\")' '{{text}}'" }`
+
+4. **Output validation with fuzzy matching**: deterministically match LLM output to the closest valid label
+   - `node match_label: tool { in: { prediction: string, labels: string } out: string shell: "python3 -c 'import sys,difflib; pred=sys.argv[1].strip(); labels=[l.strip(\"- \") for l in sys.argv[2].split(chr(10)) if l.strip(\"- \")]; m=difflib.get_close_matches(pred,labels,n=1,cutoff=0.3); print(m[0] if m else pred)' '{{prediction}}' '{{labels}}'" }`
+
+Combine these with LLM nodes: use a tool to pre-process or fetch context, feed the result to an LLM for reasoning, then use another tool to validate/normalize the output.
+"#);
+        }
         let system_chars = SYSTEM_PROMPT.len();
         let llm_config = LlmConfig::new()
             .with_model(&self.model)
@@ -74,6 +99,8 @@ impl MetaAgent {
         // Log base context on first call (system prompt is constant, log it once)
         self.log_section("SYSTEM PROMPT", SYSTEM_PROMPT);
         self.log_section("BASE CONTEXT", &base_context);
+
+        let saturated_labels = compute_saturated_families(archive, epoch_start_id.unwrap_or(0));
 
         let mut errors: Vec<String> = Vec::new();
         let mut seen_labels: Vec<String> = Vec::new();
@@ -113,6 +140,17 @@ impl MetaAgent {
                         continue;
                     }
                     seen_labels.push(label.clone());
+
+                    // Hard mask: reject saturated mutation families
+                    if saturated_labels.iter().any(|sat| label == *sat) {
+                        let msg = format!(
+                            "SATURATED: '{}' is off-limits (no improvement in recent attempts). Choose a fundamentally different mutation.",
+                            label,
+                        );
+                        self.log_section("REJECTED (saturated)", &msg);
+                        errors.push(msg);
+                        continue;
+                    }
 
                     // Validate mutation can be applied
                     match crate::mutations::apply_mutation(&parent.graph, &proposal.mutation, ir) {
@@ -178,7 +216,7 @@ impl MetaAgent {
     }
 }
 
-/// Structural mutation kinds that edit_graph subsumes.
+/// Structural mutation kinds (used for permission checks).
 const STRUCTURAL_MUTATIONS: &[&str] = &[
     "insert_verify",
     "wrap_retry",
@@ -188,6 +226,7 @@ const STRUCTURAL_MUTATIONS: &[&str] = &[
     "fan_out",
     "replace_with_subgraph",
     "add_prompt_step",
+    "propose_decomposition",
 ];
 
 const SYSTEM_PROMPT: &str = r#"You are a meta-optimizer for computational graphs. Your goal: propose a single mutation that maximizes score improvement on a dataset evaluation while minimizing regression on already-passing cases.
@@ -205,181 +244,61 @@ RULES:
 
 2. Never repeat what doesn't work. If a mutation type+target is marked "saturated" or showed zero/negative improvement across multiple attempts, it is off-limits. Choose a fundamentally different approach.
 
-3. Never repeat the same graph topology. If 2+ candidates in the archive already share the same graph structure (same steps, same control flow shape), you MUST propose a structurally different design. Different means different control flow — loops instead of nested ifs, parallel blocks instead of sequential chains, verify gates, new tool nodes, planning steps.
+3. Prefer structural diversity. Avoid repeating the same graph topology when 2+ candidates already share the same structure. When the "Content Plateau" indicator says PLATEAUED, structural change is strongly recommended. Different means different control flow — loops instead of nested ifs, parallel blocks instead of sequential chains, verify gates, new tool nodes, planning steps.
 
 4. Explore before exploiting. If the last 3+ mutations targeted the same node or used the same strategy, switch to a different lever: a different node, a different mutation kind, or a different structural pattern. Diminishing returns are real.
 
 5. Preserve what works. Compare the parent's pass/fail column with others. Target always-failing or flip-flopping cases. Avoid changes that risk flipping P→F on stable cases.
 
-6. Content mutations (rewrite_prompt, rewrite_system, rewrite_shell, set_config) change a single node's behavior. Use when the graph structure is sound but a node's output is wrong — format, constraints, instructions.
+6. Content mutations (rewrite_prompt, rewrite_system, rewrite_shell, rewrite_tool_spec, set_config) change a single node's behavior. Use when the graph structure is sound but a node's output is wrong — format, constraints, instructions.
 
-7. Structural mutations (edit_graph) change the graph's topology. Think of the graph as a circuit — you can build complex feedback systems, not just linear pipelines. Design patterns to consider:
-   - Loops with carry: iterative refinement where each pass feeds back into the next (e.g., generate → evaluate → refine → re-evaluate, carrying improved state)
-   - Verify gates: LLM-based quality checks that route to different paths based on output quality
-   - Parallel fan-out: run concurrent strategies and pick the best result via a reduce node
-   - Decomposition: split a monolithic node into smaller specialized nodes (analysis → planning → execution → validation), each with a focused prompt that's independently optimizable
-   - Choose blocks: let the optimizer search between alternative subgraph designs
-   - Feedback loops: a verify or eval node's output feeds back as input to a retry path, creating closed-loop error correction
+7. Structural mutations change the graph's topology. Use propose_decomposition for decomposition patterns, or individual structural mutations (insert_step, wrap_retry, insert_verify, etc.) for targeted changes.
 
-8. Prefer multi-node circuits over monolithic nodes. If a single node is doing too much and failing, decompose it. Smaller nodes with focused tasks compose better and give the optimizer more levers to tune. Use edit_graph with new_nodes to introduce specialized nodes.
+8. **Use propose_decomposition for adding structure.** When the "Suggested decompositions" section recommends a motif, use propose_decomposition. Motifs produce validated, tested graph transformations. Available motifs:
+   - **normalize_verify**: append a normalizer node that fixes spelling/case/alias. Use when failures are invalid format or label not in allowed set.
+   - **shortlist_select**: replace one step with shortlist→choose→normalize. Narrows label space before selection. Use when errors are confusion among nearby labels.
+   - **router_expert**: insert a domain router before the step. Use when clear domain clusters exist in the data.
+   - **retrieve_decide**: insert a fact extraction step before decision. Use when the model lacks external knowledge.
+   - **vote_critique_repair**: run the step, critique output, then repair. Creates a closed-loop error correction cycle. Use when output variance is high or the model picks wrong-but-related answers.
+   - **generate_validate_refine**: run the step, validate with a tool (shell command), then refine based on tool feedback. The validate step is a tool node — deterministic, no hallucination. Use when correctness can be checked programmatically (run tests, check format, call a validator API). Requires `config.validate_shell` (shell command for tool validation). Optional: `config.validate_timeout` (seconds, default 30).
+   Motif templates are task-generic by default (use {{input}}). To specialize them for your task, provide `config.templates` with task-specific prompt text. Template keys per motif:
+   - **shortlist_select**: `shortlist`, `choose`, `normalize`
+   - **normalize_verify**: `normalize`
+   - **router_expert**: `router`
+   - **retrieve_decide**: `retrieve`, `decide`
+   - **vote_critique_repair**: `critique` (the repair gate is a deterministic tool node — do NOT provide a template for `repair_gate`). The critique template should produce either JSON `{"verdict":"keep"|"change","better_label":"...","confidence":0.0-1.0}` or text `CORRECT` / `WRONG - [corrected label]`. Both formats are accepted by the repair gate.
+   - **generate_validate_refine**: `validate`, `refine`
+   **Template variables available in motif nodes:**
+   - Motif-specific: {{proposed}}, {{critique}}, {{candidates}}, {{raw}}, {{retrieved}}, {{feedback}} (per role)
+   - Graph input: {{input}} (full graph input struct — use {{input.field_name}} for specific fields)
+   - All original step arguments are forwarded directly: e.g. if the target step receives `task_text` and `label_guide`, use {{task_text}} and {{label_guide}} in templates.
+   Check "Steps in Parent Graph" to see which arguments the target step receives.
+   After applying a motif, follow up with rewrite_prompt on the generated `_motif.*` nodes to further refine their templates.
 
-9. Tool nodes are powerful levers. When prompt rewrites stagnate (3+ attempts on the same node with no improvement), consider tool-based interventions:
-   - rewrite_shell: modify an existing tool node's shell command — change parameters, flags, output format, add pre/post-processing pipelines
-   - edit_graph with new tool nodes: add shell-based steps for validation (syntax check, linting), formatting (auto-formatter), pre-processing (data extraction, parsing), or post-processing (output cleanup, assertion checks)
-   - Tool nodes can run any shell command available on the system. Use shell pipelines, heredocs for stdin, and template variables ({{var}}) for dynamic inputs
-   - Example new tool node: `node check_syntax: tool { in: { code: string } out: string shell: "python3 -c 'import ast; ast.parse(open(\"/dev/stdin\").read()); print(\"OK\")' <<'EOF'\n{{code}}\nEOF" }`
-   Think of tools as "deterministic guarantees" — a syntax checker never hallucinates, a formatter always produces valid output. When LLM nodes are unreliable, add tool nodes to catch or fix their failures.
+9. Tool nodes are first-class citizens — use them proactively, not as a last resort. Tool nodes run shell commands and produce deterministic, reproducible results. Unlike LLM nodes, they never hallucinate. Use them for:
+   - **Pre-processing**: extract structure, normalize data, detect domain/language before LLM classification
+   - **Post-processing**: validate LLM output against allowed values, fuzzy-match labels, fix formatting
+   - **Computation**: count items, measure similarity, apply rules that an LLM would get wrong
+   - **Orchestration**: route inputs to different strategies based on deterministic analysis
+   Tool nodes use shell commands with template variables ({{var}}). Use `python3 -c '...'` for complex logic, shell pipelines for composition, and heredocs for multi-line stdin.
+   Example: `node normalize: tool { in: { label: string, allowed: string } out: string shell: "python3 -c 'import sys,difflib; label=sys.argv[1]; allowed=sys.argv[2].split(chr(10)); m=difflib.get_close_matches(label.strip(),allowed,n=1,cutoff=0.5); print(m[0] if m else label)' '{{label}}' '{{allowed}}'" }`
+   If the "Network Access" section is present in context, tool nodes can also access the internet — this is an extremely powerful capability. Check context for details.
 
-10. Node type constraints: rewrite_prompt and rewrite_system apply ONLY to prompt/agent/verify nodes. rewrite_shell applies ONLY to tool nodes. Check "Available Nodes" for types.
+10. Node type constraints: rewrite_prompt and rewrite_system apply ONLY to prompt/agent/verify nodes. rewrite_shell and rewrite_tool_spec apply ONLY to tool nodes. Prefer rewrite_tool_spec over rewrite_shell for new tool commands — it avoids shell quoting issues and enables structured sandboxing. Check "Available Nodes" for types.
 
 11. For rewrite_prompt, provide the COMPLETE template including all {{ variable }} references from the original. You may change prose, formatting, and structure freely.
 
-12. For edit_graph, write valid .scaffold DSL. The graph must keep the same name, input type, and output type. Preserved steps (from topology) must still exist. All referenced nodes must be defined. Respect the max_nodes topology constraint.
+12. Start lightweight. Before complex structural changes (propose_decomposition with multi-node motifs, fan_out, replace_with_subgraph), try add_local_checker, normalize_verify, or attach_example_policy. These are cheap, composable, and often sufficient.
+
+13. Write generalizable prompts. The failure evidence shows training-set errors — use them to understand the KIND of mistake, not to hard-code fixes for specific cases. Do NOT embed specific label pairs (e.g. "distinguish X from Y"), case IDs, or error examples from the failure evidence into prompt rewrites. Instead, write instructions that teach the model the general principle (e.g. "read the full text before classifying" rather than "if you see symptoms X, output disease Y").
+
+14. Prefer generalizable example strategies. When using attach_example_policy, prefer `domain_conditioned` (selects examples matching the input's domain) or `nearest` (selects by input similarity) over `confusion_cover` (which overfits to training-set confusion pairs). Use confusion_cover only when domain_conditioned has already been tried.
 
 Return ONLY a single JSON object. No markdown, no explanation outside the JSON."#;
-
-/// Condensed DSL syntax reference for edit_graph proposals.
-/// Included in context only when edit_graph is available.
-const DSL_SYNTAX_REFERENCE: &str = r#"## Scaffold DSL Syntax Reference (for edit_graph)
-
-### Types
-Primitives: `bool`, `int`, `float`, `string`, `bytes`, `any`
-Containers: `list<T>`, `map<K,V>`, `option<T>`
-Structs: `{ field1: Type1, field2: Type2 }`
-Named: any previously declared `type Name = ...`
-
-### Node Definition
-```
-node <name>: <kind> {
-    in: <TypeExpr>
-    out: <TypeExpr>
-    <config fields...>
-}
-```
-Kinds: `prompt` (LLM call), `tool` (shell command), `agent` (multi-turn LLM+tools), `verify` (LLM verification)
-
-Config fields:
-- `template`: `"text"` or `file("path")` — Jinja2 template (prompt/agent/verify)
-- `system`: `"text"` or `file("path")` — system prompt (prompt/agent/verify)
-- `model`: `"model-id"` (prompt/agent/verify)
-- `temperature`: float (prompt/agent/verify)
-- `max_tokens`: int (prompt/agent/verify)
-- `max_turns`: int (agent only)
-- `tools`: `[node1, node2]` (agent only)
-- `shell`: `"command with {{var}}"` (tool only)
-- `timeout`: int in seconds (tool only)
-- `on_error`: `abort` or `retry(N)` (all)
-
-### Graph Body Statements
-```
-graph <name> {
-    in: <TypeExpr>
-    out: <TypeExpr>
-    <statements...>
-}
-```
-
-**Step** — call a node or subgraph:
-```
-step <var> = <node>(<args>)
-step x = solver(input)                     // positional (entire value)
-step x = solver(task: input, ctx: memory)  // named arguments (builds struct)
-step x = eval(code: attempt, dir: input.exercise_dir)  // field access
-```
-
-**Emit** — return value from graph:
-```
-emit <expr>
-emit { field1: expr1, field2: expr2 }
-```
-Every execution path must emit a value matching the graph's `out` type.
-
-**If/Else** — conditional:
-```
-if <condition> {
-    <statements...>
-} else {
-    <statements...>
-}
-```
-
-**Loop** — bounded iteration:
-```
-loop (max: <N>, while: <condition>) {
-    <statements...>
-    carry <var> = <expr>   // persist value for next iteration
-}
-```
-
-**Parallel** — fan-out:
-```
-parallel (<var> in <collection>, reduce: <node>) {
-    <statements...>
-}
-```
-
-**Choose** — structural alternatives:
-```
-choose [alt1, alt2, alt3]
-```
-
-### Expressions
-Operators: `+`, `-`, `*`, `/`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&&`, `||`, `!`
-Field access: `input.field`, `step_name.field`
-Index: `list[0]`, `map["key"]`
-Builtins: `len(x)`, `contains(h,n)`, `str(x)`, `int(x)`, `float(x)`, `lower(s)`, `upper(s)`, `trim(s)`, `split(s,sep)`, `join(list,sep)`, `keys(m)`, `values(m)`, `json_parse(s)`
-
-### Template Syntax (Jinja2)
-Variables: `{{ field_name }}`, `{{ input.nested }}`
-Loops: `{% for item in list %}...{% endfor %}`
-Raw blocks: `{% raw %}...{% endraw %}`
-
-### Structural Patterns (examples for edit_graph)
-
-**Iterative refinement loop** — retry with feedback until a quality gate passes:
-```
-step draft = generator(input)
-step eval_result = evaluator(output: draft)
-loop (max: 3, while: json_parse(eval_result).pass == false) {
-    step draft = refiner(input: input, previous: draft, feedback: eval_result)
-    step eval_result = evaluator(output: draft)
-    carry best = draft
-}
-emit best
-```
-
-**Verify gate with fallback** — LLM quality check before committing:
-```
-step result = solver(input)
-step check = quality_checker(output: result, criteria: input)
-if check.pass == false {
-    step result2 = alternative_solver(input: input, feedback: check.reason)
-    emit result2
-} else {
-    emit result
-}
-```
-
-**Decomposed pipeline** — split a complex task into focused stages:
-```
-step analysis = analyzer(input)
-step plan = planner(context: analysis, task: input)
-step result = executor(plan: plan, task: input)
-emit result
-```
-"#;
 
 /// Per-mutation-kind documentation. Keys are the kind strings used in proposals.
 fn mutation_doc(kind: &str) -> Option<&'static str> {
     match kind {
-        "edit_graph" => Some(
-            r#"{"kind":"edit_graph","graph":"<complete graph as .scaffold source>","new_nodes":[<optional array of new/modified node definitions as .scaffold source>],"description":"<short label>","reasoning":"..."}
-  - "graph" is REQUIRED: the complete modified graph as .scaffold DSL source (ALL steps, not just changed ones). Must use the same graph name, input type, and output type as the parent.
-  - "new_nodes" is OPTIONAL: array of new or modified node definitions as .scaffold source strings. Only include nodes you are adding or changing — existing unchanged nodes are inherited.
-  - "description" is REQUIRED: a short label (e.g. "add planning step", "wrap with retry loop") shown in the TUI.
-  - The graph source is parsed and validated. Preserved steps (from topology.preserve) must still exist. All referenced nodes must be either in the original IR or in new_nodes.
-  - Use this for ANY structural change: adding/removing steps, loops, conditionals, parallel blocks, new tool/verify nodes, complex rewiring."#,
-        ),
         "insert_verify" => Some(
             r#"{"kind":"insert_verify","after_step":"<step>","verify_node":"<node>","max_retries":<n>,"reasoning":"..."} (verify_node MUST be a node of kind "verify", NOT prompt/tool/agent)"#,
         ),
@@ -410,13 +329,26 @@ fn mutation_doc(kind: &str) -> Option<&'static str> {
         "rewrite_shell" => Some(
             r#"{"kind":"rewrite_shell","node":"<tool_node>","new_shell":"<shell command template>","reasoning":"..."}"#,
         ),
+        "rewrite_tool_spec" => Some(
+            r#"{"kind":"rewrite_tool_spec","node":"<tool_node>","spec":{"argv":["cmd","arg1","{{var}}"],"stdin_template":"optional stdin with {{var}}","workdir":".","timeout":30,"net":false,"mounts":[]},"reasoning":"..."} — structured tool specification. Each argv element is a template with {{var}} references. stdin_template is optional. net=true allows network access. Preferred over rewrite_shell for new tool commands."#,
+        ),
+        "propose_decomposition" => Some(
+            r#"{"kind":"propose_decomposition","target_step":"<step>","motif":"<motif_name>","reason":"<diagnosis>","config":{"shortlist_k":3,"templates":{"<key>":"<template text>"},"validate_shell":"<shell cmd>","validate_timeout":30},"reasoning":"..."} — decompose a step using a motif from the library. Available motifs: normalize_verify, shortlist_select, router_expert, retrieve_decide, vote_critique_repair, generate_validate_refine. Config keys: shortlist_k (for shortlist_select), validate_shell (for generate_validate_refine, required), validate_timeout (for generate_validate_refine, default 30s), templates (optional task-specific templates). Template keys per motif: shortlist_select uses "shortlist","choose","normalize"; normalize_verify uses "normalize"; router_expert uses "router"; retrieve_decide uses "retrieve","decide"; vote_critique_repair uses "critique" (repair gate accepts both JSON {"verdict":"keep"|"change","better_label":"..."} and text CORRECT / WRONG - [label]); generate_validate_refine uses "validate","refine". Template variables: (1) motif-specific: {{proposed}}, {{critique}}, {{candidates}}, {{raw}}, {{retrieved}}, {{feedback}}; (2) graph input: {{input}} (full input object, use {{input.field_name}} for fields); (3) all original step arguments are forwarded as named variables (e.g. if step receives task_text and label_guide, use {{task_text}}, {{label_guide}})."#,
+        ),
+        "attach_example_policy" => Some(
+            r#"{"kind":"attach_example_policy","node":"<node>","policy":{"strategy":"<strategy>","k":<n>},"reasoning":"..."} — attach few-shot examples to a node. Strategies: confusion_cover, nearest_plus_hard_negative, synthetic_aliases, random, domain_conditioned. domain_conditioned prefers same-domain examples when the input has a "domain" or "category" field. Examples are selected from the example bank at execution time."#,
+        ),
+        "add_local_checker" => Some(
+            r#"{"kind":"add_local_checker","node":"<node>","checker_name":"<name>","expr":"<expression>","reasoning":"..."} — add a validation expression evaluated after the node runs. Uses the same expression syntax as objective checkers."#,
+        ),
         _ => None,
     }
 }
 
 /// Estimate the total context size (in chars) that would be sent to the meta-agent.
 pub fn estimate_context_chars(
-    parent: &Candidate,
+    parent: &CandidateDelta,
+    parent_eval: &EvalResults,
     archive: &Archive,
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
@@ -425,7 +357,7 @@ pub fn estimate_context_chars(
     meta_full_traces: bool,
 ) -> usize {
     // Building the full string is cheap (no I/O), so just measure it directly.
-    let ctx = build_context(parent, archive, ir, objective, allowed_mutations, epoch_start_id, meta_full_traces);
+    let ctx = build_context(parent, parent_eval, archive, ir, objective, allowed_mutations, epoch_start_id, meta_full_traces);
     ctx.len() + SYSTEM_PROMPT.len()
 }
 
@@ -435,7 +367,8 @@ pub fn estimate_context_chars(
 /// in the archive, pass/fail matrix, and mutation effects sections. This keeps context
 /// bounded across long runs while the TUI still shows full lineage.
 fn build_context(
-    parent: &Candidate,
+    parent: &CandidateDelta,
+    parent_eval: &EvalResults,
     archive: &Archive,
     ir: &ScaffoldIR,
     objective: &ObjectiveIR,
@@ -468,8 +401,10 @@ fn build_context(
             .join(", ")
     ));
     // Show structural mutations from topology + content mutations (always available).
-    // When meta-model is active, replace individual structural mutations with edit_graph.
-    let has_tool_nodes = ir.nodes.iter().any(|n| n.kind == NodeKindIR::Tool);
+    let has_synthetic_tool = parent.overrides.iter().any(|(k, v)| {
+        k.starts_with("_node.") && v.get("kind").and_then(|k| k.as_str()) == Some("tool")
+    });
+    let has_tool_nodes = has_synthetic_tool || ir.nodes.iter().any(|n| n.kind == NodeKindIR::Tool);
     let has_prompt_nodes = ir
         .nodes
         .iter()
@@ -477,21 +412,7 @@ fn build_context(
     let has_any_structural = allowed_mutations
         .iter()
         .any(|m| STRUCTURAL_MUTATIONS.contains(&m.as_str()));
-    let mut all_available: Vec<String> = if has_any_structural {
-        // When structural mutations are available, show edit_graph instead of individuals
-        let mut v = vec!["edit_graph".to_string()];
-        // Keep non-structural mutations (set_config)
-        for m in allowed_mutations {
-            if !STRUCTURAL_MUTATIONS.contains(&m.as_str()) {
-                if !v.contains(m) {
-                    v.push(m.clone());
-                }
-            }
-        }
-        v
-    } else {
-        allowed_mutations.to_vec()
-    };
+    let mut all_available: Vec<String> = allowed_mutations.to_vec();
     if has_prompt_nodes {
         for content in &["rewrite_prompt", "rewrite_system"] {
             if !all_available.iter().any(|m| m == content) {
@@ -503,13 +424,28 @@ fn build_context(
         if !all_available.iter().any(|m| m == "rewrite_shell") {
             all_available.push("rewrite_shell".to_string());
         }
+        if !all_available.iter().any(|m| m == "rewrite_tool_spec") {
+            all_available.push("rewrite_tool_spec".to_string());
+        }
+    }
+    // Motif decomposition: available when structural mutations are allowed
+    if has_any_structural {
+        if !all_available.iter().any(|m| m == "propose_decomposition") {
+            all_available.push("propose_decomposition".to_string());
+        }
+    }
+    // Content-level mutations always available
+    for content in &["attach_example_policy", "add_local_checker"] {
+        if !all_available.iter().any(|m| m == content) {
+            all_available.push(content.to_string());
+        }
     }
     ctx.push_str(&format!(
         "Allowed mutations: {}\n",
         all_available.join(", ")
     ));
     if !has_tool_nodes {
-        ctx.push_str("Note: No tool nodes exist — rewrite_shell is NOT available.\n");
+        ctx.push_str("Note: No tool nodes exist — rewrite_shell/rewrite_tool_spec are NOT available.\n");
     }
 
     // Mutation reference: only show docs for mutations actually available
@@ -518,13 +454,6 @@ fn build_context(
         if let Some(doc) = mutation_doc(kind) {
             ctx.push_str(&format!("- {}\n", doc));
         }
-    }
-
-    // DSL syntax reference: include when edit_graph is available so the LLM
-    // knows the exact .scaffold syntax for writing graph/node definitions.
-    if all_available.iter().any(|m| m == "edit_graph") {
-        ctx.push_str("\n");
-        ctx.push_str(DSL_SYNTAX_REFERENCE);
     }
 
     // Tunables (set_config is limited to these)
@@ -542,7 +471,7 @@ fn build_context(
 
     // 2. Parent graph (pretty-printed)
     ctx.push_str("## Parent Graph (selected candidate to mutate)\n");
-    ctx.push_str(&format!("Score: {:.4}\n", parent.score.unwrap_or(0.0)));
+    ctx.push_str(&format!("Score: {:.4}\n", parent_eval.score().unwrap_or(0.0)));
     if !parent.mutations.is_empty() {
         ctx.push_str(&format!(
             "Mutations from seed: {}\n",
@@ -562,8 +491,8 @@ fn build_context(
 
     let full_lineage = candidate_lineage(archive, parent);
     // Truncate lineage at epoch boundary — pre-epoch ancestors collapsed to one line
-    let lineage: Vec<&Candidate> = if epoch_start_id.is_some() {
-        full_lineage.iter().copied().filter(|c| c.id >= epoch_start).collect()
+    let lineage: Vec<&ArchiveEntry> = if epoch_start_id.is_some() {
+        full_lineage.iter().copied().filter(|e| e.delta.id >= epoch_start).collect()
     } else {
         full_lineage.clone()
     };
@@ -577,38 +506,38 @@ fn build_context(
                 ctx.push_str(&format!(
                     "- (epoch baseline: {} prior ancestors, starting from {} score={:.4})\n",
                     ancestor_count,
-                    candidate_label(first),
-                    first.score.unwrap_or(0.0),
+                    candidate_label(&first.delta, &first.eval),
+                    first.eval.score().unwrap_or(0.0),
                 ));
             }
         }
-        for cand in &lineage {
+        for entry in &lineage {
             ctx.push_str(&format!(
                 "- {} score={:.4} parent={}\n",
-                candidate_label(cand),
-                cand.score.unwrap_or(0.0),
-                cand.parent_id
-                    .and_then(|pid| archive.candidates.iter().find(|p| p.id == pid))
-                    .map(candidate_label)
+                candidate_label(&entry.delta, &entry.eval),
+                entry.eval.score().unwrap_or(0.0),
+                entry.delta.parent_id
+                    .and_then(|pid| archive.entries.iter().find(|p| p.delta.id == pid))
+                    .map(|p| candidate_label(&p.delta, &p.eval))
                     .unwrap_or_else(|| "none".to_string())
             ));
-            if is_seed_candidate(cand) {
+            if is_seed_candidate(&entry.delta) {
                 ctx.push_str("  exact mutation: seed\n");
             } else {
-                for mutation in &cand.mutations {
+                for mutation in &entry.delta.mutations {
                     ctx.push_str(&format!(
                         "  exact mutation: {}\n",
                         format_mutation_for_meta(mutation)
                     ));
                 }
             }
-            let active = format_overrides_inline(&cand.overrides);
+            let active = format_overrides_inline(&entry.delta.overrides);
             ctx.push_str(&format!("  active overrides: {}\n", active));
-            if let Some(parent_cand) = cand
+            if let Some(parent_entry) = entry.delta
                 .parent_id
-                .and_then(|pid| archive.candidates.iter().find(|p| p.id == pid))
+                .and_then(|pid| archive.entries.iter().find(|p| p.delta.id == pid))
             {
-                let delta = candidate_case_delta(parent_cand, cand);
+                let delta = candidate_case_delta(&parent_entry.eval, &entry.eval);
                 ctx.push_str(&format!(
                     "  delta vs parent: fixed [{}] | broken [{}]\n",
                     join_case_ids(&delta.fixed),
@@ -623,15 +552,15 @@ fn build_context(
         ctx.push_str("## Best Candidate Overall\n");
         ctx.push_str(&format!(
             "Candidate: {} | Score: {:.4}\n",
-            candidate_label(best),
-            best.score.unwrap_or(0.0)
+            candidate_label(&best.delta, &best.eval),
+            best.eval.score().unwrap_or(0.0)
         ));
-        push_candidate_overrides(&mut ctx, "Best Candidate Active Overrides", best);
+        push_candidate_overrides(&mut ctx, "Best Candidate Active Overrides", &best.delta);
         ctx.push_str("Graph:\n```\n");
-        ctx.push_str(&scaffold_ir::pretty::pretty_print_graph(&best.graph));
+        ctx.push_str(&scaffold_ir::pretty::pretty_print_graph(&best.delta.graph));
         ctx.push_str("```\n");
-        push_candidate_node_state(&mut ctx, "Nodes in Best Candidate", best, ir);
-        push_step_details(&mut ctx, "Steps in Best Candidate", &best.graph);
+        push_candidate_node_state(&mut ctx, "Nodes in Best Candidate", &best.delta, ir);
+        push_step_details(&mut ctx, "Steps in Best Candidate", &best.delta.graph);
         ctx.push('\n');
     }
 
@@ -643,17 +572,17 @@ fn build_context(
         String::new()
     };
     ctx.push_str(&format!("## Archive (top candidates by score{})\n", epoch_label));
-    let ranked: Vec<&Candidate> = archive.ranked()
+    let ranked: Vec<&ArchiveEntry> = archive.ranked()
         .into_iter()
-        .filter(|c| c.id >= epoch_start)
+        .filter(|e| e.delta.id >= epoch_start)
         .collect();
-    for (i, c) in ranked.iter().take(10).enumerate() {
-        let mutations_str = if is_seed_candidate(c) {
+    for (i, e) in ranked.iter().take(10).enumerate() {
+        let mutations_str = if is_seed_candidate(&e.delta) {
             "seed".to_string()
-        } else if c.mutations.is_empty() {
+        } else if e.delta.mutations.is_empty() {
             "none".to_string()
         } else {
-            c.mutations
+            e.delta.mutations
                 .iter()
                 .map(|m| m.short_label())
                 .collect::<Vec<_>>()
@@ -662,30 +591,30 @@ fn build_context(
         ctx.push_str(&format!(
             "{}. {} score={:.4} parent={} mutations=[{}] children={}\n",
             i + 1,
-            candidate_label(c),
-            c.score.unwrap_or(0.0),
-            c.parent_id
-                .and_then(|pid| archive.candidates.iter().find(|p| p.id == pid))
-                .map(candidate_label)
+            candidate_label(&e.delta, &e.eval),
+            e.eval.score().unwrap_or(0.0),
+            e.delta.parent_id
+                .and_then(|pid| archive.entries.iter().find(|p| p.delta.id == pid))
+                .map(|p| candidate_label(&p.delta, &p.eval))
                 .unwrap_or_else(|| "none".to_string()),
             mutations_str,
-            c.children_count,
+            e.delta.children_count,
         ));
     }
     ctx.push('\n');
 
     // 3.4 Pass/Fail Matrix — cases (rows) × candidates (columns)
-    // Extremely compact view that lets the meta-agent see patterns across all candidates at once.
+    // Uses TRAIN results only to avoid leaking val labels.
     {
         let mut all_case_ids: BTreeSet<String> = BTreeSet::new();
-        for c in &archive.candidates {
-            if c.score.is_none() || c.id < epoch_start {
+        for e in &archive.entries {
+            if e.eval.score().is_none() || e.delta.id < epoch_start {
                 continue;
             }
-            for id in &c.passed_case_ids {
+            for id in e.eval.train_passed_case_ids() {
                 all_case_ids.insert(id.clone());
             }
-            for cr in &c.case_results {
+            for cr in e.eval.train_case_results() {
                 if let Some(ref id) = cr.case_id {
                     all_case_ids.insert(id.clone());
                 }
@@ -693,25 +622,25 @@ fn build_context(
         }
         let all_case_ids: Vec<String> = all_case_ids.into_iter().collect();
 
-        let mut scored: Vec<&Candidate> = archive
-            .candidates
+        let mut scored: Vec<&ArchiveEntry> = archive
+            .entries
             .iter()
-            .filter(|c| c.score.is_some() && c.id >= epoch_start)
+            .filter(|e| e.eval.score().is_some() && e.delta.id >= epoch_start)
             .collect();
-        scored.sort_by_key(|c| c.id);
+        scored.sort_by_key(|e| e.delta.id);
 
         if !all_case_ids.is_empty() && scored.len() > 1 {
             // Limit to 12 columns to prevent excessive width
-            let show: Vec<&Candidate> = scored.into_iter().take(12).collect();
+            let show: Vec<&ArchiveEntry> = scored.into_iter().take(12).collect();
 
-            ctx.push_str("## Pass/Fail Matrix\n");
+            ctx.push_str("## Pass/Fail Matrix (train)\n");
             let max_id_len = all_case_ids.iter().map(|id| id.len()).max().unwrap_or(10);
             let pad = max_id_len + 2;
 
             // Header
             ctx.push_str(&format!("{:pad$}", "Case", pad = pad));
-            for c in &show {
-                let label = candidate_label(c);
+            for e in &show {
+                let label = candidate_label(&e.delta, &e.eval);
                 ctx.push_str(&format!("{:>6}", label));
             }
             ctx.push('\n');
@@ -719,8 +648,8 @@ fn build_context(
             // Rows
             for case_id in &all_case_ids {
                 ctx.push_str(&format!("{:pad$}", case_id, pad = pad));
-                for c in &show {
-                    let passed = c.passed_case_ids.iter().any(|id| id == case_id);
+                for e in &show {
+                    let passed = e.eval.train_passed_case_ids().iter().any(|id| id == case_id);
                     ctx.push_str(&format!("{:>6}", if passed { "P" } else { "F" }));
                 }
                 ctx.push('\n');
@@ -733,39 +662,39 @@ fn build_context(
     // Compact format: one summary line per attempt with score delta.
     // Case-level detail is in the Pass/Fail Matrix above.
     {
-        let evaluated: Vec<&Candidate> = archive
-            .candidates
+        let evaluated: Vec<&ArchiveEntry> = archive
+            .entries
             .iter()
-            .filter(|c| c.score.is_some() && !c.mutations.is_empty() && c.id >= epoch_start)
+            .filter(|e| e.eval.score().is_some() && !e.delta.mutations.is_empty() && e.delta.id >= epoch_start)
             .collect();
 
         if !evaluated.is_empty() {
-            // Group candidates by mutation label (e.g. "rewrite_prompt(solve_code)")
-            let mut groups: Vec<(String, Vec<&Candidate>)> = Vec::new();
-            for c in &evaluated {
-                let label = c
+            // Group entries by mutation label (e.g. "rewrite_prompt(solve_code)")
+            let mut groups: Vec<(String, Vec<&ArchiveEntry>)> = Vec::new();
+            for e in &evaluated {
+                let label = e.delta
                     .mutations
                     .last()
                     .map(|m| m.short_label())
                     .unwrap_or_default();
                 if let Some(entry) = groups.iter_mut().find(|(l, _)| *l == label) {
-                    entry.1.push(c);
+                    entry.1.push(e);
                 } else {
-                    groups.push((label, vec![c]));
+                    groups.push((label, vec![e]));
                 }
             }
 
             ctx.push_str("## Mutation Effects (grouped by type)\n");
             ctx.push_str("Score impact of each mutation type. Compare with the Pass/Fail Matrix above for case-level detail.\n\n");
 
-            for (label, candidates) in &groups {
-                let trend = mutation_group_trend(candidates, archive);
+            for (label, entries) in &groups {
+                let trend = mutation_group_trend(entries, archive);
 
                 ctx.push_str(&format!(
                     "### {} — {} attempt{}, best={:.4}, {}\n",
                     label,
-                    candidates.len(),
-                    if candidates.len() > 1 { "s" } else { "" },
+                    entries.len(),
+                    if entries.len() > 1 { "s" } else { "" },
                     trend.best_score,
                     trend.verdict,
                 ));
@@ -776,38 +705,38 @@ fn build_context(
                     if trend.saturated { "yes" } else { "no" },
                 ));
 
-                for c in candidates {
-                    let score = c.score.unwrap_or(0.0);
-                    let parent_cand = c
+                for e in entries {
+                    let score = e.eval.score().unwrap_or(0.0);
+                    let parent_entry = e.delta
                         .parent_id
-                        .and_then(|pid| archive.candidates.iter().find(|p| p.id == pid));
-                    let parent_score = parent_cand.and_then(|p| p.score).unwrap_or(0.0);
-                    let parent_label = match parent_cand {
-                        Some(p) => candidate_label(p),
+                        .and_then(|pid| archive.entries.iter().find(|p| p.delta.id == pid));
+                    let parent_score = parent_entry.and_then(|p| p.eval.score()).unwrap_or(0.0);
+                    let parent_label = match parent_entry {
+                        Some(p) => candidate_label(&p.delta, &p.eval),
                         None => "?".to_string(),
                     };
                     let delta = score - parent_score;
 
                     // Flag likely runtime/template errors (0 passed out of N = total crash)
-                    let crash_note = if score == 0.0 && c.total_cases > 0 && c.cases_passed == 0 {
+                    let crash_note = if score == 0.0 && e.eval.total_cases() > 0 && e.eval.cases_passed() == 0 {
                         " ⚠ LIKELY RUNTIME ERROR — mutation idea may be valid, template was broken"
                     } else {
                         ""
                     };
                     ctx.push_str(&format!(
                         "  {} ({}@{:.4} → {:.4}, Δ{}) passed {}/{}{}\n",
-                        candidate_label(c),
+                        candidate_label(&e.delta, &e.eval),
                         parent_label,
                         parent_score,
                         score,
                         format_delta(delta),
-                        c.cases_passed,
-                        c.total_cases,
+                        e.eval.cases_passed(),
+                        e.eval.total_cases(),
                         crash_note,
                     ));
 
                     // Show meta-agent reasoning if available (brief)
-                    if let Some(ref reasoning) = c.meta_reasoning {
+                    if let Some(ref reasoning) = e.delta.meta_reasoning {
                         let short: String = reasoning.chars().take(200).collect();
                         ctx.push_str(&format!("    Reasoning: \"{}\"\n", short));
                     }
@@ -816,13 +745,13 @@ fn build_context(
             }
 
             // Stagnation warning (inline)
-            let epoch_ranked: Vec<&Candidate> = archive.ranked()
+            let epoch_ranked: Vec<&ArchiveEntry> = archive.ranked()
                 .into_iter()
-                .filter(|c| c.id >= epoch_start)
+                .filter(|e| e.delta.id >= epoch_start)
                 .collect();
             let best_score = epoch_ranked
                 .first()
-                .map(|c| c.score.unwrap_or(0.0))
+                .map(|e| e.eval.score().unwrap_or(0.0))
                 .unwrap_or(0.0);
             let stagnation_count = stagnation_count_after_best(archive, epoch_start);
             if stagnation_count >= 2 {
@@ -834,12 +763,26 @@ fn build_context(
         }
     }
 
-    let failure_clusters = summarize_failure_clusters(parent);
-    let repair_behavior = summarize_repair_behavior(parent, ir);
+    // Content plateau indicator
+    {
+        let (plateaued, content_count) = content_plateau_indicator(archive, epoch_start);
+        if plateaued {
+            ctx.push_str("## Content Plateau: PLATEAUED\n");
+            ctx.push_str(&format!(
+                "The last 3 content-only mutations (out of {} total) all showed zero or negative improvement.\n",
+                content_count,
+            ));
+            ctx.push_str("Content mutations (rewrite_prompt/system/shell, set_config) are exhausted for now.\n");
+            ctx.push_str("**Strongly consider structural changes**: propose_decomposition, insert_step, add_prompt_step, or tool nodes.\n\n");
+        }
+    }
+
+    let failure_clusters = summarize_failure_clusters(parent_eval);
+    let repair_behavior = summarize_repair_behavior(parent, parent_eval, ir);
     let structural_pressure =
         structural_pressure_summary(archive, &failure_clusters, &repair_behavior, epoch_start);
 
-    if !failure_clusters.is_empty() || parent.total_cases > 0 {
+    if !failure_clusters.is_empty() || parent_eval.total_cases() > 0 {
         ctx.push_str("## Failure Decomposition Hints\n");
         ctx.push_str(
             "Use these hints to decompose the task into smaller subproblems before choosing one mutation.\n",
@@ -869,7 +812,64 @@ fn build_context(
                 format!(" — {}", structural_pressure.reasons.join("; "))
             }
         ));
+
         ctx.push('\n');
+
+        // Collect prior decomposition attempts per motif for annotation.
+        let prior_decompositions: Vec<(String, String, f64, bool)> = archive.entries.iter()
+            .filter_map(|entry| {
+                let score = entry.eval.score().unwrap_or(0.0);
+                entry.delta.mutations.iter().find_map(|m| {
+                    if let crate::mutations::Mutation::ProposeDecomposition { motif, target_step, config, .. } = m {
+                        let had_custom_templates = config.contains_key("templates");
+                        Some((motif.to_string(), target_step.clone(), score, had_custom_templates))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        // Quick Wins: lightweight fixes that should be tried before complex structural changes
+        ctx.push_str("## Quick Wins (try these first)\n");
+        ctx.push_str("Before complex structural changes, consider these lightweight fixes:\n");
+        ctx.push_str("- **add_local_checker**: Add a validation expression after a node to catch bad outputs early.\n");
+        ctx.push_str("- **normalize_verify** (via propose_decomposition): Append a normalizer to fix spelling/case/format.\n");
+        ctx.push_str("- **attach_example_policy**: Inject few-shot examples from the example bank to guide the model.\n");
+        ctx.push_str("These are cheap, composable, and often sufficient before investing in multi-node motifs.\n\n");
+
+        // Motif suggestions based on failure patterns — prominent top-level section
+        let motif_suggestions = suggest_motifs(&failure_clusters);
+        if !motif_suggestions.is_empty() {
+            ctx.push_str("## RECOMMENDED: Use propose_decomposition\n");
+            ctx.push_str("The following motifs match the observed failure patterns. Use propose_decomposition:\n");
+            for (motif, reason) in &motif_suggestions {
+                ctx.push_str(&format!(
+                    "- **{}**: {} — {}\n",
+                    motif,
+                    reason,
+                    crate::motifs::motif_description(motif)
+                ));
+                // Annotate with prior attempts if any
+                let prior: Vec<_> = prior_decompositions.iter()
+                    .filter(|(m, _, _, _)| m == &motif.to_string())
+                    .collect();
+                if !prior.is_empty() {
+                    for (_, step, score, had_templates) in &prior {
+                        let tmpl_note = if *had_templates { "with custom templates" } else { "with default templates" };
+                        ctx.push_str(&format!(
+                            "  ⚠ Previously tried on step '{}' {} → score={:.4}. Use DIFFERENT templates/config if retrying.\n",
+                            step, tmpl_note, score
+                        ));
+                    }
+                }
+                ctx.push_str(&format!(
+                    "  → `{{\"kind\":\"propose_decomposition\",\"target_step\":\"<step>\",\"motif\":\"{}\",\"reason\":\"...\",\"config\":{{}},\"reasoning\":\"...\"}}`\n",
+                    motif
+                ));
+            }
+            ctx.push('\n');
+        }
     }
 
     // Repair Effectiveness section — dedicated, prominent section
@@ -938,23 +938,94 @@ fn build_context(
         }
     }
 
+    // Step-Transition Attribution (for multi-step pipelines)
+    {
+        let transitions = compute_step_transitions(parent_eval, parent);
+        let has_content = !transitions.correct_to_wrong.is_empty()
+            || !transitions.wrong_to_correct.is_empty();
+        if has_content {
+            ctx.push_str("## Step Attribution\n");
+            ctx.push_str("Per-step correctness analysis for multi-step pipelines.\n\n");
+
+            if !transitions.correct_to_wrong.is_empty() {
+                ctx.push_str(&format!(
+                    "**CORRECT→WRONG** ({} transition{}): An intermediate step had the right answer, but a later step corrupted it.\n",
+                    transitions.correct_to_wrong.len(),
+                    if transitions.correct_to_wrong.len() > 1 { "s" } else { "" },
+                ));
+                for t in transitions.correct_to_wrong.iter().take(5) {
+                    ctx.push_str(&format!(
+                        "  {} — '{}' was correct, '{}' corrupted the output\n",
+                        t.case_id, t.from_step, t.to_step,
+                    ));
+                }
+                if transitions.correct_to_wrong.len() > 5 {
+                    ctx.push_str(&format!(
+                        "  ... and {} more\n",
+                        transitions.correct_to_wrong.len() - 5,
+                    ));
+                }
+                ctx.push('\n');
+            }
+
+            if !transitions.wrong_to_correct.is_empty() {
+                ctx.push_str(&format!(
+                    "**WRONG→CORRECT** ({} transition{}): A repair/normalize step successfully fixed the output.\n",
+                    transitions.wrong_to_correct.len(),
+                    if transitions.wrong_to_correct.len() > 1 { "s" } else { "" },
+                ));
+                for t in transitions.wrong_to_correct.iter().take(5) {
+                    ctx.push_str(&format!(
+                        "  {} — '{}' was wrong, '{}' fixed it\n",
+                        t.case_id, t.from_step, t.to_step,
+                    ));
+                }
+                if transitions.wrong_to_correct.len() > 5 {
+                    ctx.push_str(&format!(
+                        "  ... and {} more\n",
+                        transitions.wrong_to_correct.len() - 5,
+                    ));
+                }
+                ctx.push('\n');
+            }
+
+            ctx.push_str(&format!(
+                "Pipeline-wide: all_correct={}, all_wrong={}\n\n",
+                transitions.all_correct, transitions.all_wrong,
+            ));
+        }
+    }
+
     // 4. Parent's evaluation summary + failed cases
-    if parent.total_cases > 0 {
-        let failed = parent.total_cases - parent.cases_passed;
+    // Val is blind (aggregate only); train has case-level detail.
+    if parent_eval.total_cases() > 0 || parent_eval.train_total() > 0 {
         ctx.push_str("## Parent Evaluation Summary\n");
+        // Blind val line: aggregate score only
+        // score() returns val score when available, else train score
+        let score_label = if parent_eval.val.is_some() { "Val Score" } else { "Train Score" };
         ctx.push_str(&format!(
-            "Score: {:.4} | {}/{} cases PASSED, {}/{} FAILED\n",
-            parent.score.unwrap_or(0.0),
-            parent.cases_passed,
-            parent.total_cases,
-            failed,
-            parent.total_cases,
+            "{}: {:.4} ({}/{} passed)\n",
+            score_label,
+            parent_eval.score().unwrap_or(0.0),
+            parent_eval.cases_passed(),
+            parent_eval.total_cases(),
         ));
+        // Train detail header
+        if parent_eval.train_total() > 0 {
+            let train_failed = parent_eval.train_total() - parent_eval.train_passed();
+            ctx.push_str(&format!(
+                "Train Batch: {}/{} PASSED, {}/{} FAILED\n",
+                parent_eval.train_passed(),
+                parent_eval.train_total(),
+                train_failed,
+                parent_eval.train_total(),
+            ));
+        }
         // Per-metric breakdown
-        if !parent.metric_scores.is_empty() {
+        if !parent_eval.metric_scores().is_empty() {
             ctx.push_str("Per-metric scores: ");
-            let metrics: Vec<String> = parent
-                .metric_scores
+            let metrics: Vec<String> = parent_eval
+                .metric_scores()
                 .iter()
                 .map(|(k, v)| format!("{}={:.4}", k, v))
                 .collect();
@@ -963,25 +1034,85 @@ fn build_context(
         }
         ctx.push('\n');
 
-        if !parent.case_results.is_empty() {
-            // Show passing cases first (just IDs)
-            if !parent.passed_case_ids.is_empty() {
+        // Generalization signal: val checkpoint history
+        if !archive.val_checkpoints.is_empty() {
+            ctx.push_str("## Generalization Signal (Val Checkpoints)\n");
+            ctx.push_str("Val is evaluated on held-out data whenever a new best candidate is found.\n");
+            for vc in &archive.val_checkpoints {
+                let gap = vc.train_score - vc.val_score;
                 ctx.push_str(&format!(
-                    "Passing cases ({}): [{}]\n",
-                    parent.passed_case_ids.len(),
-                    parent.passed_case_ids.join(", "),
+                    "  Candidate #{}: train={:.4}, val={:.4}, gap={:+.4}\n",
+                    vc.candidate_id, vc.train_score, vc.val_score, gap,
                 ));
             }
+            // Warning if latest gap is large
+            if let Some(latest) = archive.val_checkpoints.last() {
+                let gap = latest.train_score - latest.val_score;
+                if gap > 0.10 {
+                    ctx.push_str(&format!(
+                        "\nOVERFITTING WARNING: Train-val gap is {:.0}%. Recent improvements are NOT generalizing to held-out data.\n\
+                         Focus on GENERALIZABLE changes: domain_conditioned examples, structural motifs (normalize_verify, shortlist_select, router_expert), and general instructions rather than training-specific rules.\n",
+                        gap * 100.0,
+                    ));
+                }
+            }
+            ctx.push('\n');
+        }
 
-            // Detailed failures: show model output + test errors for the first N,
-            // then one-liner summaries for the rest.
-            // When meta_full_traces is enabled, show full traces for ALL failed cases.
-            let failed_count = parent.case_results.iter().filter(|c| !c.passed).count();
+        // Output pattern analysis: group failures by actual output to surface biases.
+        // Only shown when recurring patterns exist (≥2 cases with same output).
+        {
+            let failure_source_for_patterns = parent_eval.train_case_results();
+            let pattern_groups = summarize_output_patterns(failure_source_for_patterns);
+            if !pattern_groups.is_empty() {
+                ctx.push_str("## Output Pattern Analysis\n");
+                ctx.push_str("Recurring patterns in failed case outputs. Use these to diagnose systematic biases.\n\n");
+                for group in &pattern_groups {
+                    let expected_summary = count_expected_labels(&group.expected_excerpts);
+                    if group.is_short_garbage {
+                        ctx.push_str(&format!(
+                            "**SHORT/GARBAGE**: output={:?} → {} case(s) [{}]\n  Expected: {}\n\n",
+                            group.output_repr,
+                            group.count,
+                            group.case_ids.join(", "),
+                            expected_summary,
+                        ));
+                    } else {
+                        ctx.push_str(&format!(
+                            "**OUTPUT BIAS**: output={:?} → {} case(s) [{}]\n  Expected: {}\n\n",
+                            group.output_repr,
+                            group.count,
+                            group.case_ids.join(", "),
+                            expected_summary,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Use train_case_results only — val case detail is intentionally blinded.
+        let failure_source = parent_eval.train_case_results();
+        let failure_source_label = "train batch";
+
+        if !failure_source.is_empty() {
+            // Blind summary: score + pass count only, no case IDs or expected values
+            let detail_score_label = if parent_eval.val.is_some() { "Val score" } else { "Train score" };
+            ctx.push_str(&format!(
+                "{}: {:.4} ({}/{} passed)\n",
+                detail_score_label,
+                parent_eval.score().unwrap_or(0.0),
+                parent_eval.cases_passed(),
+                parent_eval.total_cases(),
+            ));
+
+            // Detailed failures from the failure source (train batch or val)
+            let failed_count = failure_source.iter().filter(|c| !c.passed).count();
             let detailed_limit = if meta_full_traces { failed_count } else { 5 };
 
-            let failed_cases: Vec<_> = parent.case_results.iter().filter(|c| !c.passed).collect();
+            let failed_cases: Vec<_> = failure_source.iter().filter(|c| !c.passed).collect();
             ctx.push_str(&format!(
-                "\nFailed cases ({}):\n",
+                "\nFailed cases from {} ({}):\n",
+                failure_source_label,
                 failed_cases.len()
             ));
             for (i, case) in failed_cases.iter().enumerate() {
@@ -1026,7 +1157,7 @@ fn build_context(
     // Shows full step traces for cases that flipped between the parent's parent and the parent,
     // giving the meta-agent concrete evidence of what mutations actually changed.
     if meta_full_traces {
-        push_changed_case_traces(&mut ctx, archive, parent, ir);
+        push_changed_case_traces(&mut ctx, archive, parent, parent_eval, ir);
     }
 
     // 5. Available nodes with DSL source + override annotations
@@ -1037,7 +1168,7 @@ fn build_context(
         ctx.push_str(&scaffold_ir::pretty::pretty_print_node(node));
         ctx.push_str("```\n");
 
-        // Show override annotations
+        // Show override annotations OR base template/system content
         let override_template_key = format!("{}.template", node.name);
         if let Some(override_val) = parent.overrides.get(&override_template_key) {
             if let Some(content) = override_val.as_str() {
@@ -1048,6 +1179,19 @@ fn build_context(
                     excerpt.replace('\n', "\\n"),
                     truncated
                 ));
+            }
+        } else if matches!(node.kind, NodeKindIR::Prompt | NodeKindIR::Agent) {
+            // Show base template content so the meta-agent knows what it's rewriting
+            if let Some(ref sof) = node.config.template {
+                if let Ok(content) = crate::node_runner::load_template(sof) {
+                    let excerpt: String = content.chars().take(2000).collect();
+                    let truncated = if content.chars().count() > 2000 { "..." } else { "" };
+                    ctx.push_str(&format!(
+                        "  Base template: \"{}{}\"\n",
+                        excerpt.replace('\n', "\\n"),
+                        truncated
+                    ));
+                }
             }
         }
 
@@ -1061,6 +1205,19 @@ fn build_context(
                     excerpt.replace('\n', "\\n"),
                     truncated
                 ));
+            }
+        } else if matches!(node.kind, NodeKindIR::Prompt | NodeKindIR::Agent) {
+            // Show base system prompt content
+            if let Some(ref sof) = node.config.system {
+                if let Ok(content) = crate::node_runner::load_template(sof) {
+                    let excerpt: String = content.chars().take(500).collect();
+                    let truncated = if content.chars().count() > 500 { "..." } else { "" };
+                    ctx.push_str(&format!(
+                        "  Base system: \"{}{}\"\n",
+                        excerpt.replace('\n', "\\n"),
+                        truncated
+                    ));
+                }
             }
         }
 
@@ -1091,12 +1248,19 @@ fn build_context(
         vars.extend(graph_input_fields);
         vars.join(", ")
     };
-    for (key, _) in &parent.overrides {
+    for (key, val) in &parent.overrides {
         if let Some(name) = key.strip_prefix("_node.") {
             let template_key = format!("{}.template", name);
             let system_key = format!("{}.system", name);
             let model_key = format!("{}.model", name);
-            ctx.push_str(&format!("- {} (prompt, SYNTHETIC) [mutations: rewrite_prompt, rewrite_system] [vars: {}]\n  output type: string", name, synthetic_vars));
+            let shell_key = format!("{}.shell", name);
+            let kind_str = val.get("kind").and_then(|v| v.as_str()).unwrap_or("prompt");
+            let mutations_str = if kind_str == "tool" {
+                "rewrite_shell"
+            } else {
+                "rewrite_prompt, rewrite_system"
+            };
+            ctx.push_str(&format!("- {} ({}, SYNTHETIC) [mutations: {}] [vars: {}]\n  output type: string", name, kind_str, mutations_str, synthetic_vars));
             if let Some(tmpl) = parent.overrides.get(&template_key).and_then(|v| v.as_str()) {
                 let excerpt: String = tmpl.chars().take(1500).collect();
                 let truncated = if tmpl.len() > 1500 { "..." } else { "" };
@@ -1118,6 +1282,15 @@ fn build_context(
             if let Some(model) = parent.overrides.get(&model_key).and_then(|v| v.as_str()) {
                 ctx.push_str(&format!("  model: {}\n", model));
             }
+            if let Some(shell) = parent.overrides.get(&shell_key).and_then(|v| v.as_str()) {
+                let excerpt: String = shell.chars().take(500).collect();
+                let truncated = if shell.len() > 500 { "..." } else { "" };
+                ctx.push_str(&format!(
+                    "  shell (OVERRIDDEN): \"{}{}\"\n",
+                    excerpt.replace('\n', "\\n"),
+                    truncated
+                ));
+            }
             ctx.push('\n');
         }
     }
@@ -1126,6 +1299,121 @@ fn build_context(
     push_step_details(&mut ctx, "Steps in Parent Graph", &parent.graph);
 
     ctx
+}
+
+// ── Output Pattern Analysis ──
+
+/// A group of failed cases that produced the same (or nearly same) output.
+#[derive(Debug)]
+struct OutputPatternGroup {
+    /// Representative output (truncated for display).
+    output_repr: String,
+    /// Number of failed cases with this output.
+    count: usize,
+    /// Case IDs in this group.
+    case_ids: Vec<String>,
+    /// Expected values for cases in this group (for showing what they should have been).
+    expected_excerpts: Vec<String>,
+    /// True if the output is very short (≤3 chars) — likely garbage/truncated.
+    is_short_garbage: bool,
+}
+
+/// Truncate a string to `max` chars, appending "..." if truncated.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max).collect();
+        format!("{}...", truncated)
+    }
+}
+
+/// Summarize expected labels: count occurrences and format as "label(N), label(N), ...".
+fn count_expected_labels(expected: &[String]) -> String {
+    if expected.is_empty() {
+        return "unknown".to_string();
+    }
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for e in expected {
+        if let Some(entry) = counts.iter_mut().find(|(label, _)| label == e) {
+            entry.1 += 1;
+        } else {
+            counts.push((e.clone(), 1));
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts
+        .iter()
+        .map(|(label, count)| {
+            if *count > 1 {
+                format!("{}({})", label, count)
+            } else {
+                label.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Group failed cases by their actual output to surface recurring patterns.
+///
+/// Returns groups with ≥2 cases (single-occurrence outputs are not interesting).
+/// For code-generation benchmarks, outputs are unique per case → returns empty vec.
+fn summarize_output_patterns(cases: &[crate::optimizer::CaseResult]) -> Vec<OutputPatternGroup> {
+    let failed: Vec<&crate::optimizer::CaseResult> =
+        cases.iter().filter(|c| !c.passed).collect();
+    if failed.is_empty() {
+        return vec![];
+    }
+
+    // Extract the "actual output" for each failed case.
+    // For classification: this is the model_response or output_excerpt (the predicted label).
+    // For code-gen: this is typically unique per case.
+    let mut groups: Vec<OutputPatternGroup> = Vec::new();
+    for case in &failed {
+        // Use model_response first (raw LLM output), fall back to output_excerpt
+        let raw_output = case
+            .model_response
+            .as_deref()
+            .or(case.output_excerpt.as_deref())
+            .unwrap_or("");
+        // Normalize: trim whitespace, lowercase for grouping
+        let normalized = raw_output.trim().to_lowercase();
+        // Use first 200 chars for grouping key (avoids grouping by long identical prefixes)
+        let group_key: String = normalized.chars().take(200).collect();
+
+        let case_id = case.case_id.as_deref().unwrap_or("?").to_string();
+        let expected = case
+            .expected_excerpt
+            .as_deref()
+            .unwrap_or("?")
+            .to_string();
+
+        if let Some(entry) = groups.iter_mut().find(|g| {
+            let g_key: String = g.output_repr.trim().to_lowercase().chars().take(200).collect();
+            g_key == group_key
+        }) {
+            entry.count += 1;
+            entry.case_ids.push(case_id);
+            entry.expected_excerpts.push(expected);
+        } else {
+            let repr = truncate_str(raw_output.trim(), 80);
+            let is_short = raw_output.trim().chars().count() <= 3;
+            groups.push(OutputPatternGroup {
+                output_repr: repr,
+                count: 1,
+                case_ids: vec![case_id],
+                expected_excerpts: vec![expected],
+                is_short_garbage: is_short,
+            });
+        }
+    }
+
+    // Only keep groups with ≥2 cases (recurring patterns)
+    groups.retain(|g| g.count >= 2);
+    // Sort by count descending
+    groups.sort_by(|a, b| b.count.cmp(&a.count));
+    groups
 }
 
 #[derive(Debug, Default)]
@@ -1185,6 +1473,176 @@ struct FailureClusterSummary {
     kind: FailureClusterKind,
     count: usize,
     cases: Vec<String>,
+}
+
+/// Suggest relevant motifs based on failure cluster analysis.
+fn suggest_motifs(clusters: &[FailureClusterSummary]) -> Vec<(crate::motifs::Motif, String)> {
+    let mut suggestions = vec![];
+    // Always suggest NormalizeVerify first when any failures exist —
+    // it's the cheapest structural fix and catches format/case/whitespace issues.
+    let total_failures: usize = clusters.iter().map(|c| c.count).sum();
+    if total_failures > 0 {
+        suggestions.push((
+            crate::motifs::Motif::NormalizeVerify,
+            format!("{} failing case(s) — normalize_verify is the cheapest structural fix", total_failures),
+        ));
+    }
+    for cluster in clusters {
+        match cluster.kind {
+            FailureClusterKind::ExactOutputContract => {
+                // Already covered by the blanket NormalizeVerify above, but add specific context
+                suggestions.push((
+                    crate::motifs::Motif::NormalizeVerify,
+                    format!("{} case(s) with exact-output failures (format/case/whitespace)", cluster.count),
+                ));
+            }
+            FailureClusterKind::ApiShapeContract => {
+                suggestions.push((
+                    crate::motifs::Motif::ShortlistSelect,
+                    format!("{} case(s) with label/shape confusion", cluster.count),
+                ));
+            }
+            FailureClusterKind::AlgorithmSearchLogic => {
+                suggestions.push((
+                    crate::motifs::Motif::VoteCritiqueRepair,
+                    format!("{} case(s) with wrong algorithm/logic — critique+repair may catch errors", cluster.count),
+                ));
+                suggestions.push((
+                    crate::motifs::Motif::GenerateValidateRefine,
+                    format!("{} case(s) with wrong algorithm/logic — tool-based validation can verify correctness deterministically", cluster.count),
+                ));
+                suggestions.push((
+                    crate::motifs::Motif::ShortlistSelect,
+                    format!("{} case(s) with wrong algorithm/logic — narrowing candidates before selecting may reduce confusion", cluster.count),
+                ));
+                suggestions.push((
+                    crate::motifs::Motif::RouterExpert,
+                    format!("{} case(s) with wrong algorithm/logic — routing by domain may help if inputs span multiple categories", cluster.count),
+                ));
+            }
+            FailureClusterKind::RuntimeException => {
+                suggestions.push((
+                    crate::motifs::Motif::VoteCritiqueRepair,
+                    format!("{} case(s) with runtime exceptions — critique may catch invalid code", cluster.count),
+                ));
+                suggestions.push((
+                    crate::motifs::Motif::GenerateValidateRefine,
+                    format!("{} case(s) with runtime exceptions — tool-based validation can catch runtime errors deterministically", cluster.count),
+                ));
+            }
+            _ => {} // Other clusters don't have a strong motif mapping
+        }
+    }
+    suggestions.dedup_by(|a, b| std::mem::discriminant(&a.0) == std::mem::discriminant(&b.0));
+    suggestions
+}
+
+// ── Step-Transition Attribution ──
+
+/// Per-step correctness in a multi-step pipeline.
+#[derive(Debug, Clone)]
+struct StepCorrectness {
+    step_name: String,
+    /// Whether this step's output matched expected (approximate).
+    correct: bool,
+}
+
+/// A transition between two adjacent pipeline steps where correctness changed.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct StepTransition {
+    case_id: String,
+    from_step: String,
+    to_step: String,
+    /// true = correct→wrong (corruption), false = wrong→correct (repair)
+    is_corruption: bool,
+}
+
+/// Summary of step-level attribution across all cases.
+#[derive(Debug, Default)]
+struct TransitionSummary {
+    /// Cases where an intermediate step was correct but a later step corrupted the answer.
+    correct_to_wrong: Vec<StepTransition>,
+    /// Cases where an earlier step was wrong but a later step fixed it.
+    wrong_to_correct: Vec<StepTransition>,
+    /// Cases where all steps were correct throughout.
+    all_correct: usize,
+    /// Cases where all steps were wrong throughout.
+    all_wrong: usize,
+}
+
+/// Compute step-transition attribution for multi-step pipelines.
+///
+/// For each case with step_trace.len() >= 2, checks each intermediate step output
+/// against the expected value using simple trim + case-insensitive comparison.
+/// This is appropriate for classification tasks where outputs are short labels.
+fn compute_step_transitions(
+    eval: &EvalResults,
+    _candidate: &CandidateDelta,
+) -> TransitionSummary {
+    let mut summary = TransitionSummary::default();
+
+    for case in eval.train_case_results() {
+        if case.step_trace.len() < 2 {
+            continue;
+        }
+        let expected = match case.expected_excerpt.as_deref() {
+            Some(e) => e.trim(),
+            None => continue,
+        };
+        if expected.is_empty() {
+            continue;
+        }
+
+        let case_id = case.case_id.as_deref().unwrap_or("?").to_string();
+
+        let correctness: Vec<StepCorrectness> = case
+            .step_trace
+            .iter()
+            .map(|(step_name, output)| {
+                let correct = output.trim().eq_ignore_ascii_case(expected);
+                StepCorrectness {
+                    step_name: step_name.clone(),
+                    correct,
+                }
+            })
+            .collect();
+
+        // Check if all correct or all wrong
+        let all_correct = correctness.iter().all(|s| s.correct);
+        let all_wrong = correctness.iter().all(|s| !s.correct);
+        if all_correct {
+            summary.all_correct += 1;
+            continue;
+        }
+        if all_wrong {
+            summary.all_wrong += 1;
+            continue;
+        }
+
+        // Find transitions
+        for window in correctness.windows(2) {
+            let from = &window[0];
+            let to = &window[1];
+            if from.correct && !to.correct {
+                summary.correct_to_wrong.push(StepTransition {
+                    case_id: case_id.clone(),
+                    from_step: from.step_name.clone(),
+                    to_step: to.step_name.clone(),
+                    is_corruption: true,
+                });
+            } else if !from.correct && to.correct {
+                summary.wrong_to_correct.push(StepTransition {
+                    case_id: case_id.clone(),
+                    from_step: from.step_name.clone(),
+                    to_step: to.step_name.clone(),
+                    is_corruption: false,
+                });
+            }
+        }
+    }
+
+    summary
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1250,13 +1708,13 @@ struct StepDetail {
     scope: String,
 }
 
-fn is_seed_candidate(candidate: &Candidate) -> bool {
+fn is_seed_candidate(candidate: &CandidateDelta) -> bool {
     candidate.parent_id.is_none()
         && candidate.mutations.is_empty()
         && candidate.overrides.is_empty()
 }
 
-fn candidate_label(candidate: &Candidate) -> String {
+fn candidate_label(candidate: &CandidateDelta, _eval: &EvalResults) -> String {
     if is_seed_candidate(candidate) {
         "seed".to_string()
     } else {
@@ -1264,26 +1722,27 @@ fn candidate_label(candidate: &Candidate) -> String {
     }
 }
 
-fn candidate_lineage<'a>(archive: &'a Archive, candidate: &'a Candidate) -> Vec<&'a Candidate> {
-    let mut lineage = Vec::new();
-    let mut current = Some(candidate);
-    while let Some(cand) = current {
-        lineage.push(cand);
-        current = cand
+fn candidate_lineage<'a>(archive: &'a Archive, candidate: &'a CandidateDelta) -> Vec<&'a ArchiveEntry> {
+    let mut lineage: Vec<&'a ArchiveEntry> = Vec::new();
+    // Find the entry for the candidate itself
+    let mut current_entry = archive.entries.iter().find(|e| e.delta.id == candidate.id);
+    while let Some(entry) = current_entry {
+        lineage.push(entry);
+        current_entry = entry.delta
             .parent_id
-            .and_then(|pid| archive.candidates.iter().find(|p| p.id == pid));
+            .and_then(|pid| archive.entries.iter().find(|p| p.delta.id == pid));
     }
     lineage.reverse();
     lineage
 }
 
-fn candidate_case_delta(parent: &Candidate, child: &Candidate) -> CaseDelta {
-    let parent_pass: BTreeSet<&str> = parent
-        .passed_case_ids
+fn candidate_case_delta(parent_eval: &EvalResults, child_eval: &EvalResults) -> CaseDelta {
+    let parent_pass: BTreeSet<&str> = parent_eval
+        .train_passed_case_ids()
         .iter()
         .map(|id| id.as_str())
         .collect();
-    let child_pass: BTreeSet<&str> = child.passed_case_ids.iter().map(|id| id.as_str()).collect();
+    let child_pass: BTreeSet<&str> = child_eval.train_passed_case_ids().iter().map(|id| id.as_str()).collect();
 
     let fixed = child_pass
         .difference(&parent_pass)
@@ -1406,10 +1865,11 @@ fn classify_failure_cluster(case: &crate::optimizer::CaseResult) -> FailureClust
     FailureClusterKind::AlgorithmSearchLogic
 }
 
-fn summarize_failure_clusters(candidate: &Candidate) -> Vec<FailureClusterSummary> {
+fn summarize_failure_clusters(eval: &EvalResults) -> Vec<FailureClusterSummary> {
     let mut grouped: BTreeMap<FailureClusterKind, FailureClusterSummary> = BTreeMap::new();
 
-    for case in &candidate.case_results {
+    // Use train results (val is blinded)
+    for case in eval.train_case_results() {
         let kind = classify_failure_cluster(case);
         let entry = grouped
             .entry(kind)
@@ -1435,10 +1895,11 @@ fn summarize_failure_clusters(candidate: &Candidate) -> Vec<FailureClusterSummar
     summaries
 }
 
-fn summarize_repair_behavior(candidate: &Candidate, ir: &ScaffoldIR) -> RepairBehaviorSummary {
+fn summarize_repair_behavior(candidate: &CandidateDelta, eval: &EvalResults, ir: &ScaffoldIR) -> RepairBehaviorSummary {
     let mut summary = RepairBehaviorSummary::default();
 
-    for case in &candidate.case_results {
+    // Use train results (val is blinded)
+    for case in eval.train_case_results() {
         let case_id = case
             .case_id
             .as_deref()
@@ -1448,11 +1909,13 @@ fn summarize_repair_behavior(candidate: &Candidate, ir: &ScaffoldIR) -> RepairBe
         // Collect prompt/agent outputs with their step→node mapping
         let mut prompt_steps: Vec<(String, String, &str)> = Vec::new(); // (step, node, value)
         let mut non_agent_outputs: Vec<&str> = Vec::new();
+        let mut all_steps: Vec<(String, String)> = Vec::new(); // (step, node) in execution order
 
         for (step_name, value) in &case.step_trace {
             let node_name = find_step_node(&candidate.graph.body, step_name)
                 .unwrap_or_else(|| "?".to_string());
             let kind = node_kind_label(ir, &node_name, &candidate.overrides);
+            all_steps.push((step_name.clone(), node_name.clone()));
             if kind == "prompt" || kind == "agent" {
                 prompt_steps.push((step_name.clone(), node_name, value.as_str()));
             } else {
@@ -1471,8 +1934,22 @@ fn summarize_repair_behavior(candidate: &Candidate, ir: &ScaffoldIR) -> RepairBe
             continue;
         }
 
-        // The repair node is the last prompt/agent step (e.g. fix_code)
-        let repair_node = prompt_steps.last().map(|(_, node, _)| node.clone());
+        // The repair node is the last step UNLESS it's a repeated evaluator
+        // (same node appeared earlier — e.g. eval_exercise runs after each attempt).
+        // In that case, the second-to-last step is the actual repair node.
+        let repair_node = if all_steps.len() >= 2 {
+            let last_node = &all_steps[all_steps.len() - 1].1;
+            let is_repeated = all_steps[..all_steps.len() - 1]
+                .iter()
+                .any(|(_, n)| n == last_node);
+            if is_repeated {
+                Some(all_steps[all_steps.len() - 2].1.clone())
+            } else {
+                Some(last_node.clone())
+            }
+        } else {
+            all_steps.last().map(|(_, node)| node.clone())
+        };
 
         let prompt_same = prompt_steps.len() >= 2 && {
             let a = prompt_steps[prompt_steps.len() - 2].2;
@@ -1531,25 +2008,25 @@ fn format_delta_list(deltas: &[f64]) -> String {
     }
 }
 
-fn mutation_group_trend(group: &[&Candidate], archive: &Archive) -> MutationTrendSummary {
-    let mut ordered: Vec<&Candidate> = group.to_vec();
-    ordered.sort_by_key(|candidate| candidate.id);
+fn mutation_group_trend(group: &[&ArchiveEntry], archive: &Archive) -> MutationTrendSummary {
+    let mut ordered: Vec<&ArchiveEntry> = group.to_vec();
+    ordered.sort_by_key(|entry| entry.delta.id);
 
     let deltas: Vec<f64> = ordered
         .iter()
-        .map(|candidate| {
-            let parent_score = candidate
+        .map(|entry| {
+            let parent_score = entry.delta
                 .parent_id
-                .and_then(|pid| archive.candidates.iter().find(|parent| parent.id == pid))
-                .and_then(|parent| parent.score)
+                .and_then(|pid| archive.entries.iter().find(|parent| parent.delta.id == pid))
+                .and_then(|parent| parent.eval.score())
                 .unwrap_or(0.0);
-            candidate.score.unwrap_or(0.0) - parent_score
+            entry.eval.score().unwrap_or(0.0) - parent_score
         })
         .collect();
 
     let best_score = ordered
         .iter()
-        .filter_map(|candidate| candidate.score)
+        .filter_map(|entry| entry.eval.score())
         .fold(f64::NEG_INFINITY, f64::max);
     let ever_improved = deltas.iter().any(|delta| *delta > 0.0);
     let recent_deltas = if deltas.len() > 3 {
@@ -1582,17 +2059,90 @@ fn mutation_group_trend(group: &[&Candidate], archive: &Archive) -> MutationTren
     }
 }
 
+/// Detect whether content-only mutations have plateaued.
+///
+/// Returns `(plateaued, count)` where `plateaued` is true if the last 3 consecutive
+/// content mutations all had delta <= 0 (no improvement).
+fn content_plateau_indicator(archive: &Archive, epoch_start: usize) -> (bool, usize) {
+    let content_kinds = [
+        "rewrite_prompt", "rewrite_system", "rewrite_shell", "rewrite_tool_spec", "set_config",
+    ];
+    let content_entries: Vec<&ArchiveEntry> = archive
+        .entries
+        .iter()
+        .filter(|e| {
+            e.eval.score().is_some()
+                && e.delta.id >= epoch_start
+                && e.delta.mutations.last().map(|m| {
+                    let label = m.short_label();
+                    content_kinds.iter().any(|k| label.starts_with(k))
+                }).unwrap_or(false)
+        })
+        .collect();
+
+    let count = content_entries.len();
+    if count < 3 {
+        return (false, count);
+    }
+
+    // Check last 3 content mutations for non-positive deltas
+    let last_3: Vec<f64> = content_entries[content_entries.len() - 3..]
+        .iter()
+        .map(|entry| {
+            let parent_score = entry.delta
+                .parent_id
+                .and_then(|pid| archive.entries.iter().find(|p| p.delta.id == pid))
+                .and_then(|p| p.eval.score())
+                .unwrap_or(0.0);
+            entry.eval.score().unwrap_or(0.0) - parent_score
+        })
+        .collect();
+
+    let plateaued = last_3.iter().all(|d| *d <= 0.0);
+    (plateaued, count)
+}
+
+/// Return mutation short_labels whose trend is saturated within the current epoch.
+///
+/// Used by `propose_mutation` to hard-block the meta-agent from repeating exhausted
+/// mutation families.
+fn compute_saturated_families(archive: &Archive, epoch_start: usize) -> Vec<String> {
+    let evaluated: Vec<&ArchiveEntry> = archive
+        .entries
+        .iter()
+        .filter(|e| e.eval.score().is_some() && !e.delta.mutations.is_empty() && e.delta.id >= epoch_start)
+        .collect();
+    let mut groups: Vec<(String, Vec<&ArchiveEntry>)> = Vec::new();
+    for entry in &evaluated {
+        let label = entry.delta
+            .mutations
+            .last()
+            .map(|m| m.short_label())
+            .unwrap_or_default();
+        if let Some(grp) = groups.iter_mut().find(|(l, _)| *l == label) {
+            grp.1.push(entry);
+        } else {
+            groups.push((label, vec![entry]));
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|(_, g)| mutation_group_trend(g.as_slice(), archive).saturated)
+        .map(|(label, _)| label)
+        .collect()
+}
+
 fn stagnation_count_after_best(archive: &Archive, epoch_start: usize) -> usize {
     let best_id = archive.ranked()
         .into_iter()
-        .filter(|c| c.id >= epoch_start)
-        .map(|c| c.id)
+        .filter(|e| e.delta.id >= epoch_start)
+        .map(|e| e.delta.id)
         .next()
         .unwrap_or(0);
     archive
-        .candidates
+        .entries
         .iter()
-        .filter(|candidate| candidate.score.is_some() && candidate.id > best_id && candidate.id >= epoch_start)
+        .filter(|e| e.eval.score().is_some() && e.delta.id > best_id && e.delta.id >= epoch_start)
         .count()
 }
 
@@ -1627,26 +2177,26 @@ fn structural_pressure_summary(
         ));
     }
 
-    let evaluated: Vec<&Candidate> = archive
-        .candidates
+    let evaluated: Vec<&ArchiveEntry> = archive
+        .entries
         .iter()
-        .filter(|candidate| candidate.score.is_some() && !candidate.mutations.is_empty() && candidate.id >= epoch_start)
+        .filter(|e| e.eval.score().is_some() && !e.delta.mutations.is_empty() && e.delta.id >= epoch_start)
         .collect();
     let mut saturated_families = 0usize;
-    let mut groups: Vec<(String, Vec<&Candidate>)> = Vec::new();
-    for candidate in evaluated {
-        let label = candidate
+    let mut groups: Vec<(String, Vec<&ArchiveEntry>)> = Vec::new();
+    for entry in evaluated {
+        let label = entry.delta
             .mutations
             .last()
             .map(|mutation| mutation.short_label())
             .unwrap_or_default();
-        if let Some(entry) = groups
+        if let Some(grp) = groups
             .iter_mut()
             .find(|(group_label, _)| *group_label == label)
         {
-            entry.1.push(candidate);
+            grp.1.push(entry);
         } else {
-            groups.push((label, vec![candidate]));
+            groups.push((label, vec![entry]));
         }
     }
     for (_label, group) in groups {
@@ -1821,7 +2371,7 @@ fn format_overrides_inline(
         .join(", ")
 }
 
-fn push_candidate_overrides(ctx: &mut String, title: &str, candidate: &Candidate) {
+fn push_candidate_overrides(ctx: &mut String, title: &str, candidate: &CandidateDelta) {
     ctx.push_str(&format!("## {}\n", title));
     if candidate.overrides.is_empty() {
         ctx.push_str("none\n");
@@ -1845,7 +2395,7 @@ fn push_candidate_overrides(ctx: &mut String, title: &str, candidate: &Candidate
 fn push_candidate_node_state(
     ctx: &mut String,
     title: &str,
-    candidate: &Candidate,
+    candidate: &CandidateDelta,
     ir: &ScaffoldIR,
 ) {
     ctx.push_str(&format!("## {}\n", title));
@@ -1883,7 +2433,7 @@ fn push_candidate_node_state(
     }
 }
 
-fn active_node_config_summary(candidate: &Candidate, node: &NodeIR) -> Option<String> {
+fn active_node_config_summary(candidate: &CandidateDelta, node: &NodeIR) -> Option<String> {
     let mut parts = Vec::new();
     let prefix = format!("{}.", node.name);
 
@@ -1949,7 +2499,7 @@ fn active_node_config_summary(candidate: &Candidate, node: &NodeIR) -> Option<St
     }
 }
 
-fn synthetic_node_config_summary(candidate: &Candidate, node_name: &str) -> String {
+fn synthetic_node_config_summary(candidate: &CandidateDelta, node_name: &str) -> String {
     let prefix = format!("{}.", node_name);
     let mut parts = Vec::new();
 
@@ -2045,7 +2595,7 @@ fn format_step_arg_for_meta(arg: &StepArgIR) -> String {
 fn push_lineage_evidence(
     ctx: &mut String,
     archive: &Archive,
-    lineage: &[&Candidate],
+    lineage: &[&ArchiveEntry],
     ir: &ScaffoldIR,
 ) {
     if lineage.len() <= 1 {
@@ -2056,15 +2606,15 @@ fn push_lineage_evidence(
     ctx.push_str("Raw failure evidence for cases each lineage mutation fixed or broke. For fixed cases, evidence is taken from the parent failure that the child resolved.\n\n");
 
     for window in lineage.windows(2) {
-        let parent = window[0];
-        let child = window[1];
-        let delta = candidate_case_delta(parent, child);
+        let parent_entry = window[0];
+        let child_entry = window[1];
+        let delta = candidate_case_delta(&parent_entry.eval, &child_entry.eval);
         ctx.push_str(&format!(
             "### {} from {}\n",
-            candidate_label(child),
-            candidate_label(parent)
+            candidate_label(&child_entry.delta, &child_entry.eval),
+            candidate_label(&parent_entry.delta, &parent_entry.eval)
         ));
-        for mutation in &child.mutations {
+        for mutation in &child_entry.delta.mutations {
             ctx.push_str(&format!(
                 "Exact mutation: {}\n",
                 format_mutation_for_meta(mutation)
@@ -2082,35 +2632,35 @@ fn push_lineage_evidence(
         }
 
         for case_id in delta.fixed.iter().take(3) {
-            if let Some(case) = find_case_result(parent, case_id) {
+            if let Some(case) = find_case_result(&parent_entry.eval, case_id) {
                 ctx.push_str(&format!(
                     "Pre-fix failure evidence from {}:\n",
-                    candidate_label(parent)
+                    candidate_label(&parent_entry.delta, &parent_entry.eval)
                 ));
                 ctx.push_str(&format!(
                     "Child outcome: F -> P (resolved in {})\n",
-                    candidate_label(child)
+                    candidate_label(&child_entry.delta, &child_entry.eval)
                 ));
-                push_case_evidence(ctx, parent, case, ir, 2500, None);
+                push_case_evidence(ctx, &parent_entry.delta, case, ir, 2500, None);
             }
         }
 
         for case_id in delta.broken.iter().take(3) {
-            if let Some(case) = find_case_result(child, case_id) {
+            if let Some(case) = find_case_result(&child_entry.eval, case_id) {
                 ctx.push_str(&format!(
                     "Regression evidence from {}:\n",
-                    candidate_label(child)
+                    candidate_label(&child_entry.delta, &child_entry.eval)
                 ));
                 ctx.push_str(&format!(
                     "Child outcome: P -> F (regressed in {})\n",
-                    candidate_label(child)
+                    candidate_label(&child_entry.delta, &child_entry.eval)
                 ));
-                push_case_evidence(ctx, child, case, ir, 2500, None);
+                push_case_evidence(ctx, &child_entry.delta, case, ir, 2500, None);
             }
         }
 
         if let Some(best) = archive.best() {
-            if best.id == child.id {
+            if best.delta.id == child_entry.delta.id {
                 ctx.push_str("This mutation is currently on the best-known path.\n");
             }
         }
@@ -2124,20 +2674,21 @@ fn push_lineage_evidence(
 fn push_changed_case_traces(
     ctx: &mut String,
     archive: &Archive,
-    parent: &Candidate,
+    parent: &CandidateDelta,
+    parent_eval: &EvalResults,
     ir: &ScaffoldIR,
 ) {
     // Find the grandparent (parent's parent)
     let grandparent = parent
         .parent_id
-        .and_then(|pid| archive.candidates.iter().find(|c| c.id == pid));
+        .and_then(|pid| archive.entries.iter().find(|e| e.delta.id == pid));
 
     let grandparent = match grandparent {
         Some(gp) => gp,
         None => return, // seed candidate, no prior generation to compare
     };
 
-    let delta = candidate_case_delta(grandparent, parent);
+    let delta = candidate_case_delta(&grandparent.eval, parent_eval);
     if delta.fixed.is_empty() && delta.broken.is_empty() {
         return; // no flips, nothing to show
     }
@@ -2147,7 +2698,7 @@ fn push_changed_case_traces(
 
     // Fixed cases: show the parent's trace (the successful execution)
     for case_id in &delta.fixed {
-        if let Some(case) = find_case_result(parent, case_id) {
+        if let Some(case) = find_case_result(parent_eval, case_id) {
             ctx.push_str(&format!("### {} (FIXED: F → P)\n", case_id));
             push_case_evidence(ctx, parent, case, ir, 4000, None);
         }
@@ -2155,7 +2706,7 @@ fn push_changed_case_traces(
 
     // Broken cases: show the parent's trace (the failing execution)
     for case_id in &delta.broken {
-        if let Some(case) = find_case_result(parent, case_id) {
+        if let Some(case) = find_case_result(parent_eval, case_id) {
             ctx.push_str(&format!("### {} (BROKEN: P → F)\n", case_id));
             push_case_evidence(ctx, parent, case, ir, 4000, None);
         }
@@ -2164,18 +2715,19 @@ fn push_changed_case_traces(
 }
 
 fn find_case_result<'a>(
-    candidate: &'a Candidate,
+    eval: &'a EvalResults,
     case_id: &str,
 ) -> Option<&'a crate::optimizer::CaseResult> {
-    candidate
-        .case_results
+    // Search train results (val case_results are blinded)
+    eval
+        .train_case_results()
         .iter()
         .find(|case| case.case_id.as_deref() == Some(case_id))
 }
 
 fn push_case_evidence(
     ctx: &mut String,
-    candidate: &Candidate,
+    candidate: &CandidateDelta,
     case: &crate::optimizer::CaseResult,
     ir: &ScaffoldIR,
     max_chars: usize,
@@ -2295,8 +2847,13 @@ fn node_kind_label(
     node_name: &str,
     overrides: &std::collections::HashMap<String, serde_json::Value>,
 ) -> &'static str {
-    if overrides.contains_key(&format!("_node.{}", node_name)) {
-        return "prompt";
+    if let Some(val) = overrides.get(&format!("_node.{}", node_name)) {
+        return match val.get("kind").and_then(|v| v.as_str()) {
+            Some("tool") => "tool",
+            Some("agent") => "agent",
+            Some("verify") => "verify",
+            _ => "prompt",
+        };
     }
 
     match ir
@@ -2416,13 +2973,16 @@ fn parse_proposal(
 
     // Content rewrites (prompt/system/shell) are always allowed — they don't change
     // graph structure. Structural mutations must be in the topology's allowed list.
-    // edit_graph is allowed when any structural mutation is in the allowed list (it subsumes all).
-    let content_mutations = ["rewrite_prompt", "rewrite_system", "rewrite_shell"];
+    // propose_decomposition is allowed when any structural mutation is in the allowed list.
+    let content_mutations = [
+        "rewrite_prompt", "rewrite_system", "rewrite_shell", "rewrite_tool_spec",
+        "attach_example_policy", "add_local_checker",
+    ];
     let has_any_structural = allowed_mutations
         .iter()
         .any(|m| STRUCTURAL_MUTATIONS.contains(&m.as_str()));
     if !content_mutations.contains(&kind)
-        && !(kind == "edit_graph" && has_any_structural)
+        && !(kind == "propose_decomposition" && has_any_structural)
         && !allowed_mutations.contains(&kind.to_string())
     {
         return Err(Error::Runtime(format!(
@@ -2623,24 +3183,70 @@ fn parse_proposal(
             validate_node_exists(ir, &node, Some(NodeKindIR::Tool))?;
             Mutation::RewriteShell { node, new_shell }
         }
-        "edit_graph" => {
-            let graph_source = require_str(&json, "graph")?;
-            let description = require_str(&json, "description")?;
-            let new_node_sources: Vec<String> = json
-                .get("new_nodes")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
+        "rewrite_tool_spec" => {
+            let node = require_str(&json, "node")?;
+            validate_node_exists(ir, &node, Some(NodeKindIR::Tool))?;
+            let spec_value = json.get("spec").ok_or_else(|| {
+                Error::Runtime("meta-agent response missing 'spec' field for rewrite_tool_spec".into())
+            })?;
+            let spec: crate::mutations::ToolSpec = serde_json::from_value(spec_value.clone())
+                .map_err(|e| Error::Runtime(format!("invalid tool spec: {}", e)))?;
+            if spec.argv.is_empty() {
+                return Err(Error::Runtime("rewrite_tool_spec: argv must not be empty".into()));
+            }
+            Mutation::RewriteToolSpec { node, spec }
+        }
+        "propose_decomposition" => {
+            let target_step = require_str(&json, "target_step")?;
+            let motif_str = require_str(&json, "motif")?;
+            let reason = json
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let motif: crate::motifs::Motif = serde_json::from_value(serde_json::json!(motif_str))
+                .map_err(|e| Error::Runtime(format!(
+                    "invalid motif '{}': {}. Valid motifs: normalize_verify, shortlist_select, router_expert, retrieve_decide, vote_critique_repair",
+                    motif_str, e
+                )))?;
+            validate_step_exists(parent_graph, &target_step)?;
+            let config: std::collections::HashMap<String, serde_json::Value> = json
+                .get("config")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
-            let (new_graph, new_nodes) =
-                parse_and_validate_graph_edit(&graph_source, &new_node_sources, parent_graph, ir, objective)?;
-            Mutation::EditGraph {
-                new_graph,
-                new_nodes,
-                description,
+            // Validate the motif can be applied
+            crate::motifs::apply_motif(&motif, parent_graph, &target_step, &config, ir)
+                .map_err(|e| Error::Runtime(format!("propose_decomposition: {}", e)))?;
+            Mutation::ProposeDecomposition {
+                target_step,
+                motif,
+                reason,
+                config,
+            }
+        }
+        "attach_example_policy" => {
+            let node = require_str(&json, "node")?;
+            validate_node_exists(ir, &node, None)?;
+            let policy_value = json.get("policy").ok_or_else(|| {
+                Error::Runtime("meta-agent response missing 'policy' field for attach_example_policy".into())
+            })?;
+            let policy: crate::example_bank::ExamplePolicy =
+                serde_json::from_value(policy_value.clone())
+                    .map_err(|e| Error::Runtime(format!("invalid example policy: {}", e)))?;
+            if policy.k == 0 {
+                return Err(Error::Runtime("attach_example_policy: k must be > 0".into()));
+            }
+            Mutation::AttachExamplePolicy { node, policy }
+        }
+        "add_local_checker" => {
+            let node = require_str(&json, "node")?;
+            let checker_name = require_str(&json, "checker_name")?;
+            let expr = require_str(&json, "expr")?;
+            validate_node_exists(ir, &node, None)?;
+            Mutation::AddLocalChecker {
+                node,
+                checker_name,
+                expr,
             }
         }
         other => {
@@ -2664,162 +3270,6 @@ fn require_str(json: &serde_json::Value, field: &str) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| Error::Runtime(format!("meta-agent response missing '{}' field", field)))
-}
-
-/// Parse and validate an edit_graph proposal.
-///
-/// 1. Build combined source: type defs + new node sources + graph source
-/// 2. Parse + lower via scaffold_ir::parse_and_lower()
-/// 3. Extract graph by name — reject if graph name doesn't match parent's
-/// 4. Validate input/output types match parent's
-/// 5. Validate preserved steps exist in new graph
-/// 6. Validate node references — every step references a known node
-/// 7. Check topology constraints (max_nodes, max_depth)
-/// 8. Extract new/modified nodes from lowered IR
-fn parse_and_validate_graph_edit(
-    graph_source: &str,
-    new_node_sources: &[String],
-    parent_graph: &GraphIR,
-    ir: &ScaffoldIR,
-    objective: &ObjectiveIR,
-) -> Result<(GraphIR, Vec<NodeIR>)> {
-    // 1. Build combined source for parsing.
-    // Include type definitions so the parser can resolve named types.
-    let mut combined = String::new();
-    for td in &ir.types {
-        combined.push_str(&format!(
-            "type {} = {}\n",
-            td.name,
-            scaffold_ir::pretty::format_type(&td.ty)
-        ));
-    }
-    // Include new node sources
-    for ns in new_node_sources {
-        combined.push_str(ns);
-        combined.push('\n');
-    }
-    // Include graph source
-    combined.push_str(graph_source);
-    combined.push('\n');
-
-    // 2. Parse + lower
-    let lowered = scaffold_ir::parse_and_lower(&combined).map_err(|e| {
-        Error::Runtime(format!("edit_graph: failed to parse .scaffold source: {}", e))
-    })?;
-
-    // 3. Extract graph by name
-    let new_graph = lowered
-        .graphs
-        .iter()
-        .find(|g| g.name == parent_graph.name)
-        .ok_or_else(|| {
-            Error::Runtime(format!(
-                "edit_graph: graph '{}' not found in source (found: [{}])",
-                parent_graph.name,
-                lowered.graphs.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", ")
-            ))
-        })?
-        .clone();
-
-    // 4. Validate input/output types match parent's
-    let parent_input = scaffold_ir::pretty::format_type(&parent_graph.input);
-    let new_input = scaffold_ir::pretty::format_type(&new_graph.input);
-    if parent_input != new_input {
-        return Err(Error::Runtime(format!(
-            "edit_graph: input type mismatch — parent has '{}', new graph has '{}'",
-            parent_input, new_input
-        )));
-    }
-    let parent_output = scaffold_ir::pretty::format_type(&parent_graph.output);
-    let new_output = scaffold_ir::pretty::format_type(&new_graph.output);
-    if parent_output != new_output {
-        return Err(Error::Runtime(format!(
-            "edit_graph: output type mismatch — parent has '{}', new graph has '{}'",
-            parent_output, new_output
-        )));
-    }
-
-    // 5. Validate preserved steps exist
-    if let Some(ref topo) = objective.topology {
-        for preserved in &topo.preserve {
-            if !crate::mutations::step_exists_pub(&new_graph.body, preserved) {
-                return Err(Error::Runtime(format!(
-                    "edit_graph: preserved step '{}' missing from new graph",
-                    preserved
-                )));
-            }
-        }
-    }
-
-    // 6. Validate node references — every step must reference a known node
-    let known_node_names: std::collections::HashSet<String> = ir
-        .nodes
-        .iter()
-        .map(|n| n.name.clone())
-        .chain(lowered.nodes.iter().map(|n| n.name.clone()))
-        .chain(ir.graphs.iter().map(|g| g.name.clone()))
-        .collect();
-    validate_node_refs_in_stmts(&new_graph.body, &known_node_names)?;
-
-    // 7. Check topology constraints
-    if let Some(ref topo) = objective.topology {
-        let violations = crate::mutations::check_constraints(&new_graph, topo);
-        if !violations.is_empty() {
-            return Err(Error::Runtime(format!(
-                "edit_graph: topology constraint violations: {}",
-                violations.join("; ")
-            )));
-        }
-    }
-
-    // 8. Extract new/modified nodes from lowered IR
-    let new_nodes: Vec<NodeIR> = lowered
-        .nodes
-        .into_iter()
-        .filter(|n| {
-            // Only include nodes that are NOT in the original IR, or that have changed config
-            !ir.nodes.iter().any(|orig| orig.name == n.name)
-        })
-        .collect();
-
-    Ok((new_graph, new_nodes))
-}
-
-/// Recursively validate that all steps reference known nodes.
-fn validate_node_refs_in_stmts(
-    stmts: &[GraphStmtIR],
-    known: &std::collections::HashSet<String>,
-) -> Result<()> {
-    for stmt in stmts {
-        match stmt {
-            GraphStmtIR::Step(s) => {
-                if !known.contains(&s.node) {
-                    return Err(Error::Runtime(format!(
-                        "edit_graph: step '{}' references unknown node '{}'",
-                        s.name, s.node
-                    )));
-                }
-            }
-            GraphStmtIR::Loop(l) => validate_node_refs_in_stmts(&l.body, known)?,
-            GraphStmtIR::If(i) => {
-                validate_node_refs_in_stmts(&i.then_body, known)?;
-                validate_node_refs_in_stmts(&i.else_body, known)?;
-            }
-            GraphStmtIR::Parallel(p) => validate_node_refs_in_stmts(&p.body, known)?,
-            GraphStmtIR::Choose(c) => {
-                for alt in &c.alternatives {
-                    if !known.contains(alt) {
-                        return Err(Error::Runtime(format!(
-                            "edit_graph: choose references unknown node/graph '{}'",
-                            alt
-                        )));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 fn validate_step_exists(graph: &GraphIR, step_name: &str) -> Result<()> {
@@ -2892,10 +3342,38 @@ fn validate_template_variables(
     let known_fields = match ir.nodes.iter().find(|n| n.name == node_name) {
         Some(n) => resolve_input_fields(ir, n),
         None => {
-            // Synthetic node (from AddPromptStep): allowed vars = input + graph input fields
+            // Synthetic node (from motif or AddPromptStep): allowed vars = input + graph
+            // input fields + named arguments from the step that invokes this node.
             if let Some(graph) = parent_graph {
                 let mut vars = vec!["input".to_string()];
                 vars.extend(crate::mutations::resolve_graph_input_fields(graph, ir));
+                // Find steps that invoke this node and add their named arg names.
+                // This covers motif-wired variables like `proposed`, `critique`,
+                // `feedback`, `candidates`, `raw`, `retrieved`, etc.
+                fn collect_step_args(body: &[GraphStmtIR], node_name: &str, vars: &mut Vec<String>) {
+                    for stmt in body {
+                        match stmt {
+                            GraphStmtIR::Step(s) if s.node == node_name => {
+                                for arg in &s.args {
+                                    if let StepArgIR::Named { name, .. } = arg {
+                                        if !vars.contains(name) {
+                                            vars.push(name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            GraphStmtIR::Loop(l) => {
+                                collect_step_args(&l.body, node_name, vars);
+                            }
+                            GraphStmtIR::If(i) => {
+                                collect_step_args(&i.then_body, node_name, vars);
+                                collect_step_args(&i.else_body, node_name, vars);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                collect_step_args(&graph.body, node_name, &mut vars);
                 vars
             } else {
                 return Ok(()); // can't validate without graph context
@@ -3072,7 +3550,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::mutations::GraphDescriptor;
-    use crate::optimizer::CaseResult;
+    use crate::optimizer::{BlindEval, CaseResult, TrainEval};
 
     fn make_test_graph() -> GraphIR {
         GraphIR {
@@ -3169,6 +3647,7 @@ mod tests {
                 .into_iter()
                 .map(|(step, value)| (step.to_string(), value.to_string()))
                 .collect(),
+            expected_excerpt: None,
         }
     }
 
@@ -3183,26 +3662,38 @@ mod tests {
         passed_case_ids: Vec<&str>,
         graph: &GraphIR,
         ir: &ScaffoldIR,
-    ) -> Candidate {
-        Candidate {
+    ) -> (CandidateDelta, EvalResults) {
+        let passed_ids: Vec<String> = passed_case_ids
+            .into_iter()
+            .map(|case| case.to_string())
+            .collect();
+        let delta = CandidateDelta {
             id,
             parent_id,
             graph: graph.clone(),
             overrides: HashMap::new(),
             mutations,
-            score: Some(score),
-            metric_scores: HashMap::new(),
             descriptor: GraphDescriptor::from_graph(graph, ir),
             children_count: 0,
             meta_reasoning: None,
-            case_results,
-            total_cases,
-            cases_passed,
-            passed_case_ids: passed_case_ids
-                .into_iter()
-                .map(|case| case.to_string())
-                .collect(),
-        }
+        };
+        let eval = EvalResults {
+            val: Some(BlindEval {
+                score,
+                metric_scores: HashMap::new(),
+                total: total_cases,
+                passed: cases_passed,
+            }),
+            train: Some(TrainEval {
+                score,
+                metric_scores: HashMap::new(),
+                cases: case_results,
+                total: total_cases,
+                passed: cases_passed,
+                passed_case_ids: passed_ids,
+            }),
+        };
+        (delta, eval)
     }
 
     fn make_objective() -> ObjectiveIR {
@@ -3227,7 +3718,7 @@ mod tests {
     fn test_failure_clusters_group_distinct_contracts() {
         let ir = make_test_ir();
         let graph = make_test_graph();
-        let candidate = make_candidate(
+        let (_delta, eval) = make_candidate(
             0,
             None,
             0.2,
@@ -3256,7 +3747,7 @@ mod tests {
             &ir,
         );
 
-        let clusters = summarize_failure_clusters(&candidate);
+        let clusters = summarize_failure_clusters(&eval);
         let as_map: HashMap<&str, usize> = clusters
             .iter()
             .map(|cluster| (cluster.kind.label(), cluster.count))
@@ -3271,7 +3762,7 @@ mod tests {
     fn test_repair_behavior_detects_noop_and_changed_attempts() {
         let ir = make_test_ir();
         let graph = make_test_graph();
-        let candidate = make_candidate(
+        let (delta, eval) = make_candidate(
             0,
             None,
             0.2,
@@ -3317,7 +3808,7 @@ mod tests {
             &ir,
         );
 
-        let summary = summarize_repair_behavior(&candidate, &ir);
+        let summary = summarize_repair_behavior(&delta, &eval, &ir);
         assert_eq!(summary.no_op, 1);
         assert_eq!(summary.changed_unresolved, 1);
         assert_eq!(summary.no_repair_signal, 0);
@@ -3339,7 +3830,7 @@ mod tests {
         // When repair produces different code but the same error signature → SameError
         let ir = make_test_ir();
         let graph = make_test_graph();
-        let candidate = make_candidate(
+        let (delta, eval) = make_candidate(
             0,
             None,
             0.2,
@@ -3367,7 +3858,7 @@ mod tests {
             &ir,
         );
 
-        let summary = summarize_repair_behavior(&candidate, &ir);
+        let summary = summarize_repair_behavior(&delta, &eval, &ir);
         assert_eq!(summary.no_op, 1); // SameError also counts as no_op
         assert_eq!(summary.per_case.len(), 1);
         assert_eq!(summary.per_case[0].outcome, RepairOutcome::SameError);
@@ -3378,7 +3869,7 @@ mod tests {
         // When only one prompt step exists → SingleAttempt
         let ir = make_test_ir();
         let graph = make_test_graph();
-        let candidate = make_candidate(
+        let (delta, eval) = make_candidate(
             0,
             None,
             0.2,
@@ -3401,7 +3892,7 @@ mod tests {
             &ir,
         );
 
-        let summary = summarize_repair_behavior(&candidate, &ir);
+        let summary = summarize_repair_behavior(&delta, &eval, &ir);
         assert_eq!(summary.no_repair_signal, 1);
         assert_eq!(summary.per_case.len(), 1);
         assert_eq!(summary.per_case[0].outcome, RepairOutcome::SingleAttempt);
@@ -3411,8 +3902,8 @@ mod tests {
     fn test_mutation_group_trend_flags_recent_saturation() {
         let ir = make_test_ir();
         let graph = make_test_graph();
-        let seed = make_candidate(0, None, 0.2, vec![], vec![], 0, 0, vec![], &graph, &ir);
-        let child1 = make_candidate(
+        let (seed_d, seed_e) = make_candidate(0, None, 0.2, vec![], vec![], 0, 0, vec![], &graph, &ir);
+        let (child1_d, child1_e) = make_candidate(
             1,
             Some(0),
             0.3,
@@ -3427,7 +3918,7 @@ mod tests {
             &graph,
             &ir,
         );
-        let child2 = make_candidate(
+        let (child2_d, child2_e) = make_candidate(
             2,
             Some(1),
             0.3,
@@ -3442,7 +3933,7 @@ mod tests {
             &graph,
             &ir,
         );
-        let child3 = make_candidate(
+        let (child3_d, child3_e) = make_candidate(
             3,
             Some(2),
             0.28,
@@ -3459,15 +3950,15 @@ mod tests {
         );
 
         let mut archive = Archive::new();
-        archive.add(seed);
-        archive.add(child1);
-        archive.add(child2);
-        archive.add(child3);
+        archive.add(seed_d, seed_e);
+        archive.add(child1_d, child1_e);
+        archive.add(child2_d, child2_e);
+        archive.add(child3_d, child3_e);
         let trend = mutation_group_trend(
             &[
-                &archive.candidates[1],
-                &archive.candidates[2],
-                &archive.candidates[3],
+                &archive.entries[1],
+                &archive.entries[2],
+                &archive.entries[3],
             ],
             &archive,
         );
@@ -3487,7 +3978,7 @@ mod tests {
         let graph = make_test_graph();
         let objective = make_objective();
 
-        let seed = make_candidate(
+        let (seed_d, seed_e) = make_candidate(
             0,
             None,
             0.2,
@@ -3499,7 +3990,7 @@ mod tests {
             &graph,
             &ir,
         );
-        let parent = make_candidate(
+        let (parent_d, parent_e) = make_candidate(
             1,
             Some(0),
             0.25,
@@ -3541,7 +4032,7 @@ mod tests {
             &graph,
             &ir,
         );
-        let flat_child = make_candidate(
+        let (flat_d, flat_e) = make_candidate(
             2,
             Some(1),
             0.25,
@@ -3558,12 +4049,13 @@ mod tests {
         );
 
         let mut archive = Archive::new();
-        archive.add(seed);
-        archive.add(parent.clone());
-        archive.add(flat_child);
+        archive.add(seed_d, seed_e);
+        archive.add(parent_d, parent_e);
+        archive.add(flat_d, flat_e);
 
         let ctx = build_context(
-            &archive.candidates[1],
+            &archive.entries[1].delta,
+            &archive.entries[1].eval,
             &archive,
             &ir,
             &objective,
@@ -3578,248 +4070,4 @@ mod tests {
         assert!(ctx.contains("exact-output-contract") || ctx.contains("api-shape-contract"));
     }
 
-    // ── edit_graph tests ──
-
-    #[test]
-    fn test_parse_and_validate_graph_edit_valid() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph();
-        let objective = make_objective();
-
-        let graph_source = r#"
-            graph solve {
-                in: string
-                out: string
-                step attempt1 = solve_code(input)
-                step result1 = eval_exercise(attempt1)
-                step attempt2 = fix_code(attempt1)
-                step result2 = eval_exercise(attempt2)
-                emit result2
-            }
-        "#;
-
-        let (new_graph, new_nodes) =
-            parse_and_validate_graph_edit(graph_source, &[], &parent_graph, &ir, &objective)
-                .unwrap();
-        assert_eq!(new_graph.name, "solve");
-        assert!(new_nodes.is_empty()); // No new nodes — all existing
-    }
-
-    #[test]
-    fn test_parse_and_validate_graph_edit_with_new_node() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph();
-        let objective = make_objective();
-
-        let graph_source = r#"
-            graph solve {
-                in: string
-                out: string
-                step plan = planner(input)
-                step attempt1 = solve_code(plan)
-                step result1 = eval_exercise(attempt1)
-                emit result1
-            }
-        "#;
-        let new_node_source = r#"
-            node planner: prompt {
-                in: string
-                out: string
-                template: "Plan: {{ input }}"
-            }
-        "#;
-
-        let (new_graph, new_nodes) = parse_and_validate_graph_edit(
-            graph_source,
-            &[new_node_source.to_string()],
-            &parent_graph,
-            &ir,
-            &objective,
-        )
-        .unwrap();
-        assert_eq!(new_graph.name, "solve");
-        assert_eq!(new_nodes.len(), 1);
-        assert_eq!(new_nodes[0].name, "planner");
-    }
-
-    #[test]
-    fn test_parse_and_validate_graph_edit_reject_type_mismatch() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph(); // input: string, output: string
-        let objective = make_objective();
-
-        let graph_source = r#"
-            graph solve {
-                in: int
-                out: string
-                step attempt1 = solve_code(input)
-                emit attempt1
-            }
-        "#;
-
-        let result =
-            parse_and_validate_graph_edit(graph_source, &[], &parent_graph, &ir, &objective);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("input type mismatch"), "got: {}", err);
-    }
-
-    #[test]
-    fn test_parse_and_validate_graph_edit_reject_missing_preserved() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph();
-        let mut objective = make_objective();
-        objective.topology = Some(TopologyIR {
-            mutations: vec!["insert_step".into()],
-            max_nodes: None,
-            max_depth: None,
-            preserve: vec!["attempt1".into()],
-            target_score: None,
-        });
-
-        // Graph without the preserved step "attempt1"
-        let graph_source = r#"
-            graph solve {
-                in: string
-                out: string
-                step x = solve_code(input)
-                emit x
-            }
-        "#;
-
-        let result =
-            parse_and_validate_graph_edit(graph_source, &[], &parent_graph, &ir, &objective);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("preserved step 'attempt1' missing"), "got: {}", err);
-    }
-
-    #[test]
-    fn test_parse_and_validate_graph_edit_reject_unknown_node() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph();
-        let objective = make_objective();
-
-        let graph_source = r#"
-            graph solve {
-                in: string
-                out: string
-                step attempt1 = nonexistent_node(input)
-                emit attempt1
-            }
-        "#;
-
-        let result =
-            parse_and_validate_graph_edit(graph_source, &[], &parent_graph, &ir, &objective);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown node 'nonexistent_node'"), "got: {}", err);
-    }
-
-    #[test]
-    fn test_parse_and_validate_graph_edit_reject_wrong_graph_name() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph(); // name: "solve"
-        let objective = make_objective();
-
-        let graph_source = r#"
-            graph different_name {
-                in: string
-                out: string
-                step attempt1 = solve_code(input)
-                emit attempt1
-            }
-        "#;
-
-        let result =
-            parse_and_validate_graph_edit(graph_source, &[], &parent_graph, &ir, &objective);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("graph 'solve' not found"), "got: {}", err);
-    }
-
-    #[test]
-    fn test_parse_proposal_edit_graph() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph();
-        let objective = make_objective();
-
-        let response = r#"{
-            "kind": "edit_graph",
-            "graph": "graph solve {\n    in: string\n    out: string\n    step attempt1 = solve_code(input)\n    step result1 = eval_exercise(attempt1)\n    emit result1\n}",
-            "description": "remove retry step",
-            "reasoning": "simplify the graph"
-        }"#;
-
-        let result = parse_proposal(
-            response,
-            &ir,
-            &parent_graph,
-            &objective,
-            &["insert_step".into()], // edit_graph allowed since structural mutations present
-        );
-        match result {
-            Ok(proposal) => {
-                assert_eq!(proposal.mutation.short_label(), "edit: remove retry step");
-                if let Mutation::EditGraph { new_graph, description, .. } = &proposal.mutation {
-                    assert_eq!(new_graph.name, "solve");
-                    assert_eq!(description, "remove retry step");
-                } else {
-                    panic!("expected EditGraph");
-                }
-            }
-            Err(e) => panic!("unexpected error: {}", e),
-        }
-    }
-
-    #[test]
-    fn test_parse_proposal_edit_graph_not_allowed_without_structural() {
-        let ir = make_test_ir();
-        let parent_graph = make_test_graph();
-        let objective = make_objective();
-
-        let response = r#"{
-            "kind": "edit_graph",
-            "graph": "graph solve {\n    in: string\n    out: string\n    step attempt1 = solve_code(input)\n    emit attempt1\n}",
-            "description": "simplify",
-            "reasoning": "test"
-        }"#;
-
-        // No structural mutations in allowed list — only content
-        let result = parse_proposal(
-            response,
-            &ir,
-            &parent_graph,
-            &objective,
-            &["set_config".into()],
-        );
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not in allowed mutations"), "got: {}", err);
-    }
-
-    #[test]
-    fn test_build_context_shows_edit_graph_for_meta_agent() {
-        let ir = make_test_ir();
-        let graph = make_test_graph();
-        let objective = make_objective();
-        let seed = make_candidate(0, None, 0.5, vec![], vec![], 4, 2, vec!["a", "b"], &graph, &ir);
-
-        let mut archive = Archive::new();
-        archive.add(seed.clone());
-
-        let ctx = build_context(
-            &archive.candidates[0],
-            &archive,
-            &ir,
-            &objective,
-            &["insert_step".into(), "remove_step".into()],
-            None,
-            false,
-        );
-
-        // Should show edit_graph instead of individual structural mutations
-        assert!(ctx.contains("edit_graph"), "context should contain edit_graph");
-        assert!(!ctx.contains("Allowed mutations: insert_step"), "should not list individual structural mutations");
-    }
 }
