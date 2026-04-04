@@ -16,5 +16,11 @@ __pycache__/
 *.pyc
 .venv/
 
+# Blog drafts
+docs/blog.mdx
+
+# Datasets (regenerate with tools/prepare_*.py)
+examples/datasets/
+
 # External repos (cloned for benchmarks)
 polyglot-benchmark/

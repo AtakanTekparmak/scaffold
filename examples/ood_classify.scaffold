@@ -1,6 +1,7 @@
-// Text Classification Benchmark
-// Replicates Meta-Harness (Stanford, 2026) text classification setup.
-// Graph has NO access to ground truth labels — must classify blind.
+// OOD Classification — Stress-test for regression gate
+// Merged: 9 diverse OOD datasets (ag_news, amazon_reviews, banking77,
+//   financial_phrasebank, finer139, go_emotions, scicite, scitail, tweet_eval_hate)
+// 1620 total cases across wildly different label spaces.
 
 // ── Types ──
 
@@ -44,9 +45,9 @@ graph classify {
 
 // ── Objective ──
 
-objective text_classify {
+objective ood_classify {
     graph: classify
-    dataset: file("examples/datasets/symptom2disease.jsonl")
+    dataset: file("examples/datasets/ood_merged.jsonl")
 
     checker correct { output == expected.label }
     metric accuracy { checker: correct }

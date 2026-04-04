@@ -26,8 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 DATASET_CONFIGS = {
     "symptom2disease": {
         "hf_id": "gretelai/symptom_to_diagnosis",
-        "text_col": "text",
-        "label_col": "label",
+        "text_col": "input_text",
+        "label_col": "output_text",
     },
     "uspto50k": {
         "hf_id": "pingzhili/uspto-50k",

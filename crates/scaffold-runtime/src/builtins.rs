@@ -196,7 +196,9 @@ pub fn text_truncate(text: &str, max_chars: i64) -> String {
     if text.len() <= max {
         text.to_string()
     } else {
-        text[..max].to_string()
+        let mut end = max;
+        while end > 0 && !text.is_char_boundary(end) { end -= 1; }
+        text[..end].to_string()
     }
 }
 

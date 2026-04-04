@@ -81,6 +81,7 @@ impl LlmConfig {
         self.system_prompt = Some(prompt.into());
         self
     }
+
 }
 
 /// Query an LLM with a prompt using the default model
@@ -263,6 +264,51 @@ async fn query_anthropic(model: &str, prompt: &str, llm_config: &LlmConfig) -> R
     extract_text_or_error(response.choice.iter())
 }
 
+/// Send a request to OpenRouter and return the response body.
+/// On HTTP errors (4xx/5xx) ureq returns Err(Status(code, response)); we read the
+/// body from the error response so callers can inspect it (e.g. to retry without
+/// unsupported parameters like response_format).
+fn openrouter_post(api_key: &str, body: &str) -> Result<String> {
+    match ureq::post("https://openrouter.ai/api/v1/chat/completions")
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .set("Content-Type", "application/json")
+        .send_string(body)
+    {
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| Error::Runtime(format!("OpenRouter read error: {}", e))),
+        Err(ureq::Error::Status(_code, resp)) => {
+            // Read the error body so we can inspect / retry
+            resp.into_string()
+                .map_err(|e| Error::Runtime(format!("OpenRouter read error: {}", e)))
+        }
+        Err(e) => Err(Error::Runtime(format!("OpenRouter API error: {}", e))),
+    }
+}
+
+/// Parse an OpenRouter response body, returning the content string or an error.
+fn parse_openrouter_response(response_text: &str) -> Result<String> {
+    let parsed: serde_json::Value = serde_json::from_str(response_text)
+        .map_err(|e| Error::Runtime(format!("OpenRouter JSON parse error: {}", e)))?;
+
+    if let Some(err) = parsed.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(Error::Runtime(format!("OpenRouter API error: {}", msg)));
+    }
+
+    parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|msg| msg.get("content"))
+        .and_then(|content| content.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::Runtime("OpenRouter: no content in response".to_string()))
+}
+
 /// Query via OpenRouter (unified API for all models)
 ///
 /// OpenRouter provides access to OpenAI, Anthropic, and many other models
@@ -301,44 +347,16 @@ async fn query_openrouter(model: &str, prompt: &str, llm_config: &LlmConfig) -> 
         body["max_tokens"] = serde_json::json!(max_tokens);
     }
 
-    let api_key_owned = api_key.clone();
+    let api_key_clone = api_key.clone();
     let body_string = body.to_string();
 
     let response_text = tokio::task::spawn_blocking(move || {
-        let resp = ureq::post("https://openrouter.ai/api/v1/chat/completions")
-            .set("Authorization", &format!("Bearer {}", api_key_owned))
-            .set("Content-Type", "application/json")
-            .send_string(&body_string)
-            .map_err(|e| Error::Runtime(format!("OpenRouter API error: {}", e)))?;
-
-        resp.into_string()
-            .map_err(|e| Error::Runtime(format!("OpenRouter read error: {}", e)))
+        openrouter_post(&api_key_clone, &body_string)
     })
     .await
     .map_err(|e| Error::Runtime(format!("OpenRouter task error: {}", e)))??;
 
-    // Parse the chat completions response
-    let parsed: serde_json::Value = serde_json::from_str(&response_text)
-        .map_err(|e| Error::Runtime(format!("OpenRouter JSON parse error: {}", e)))?;
-
-    // Check for API errors
-    if let Some(err) = parsed.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        return Err(Error::Runtime(format!("OpenRouter API error: {}", msg)));
-    }
-
-    // Extract content from first choice
-    parsed
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|choice| choice.get("message"))
-        .and_then(|msg| msg.get("content"))
-        .and_then(|content| content.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| Error::Runtime("OpenRouter: no content in response".to_string()))
+    parse_openrouter_response(&response_text)
 }
 
 /// Query and parse response as JSON (typed)
@@ -460,10 +478,17 @@ pub(crate) fn parse_json_with_repairs(
             Err(error) => {
                 last_error = Some(error.to_string());
                 push_json_attempt(&mut attempts, strip_trailing_commas(&candidate));
+                push_json_attempt(&mut attempts, quote_unquoted_keys(&candidate));
                 if let Some(closed) = close_json_delimiters(&candidate) {
                     push_json_attempt(&mut attempts, closed);
                 }
                 if let Some(closed) = close_json_delimiters(&strip_trailing_commas(&candidate)) {
+                    push_json_attempt(&mut attempts, closed);
+                }
+                // Combined repairs: quote keys + strip commas
+                let quoted = quote_unquoted_keys(&candidate);
+                push_json_attempt(&mut attempts, strip_trailing_commas(&quoted));
+                if let Some(closed) = close_json_delimiters(&quoted) {
                     push_json_attempt(&mut attempts, closed);
                 }
             }
@@ -631,6 +656,87 @@ fn strip_trailing_commas(candidate: &str) -> String {
         index += 1;
     }
 
+    out
+}
+
+/// Fix JavaScript-style unquoted keys: `{kind: "value"}` → `{"kind": "value"}`
+fn quote_unquoted_keys(candidate: &str) -> String {
+    use std::fmt::Write;
+    let chars: Vec<char> = candidate.chars().collect();
+    let mut out = String::with_capacity(candidate.len() + 32);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_string {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else {
+                match ch {
+                    '\\' => escape = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+                i += 1;
+            }
+            // After { or , we might see an unquoted key
+            _ if (ch == '{' || ch == ',') => {
+                out.push(ch);
+                i += 1;
+                // Skip whitespace
+                while i < chars.len() && chars[i].is_whitespace() {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                // Check if next is an unquoted identifier (not " or } or ])
+                if i < chars.len()
+                    && chars[i] != '"'
+                    && chars[i] != '}'
+                    && chars[i] != ']'
+                    && (chars[i].is_alphabetic() || chars[i] == '_')
+                {
+                    // Collect the identifier
+                    let key_start = i;
+                    while i < chars.len()
+                        && (chars[i].is_alphanumeric() || chars[i] == '_')
+                    {
+                        i += 1;
+                    }
+                    // Skip whitespace after key
+                    let mut j = i;
+                    while j < chars.len() && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    // If followed by ':', it's an unquoted key — quote it
+                    if j < chars.len() && chars[j] == ':' {
+                        let key: String = chars[key_start..i].iter().collect();
+                        let _ = write!(out, "\"{}\"", key);
+                    } else {
+                        // Not a key, just output as-is
+                        for c in &chars[key_start..i] {
+                            out.push(*c);
+                        }
+                    }
+                }
+            }
+            _ => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
     out
 }
 
@@ -857,5 +963,27 @@ mod tests {
         let parsed =
             parse_json_with_repairs(r#"Here is the answer: {"answer":"Paris"} Thanks!"#).unwrap();
         assert_eq!(parsed, serde_json::json!({ "answer": "Paris" }));
+    }
+
+    #[test]
+    fn parse_json_with_repairs_fixes_unquoted_keys() {
+        let parsed = parse_json_with_repairs(
+            r#"{kind: "rewrite_prompt", node: "classify", reasoning: "test"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed["kind"], "rewrite_prompt");
+        assert_eq!(parsed["node"], "classify");
+        assert_eq!(parsed["reasoning"], "test");
+    }
+
+    #[test]
+    fn parse_json_with_repairs_fixes_unquoted_keys_nested() {
+        let parsed = parse_json_with_repairs(
+            r#"{kind: "propose_decomposition", config: {shortlist_k: 3, templates: {shortlist: "text"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed["kind"], "propose_decomposition");
+        assert_eq!(parsed["config"]["shortlist_k"], 3);
+        assert_eq!(parsed["config"]["templates"]["shortlist"], "text");
     }
 }

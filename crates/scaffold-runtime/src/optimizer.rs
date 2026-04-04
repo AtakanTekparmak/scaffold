@@ -487,6 +487,9 @@ pub struct Archive {
     seen_hashes: std::collections::HashSet<u64>,
     /// Val checkpoints recorded on new-best events.
     pub val_checkpoints: Vec<ValCheckpoint>,
+    /// Monotonically-growing set of train case IDs passed by any best candidate.
+    /// New candidates must pass all of these to become the new best.
+    pub regression_set: std::collections::HashSet<String>,
 }
 
 impl Archive {
@@ -496,6 +499,7 @@ impl Archive {
             next_id: 0,
             seen_hashes: std::collections::HashSet::new(),
             val_checkpoints: Vec::new(),
+            regression_set: std::collections::HashSet::new(),
         }
     }
 
@@ -519,18 +523,38 @@ impl Archive {
         self.seen_hashes.contains(&hash)
     }
 
-    /// Get the best entry by score.
+    /// Get the best entry by score, respecting the regression gate.
+    /// A candidate can only be best if it passes all cases in the regression set.
+    /// Falls back to unconstrained best if no candidate passes the gate (shouldn't happen).
     pub fn best(&self) -> Option<&ArchiveEntry> {
-        self.entries
-            .iter()
+        let cmp = |a: &&ArchiveEntry, b: &&ArchiveEntry| {
+            a.eval.score().unwrap().partial_cmp(&b.eval.score().unwrap())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        // Try strict: no regressions allowed
+        let strict = self.entries.iter()
             .filter(|e| e.eval.score().is_some())
-            .max_by(|a, b| {
-                a.eval
-                    .score()
-                    .unwrap()
-                    .partial_cmp(&b.eval.score().unwrap())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .filter(|e| self.count_regressions(e.eval.train_passed_case_ids()) == 0)
+            .max_by(cmp);
+        if strict.is_some() { return strict; }
+        // Fallback: unconstrained (current best always qualifies, so this is a safety net)
+        self.entries.iter()
+            .filter(|e| e.eval.score().is_some())
+            .max_by(cmp)
+    }
+
+    /// Grow the regression set with cases passed by the new best.
+    pub fn update_regression_set(&mut self, passed_case_ids: &[String]) {
+        for id in passed_case_ids {
+            self.regression_set.insert(id.clone());
+        }
+    }
+
+    /// Count how many regression-set cases a candidate fails.
+    pub fn count_regressions(&self, passed_case_ids: &[String]) -> usize {
+        if self.regression_set.is_empty() { return 0; }
+        let passed: std::collections::HashSet<&str> = passed_case_ids.iter().map(|s| s.as_str()).collect();
+        self.regression_set.iter().filter(|id| !passed.contains(id.as_str())).count()
     }
 
     /// Increment the children count for a parent candidate.
@@ -2135,6 +2159,14 @@ async fn run_evolutionary_into(
         train: seed_train,
     });
 
+    // Seed the regression set with cases the seed passes.
+    {
+        let seed_passed = archive.entries.last()
+            .map(|e| e.eval.train_passed_case_ids().to_vec())
+            .unwrap_or_default();
+        archive.update_regression_set(&seed_passed);
+    }
+
     // Build example bank from seed train results for few-shot injection.
     let example_bank: Option<Arc<ExampleBank>> = archive.entries.last()
         .and_then(|e| e.eval.train.as_ref())
@@ -2311,6 +2343,12 @@ async fn run_evolutionary_into(
         }
     }
 
+    // Update regression set if best changed during tunable sweep.
+    if let Some(best) = archive.best() {
+        let passed = best.eval.train_passed_case_ids().to_vec();
+        archive.update_regression_set(&passed);
+    }
+
     // ── Phase 2: Evolutionary mutations ──
     // max_candidates = number of successful evolutionary generations (not total archive size).
     // Skipped/failed mutations do NOT count against the budget.
@@ -2389,13 +2427,11 @@ async fn run_evolutionary_into(
                             );
                             let score = evo_train.as_ref().map(|t| t.score).unwrap_or(0.0);
                             let metrics = evo_train.as_ref().map(|t| t.metric_scores.clone()).unwrap_or_default();
-                            let best_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
+                            let best_id_before = archive.best().map(|e| e.delta.id);
+                            let best_score_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
 
                             successful_generations += 1;
                             epoch_generation_count += 1;
-                            if score > best_before {
-                                consecutive_non_improving = 0;
-                            }
 
                             emit(
                                 options,
@@ -2404,7 +2440,7 @@ async fn run_evolutionary_into(
                                     parent_id: recombined.parent_id,
                                     score,
                                     metric_scores: metrics,
-                                    best_so_far: best_before.max(score),
+                                    best_so_far: best_score_before.max(score),
                                     mutations: vec!["recombine".to_string()],
                                     generation: successful_generations,
                                     max_generations,
@@ -2424,6 +2460,15 @@ async fn run_evolutionary_into(
                                 val: None,
                                 train: evo_train,
                             });
+
+                            let best_id_after = archive.best().map(|e| e.delta.id);
+                            if best_id_before != best_id_after {
+                                consecutive_non_improving = 0;
+                                if let Some(best_entry) = archive.best() {
+                                    let passed = best_entry.eval.train_passed_case_ids().to_vec();
+                                    archive.update_regression_set(&passed);
+                                }
+                            }
 
                             // Check early stop
                             if let Some(ts) = target_score {
@@ -2813,12 +2858,9 @@ async fn run_evolutionary_into(
                         },
                     );
                 }
-                let best_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
-                if score > best_before {
-                    consecutive_non_improving = 0;
-                } else {
-                    consecutive_non_improving += 1;
-                }
+                let best_id_before = archive.best().map(|e| e.delta.id);
+                let best_score_before = archive.best().map(|e| e.eval.score().unwrap()).unwrap_or(0.0);
+
                 let mutation_labels: Vec<String> = evo_delta
                     .mutations
                     .iter()
@@ -2832,7 +2874,7 @@ async fn run_evolutionary_into(
                         parent_id: Some(parent_id),
                         score,
                         metric_scores: metrics.clone(),
-                        best_so_far: best_before.max(score),
+                        best_so_far: best_score_before.max(score),
                         mutations: mutation_labels,
                         generation: successful_generations,
                         max_generations,
@@ -2853,8 +2895,37 @@ async fn run_evolutionary_into(
                 // Track parent usage for novelty weighting
                 archive.increment_children(parent_id);
 
+                let best_id_after = archive.best().map(|e| e.delta.id);
+                let new_best = best_id_before != best_id_after;
+
+                if new_best {
+                    consecutive_non_improving = 0;
+                    // Grow regression set with new best's passed cases
+                    if let Some(best_entry) = archive.best() {
+                        let passed = best_entry.eval.train_passed_case_ids().to_vec();
+                        archive.update_regression_set(&passed);
+                    }
+                } else {
+                    consecutive_non_improving += 1;
+                }
+
+                // Log if a candidate had higher raw score but was blocked by regression gate
+                {
+                    let last_entry = archive.entries.last().unwrap();
+                    let last_score = last_entry.eval.score().unwrap_or(0.0);
+                    let regressions = archive.count_regressions(last_entry.eval.train_passed_case_ids());
+                    if regressions > 0 && last_score > best_score_before {
+                        emit(options, OptEvent::Log {
+                            message: format!(
+                                "Regression gate: candidate scores {:.4} but regresses on {}/{} protected cases — not crowned best",
+                                last_score, regressions, archive.regression_set.len(),
+                            ),
+                        });
+                    }
+                }
+
                 // Val checkpoint: evaluate new best on val to track generalization gap
-                if score > best_before && !split.val.is_empty() {
+                if new_best && !split.val.is_empty() {
                     let last_entry = archive.entries.last().unwrap();
                     let ckpt_delta = last_entry.delta.clone();
                     let ckpt_id = ckpt_delta.id;

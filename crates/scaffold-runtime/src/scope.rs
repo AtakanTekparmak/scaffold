@@ -79,7 +79,12 @@ impl Scope {
                 let repr = value.to_string();
                 let max = 2000;
                 let truncated = if repr.len() > max {
-                    format!("{}...", &repr[..max])
+                    // Find a valid char boundary at or before `max`
+                    let mut end = max;
+                    while end > 0 && !repr.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &repr[..end])
                 } else {
                     repr
                 };

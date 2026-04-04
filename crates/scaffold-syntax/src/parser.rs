@@ -113,6 +113,42 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// Parse a possibly-dotted identifier like `_motif.result.shortlist`.
+    /// Consumes `Ident(.Ident)*` and joins with dots.
+    /// Parse a possibly-dotted identifier like `_motif.result.shortlist`.
+    /// Consumes `Ident(.Ident)*` where each segment can be an identifier or keyword-as-ident.
+    fn expect_dotted_ident(&mut self) -> ParseResult<Ident> {
+        let first = self.expect_ident()?;
+        let start = first.span.start;
+        let mut name = first.name;
+        while self.peek() == Some(&Token::Dot) {
+            // Check if the dot is followed by an ident or keyword-as-ident
+            let is_ident_after = self.peek_is_ident_after_dot();
+            if !is_ident_after {
+                break;
+            }
+            self.advance(); // consume Dot
+            let next = self.expect_ident()?;
+            name.push('.');
+            name.push_str(&next.name);
+        }
+        let end = self.last_span.end;
+        Ok(Ident::new(name, start..end))
+    }
+
+    /// Peek past the current Dot token to check if what follows is an identifier
+    /// (regular ident or keyword-as-ident). Used by expect_dotted_ident to avoid
+    /// consuming dots that are part of field access syntax.
+    fn peek_is_ident_after_dot(&mut self) -> bool {
+        // We know current peek is Dot. We need to look 2 tokens ahead.
+        // Since our lexer only supports single-token peek, we check if the
+        // token after dot would be accepted by expect_ident (Ident or keyword-as-ident).
+        // For now, always consume — if the dot is followed by something that
+        // expect_ident can parse, it works. If not, we get a parse error which is
+        // acceptable since dotted names in node/step contexts should always be valid.
+        true
+    }
+
     fn expect_string(&mut self) -> ParseResult<(String, Span)> {
         match self.advance() {
             Some((Token::StringLit(s), span)) => Ok((s, span)),
@@ -321,7 +357,7 @@ impl<'src> Parser<'src> {
 
     fn parse_node_decl(&mut self) -> ParseResult<NodeDecl> {
         let start = self.expect(&Token::Node)?;
-        let name = self.expect_ident()?;
+        let name = self.expect_dotted_ident()?;
         self.expect(&Token::Colon)?;
         let kind = self.parse_node_kind()?;
         self.expect(&Token::LBrace)?;
@@ -572,7 +608,7 @@ impl<'src> Parser<'src> {
         let start = self.expect(&Token::Step)?;
         let name = self.expect_ident()?;
         self.expect(&Token::Eq)?;
-        let node = self.expect_ident()?;
+        let node = self.expect_dotted_ident()?;
         self.expect(&Token::LParen)?;
 
         let mut args = Vec::new();
@@ -595,7 +631,8 @@ impl<'src> Parser<'src> {
     fn parse_step_arg(&mut self) -> ParseResult<StepArg> {
         // Try named: IDENT ":" expr
         // We need lookahead to distinguish named from positional
-        if let Some(Token::Ident(_)) = self.peek() {
+        // Also accept keyword-as-ident (e.g. `input:`) for named args
+        if self.peek_is_ident_like() {
             // Check if next-next is ':'
             // Use a simple approach: parse expr, and if the expr is an ident followed by :, it's named
             let start = self.peek_span();

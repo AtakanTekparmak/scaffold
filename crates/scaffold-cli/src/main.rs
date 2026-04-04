@@ -98,6 +98,10 @@ enum Commands {
         #[arg(long)]
         assignments: Option<String>,
 
+        /// Override the objective's dataset with a different file
+        #[arg(long)]
+        dataset: Option<PathBuf>,
+
         /// Enable live tracing
         #[arg(long)]
         live: bool,
@@ -153,6 +157,21 @@ enum Commands {
         /// Also enables changed-case trace analysis between generations.
         #[arg(long)]
         meta_full_traces: bool,
+
+        /// Number of training cases to sample per generation for meta-agent context.
+        /// Only effective when the objective declares a split.
+        #[arg(long)]
+        batch_size: Option<usize>,
+
+        /// Pool train+val cases and sample a fresh random subset for each candidate
+        /// evaluation. Prevents overfitting to a small fixed val set.
+        #[arg(long)]
+        rotating_val: bool,
+
+        /// Allow meta-agent proposed tool nodes to access the network.
+        /// Filesystem sandbox remains active (CWD only).
+        #[arg(long)]
+        online: bool,
     },
 
     /// Pretty-print IR back to scaffold source
@@ -183,8 +202,9 @@ fn main() -> ExitCode {
             file,
             objective,
             assignments,
+            dataset,
             live,
-        } => cmd_evaluate(&file, &objective, assignments.as_deref(), live),
+        } => cmd_evaluate(&file, &objective, assignments.as_deref(), dataset, live),
         Commands::Optimize {
             file,
             objective,
@@ -198,6 +218,9 @@ fn main() -> ExitCode {
             meta_log,
             meta_restart,
             meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
         } => cmd_optimize(
             &file,
             &objective,
@@ -211,6 +234,9 @@ fn main() -> ExitCode {
             meta_log,
             meta_restart,
             meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
         ),
         Commands::Print { file } => cmd_print(&file),
     }
@@ -393,6 +419,7 @@ fn cmd_evaluate(
     file: &PathBuf,
     objective_name: &str,
     assignments: Option<&str>,
+    dataset_override: Option<PathBuf>,
     live: bool,
 ) -> ExitCode {
     if live {
@@ -452,8 +479,14 @@ fn cmd_evaluate(
         .with_prompt_manager(prompt_mgr)
         .with_overrides(overrides);
 
-    // Load dataset
-    let dataset = match scaffold_runtime::optimizer::load_dataset_from_spec(&objective.dataset) {
+    // Load dataset (with optional override)
+    let dataset_spec = match dataset_override {
+        Some(ref path) => scaffold_ir::DatasetSpecIR::File {
+            path: path.display().to_string(),
+        },
+        None => objective.dataset.clone(),
+    };
+    let dataset = match scaffold_runtime::optimizer::load_dataset_from_spec(&dataset_spec) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: failed to load dataset: {}", e);
@@ -588,6 +621,9 @@ fn cmd_optimize(
     meta_log: Option<PathBuf>,
     meta_restart: Option<usize>,
     meta_full_traces: bool,
+    batch_size: Option<usize>,
+    rotating_val: bool,
+    online: bool,
 ) -> ExitCode {
     let ir = match load_ir(file) {
         Ok(ir) => ir,
@@ -624,6 +660,9 @@ fn cmd_optimize(
             meta_log: meta_log.clone(),
             meta_context_restart: meta_restart,
             meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
         };
 
         let obj_name = objective_name.to_string();
@@ -659,6 +698,9 @@ fn cmd_optimize(
             meta_log,
             meta_context_restart: meta_restart,
             meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
         };
 
         let rt = tokio::runtime::Runtime::new().unwrap();

@@ -6,10 +6,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use scaffold_ir::ir::*;
 
 use crate::error::{Error, Result};
+use crate::example_bank::ExampleBank;
 use crate::node_runner;
 use crate::prompt::PromptManager;
 use crate::scope::Scope;
@@ -25,6 +27,10 @@ pub struct GraphExecutor {
     overrides: TunableOverrides,
     /// Synthetic nodes created by `AddPromptStep` mutations (stored via `_node.*` overrides).
     synthetic_nodes: Vec<NodeIR>,
+    /// When true, meta-agent proposed shell commands can access the network.
+    online: bool,
+    /// Shared example bank for few-shot injection (built from seed eval, read-only).
+    example_bank: Option<Arc<ExampleBank>>,
 }
 
 impl GraphExecutor {
@@ -35,6 +41,8 @@ impl GraphExecutor {
             prompt_mgr: PromptManager::new(),
             overrides: HashMap::new(),
             synthetic_nodes: Vec::new(),
+            online: false,
+            example_bank: None,
         }
     }
 
@@ -51,11 +59,21 @@ impl GraphExecutor {
     pub fn with_overrides(mut self, overrides: TunableOverrides) -> Self {
         // Parse synthetic nodes from `_node.<name>` override keys.
         let mut synthetic = Vec::new();
-        for key in overrides.keys() {
+        for (key, value) in overrides.iter() {
             if let Some(name) = key.strip_prefix("_node.") {
+                let kind = value
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .map(|k| match k {
+                        "tool" => NodeKindIR::Tool,
+                        "agent" => NodeKindIR::Agent,
+                        "verify" => NodeKindIR::Verify,
+                        _ => NodeKindIR::Prompt,
+                    })
+                    .unwrap_or(NodeKindIR::Prompt);
                 synthetic.push(NodeIR {
                     name: name.to_string(),
-                    kind: NodeKindIR::Prompt,
+                    kind,
                     input: TypeIR::String,
                     output: TypeIR::String,
                     config: NodeConfigIR::default(),
@@ -64,6 +82,18 @@ impl GraphExecutor {
         }
         self.synthetic_nodes = synthetic;
         self.overrides = overrides;
+        self
+    }
+
+    /// Enable online mode (meta-agent shell commands can access the network).
+    pub fn with_online(mut self, online: bool) -> Self {
+        self.online = online;
+        self
+    }
+
+    /// Set the shared example bank for few-shot injection.
+    pub fn with_example_bank(mut self, bank: Arc<ExampleBank>) -> Self {
+        self.example_bank = Some(bank);
         self
     }
 
@@ -214,6 +244,8 @@ impl GraphExecutor {
                             input.clone(),
                             &node_overrides,
                             &self.prompt_mgr,
+                            self.online,
+                            self.example_bank.as_deref(),
                         )
                         .await
                         {
@@ -237,7 +269,7 @@ impl GraphExecutor {
                     }))
                 }
                 Some(ErrorStrategyIR::Abort) | None => {
-                    node_runner::run_node(node, input, &node_overrides, &self.prompt_mgr)
+                    node_runner::run_node(node, input, &node_overrides, &self.prompt_mgr, self.online, self.example_bank.as_deref())
                         .await
                         .map_err(|e| Error::StepFailed {
                             step: step.name.clone(),
@@ -373,7 +405,7 @@ impl GraphExecutor {
             if let Some(node) = self.ir.nodes.iter().find(|n| n.name == *selected) {
                 let overrides = self.get_node_overrides(&node.name);
                 let result =
-                    node_runner::run_node(node, input, &overrides, &self.prompt_mgr).await?;
+                    node_runner::run_node(node, input, &overrides, &self.prompt_mgr, self.online, self.example_bank.as_deref()).await?;
                 return Ok(Some(result));
             }
 
@@ -425,7 +457,7 @@ impl GraphExecutor {
                 if let Some(node) = self.ir.nodes.iter().find(|n| n.name == *reduce_name) {
                     let overrides = self.get_node_overrides(&node.name);
                     let reduced =
-                        node_runner::run_node(node, collected, &overrides, &self.prompt_mgr)
+                        node_runner::run_node(node, collected, &overrides, &self.prompt_mgr, self.online, self.example_bank.as_deref())
                             .await?;
                     scope.bind("parallel_result", reduced.clone());
                     return Ok(Some(reduced));

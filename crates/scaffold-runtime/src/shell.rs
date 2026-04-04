@@ -6,13 +6,13 @@ use std::process::{Command, Stdio};
 /// Build the macOS sandbox profile at runtime.
 ///
 /// Starts from `allow default` then carves out restrictions:
-/// - **No network** — prevents data exfiltration
+/// - **No network** (unless `allow_network` is true) — prevents data exfiltration
 /// - **No file access under /Users except CWD** — can't read/write user files outside the project
 /// - **No process execution under /Users except CWD** — can't run scripts from elsewhere
 ///
 /// System paths (/usr, /bin, /opt, etc.) remain accessible so tools (python, jq, etc.) work.
 #[cfg(target_os = "macos")]
-fn sandbox_profile() -> String {
+fn sandbox_profile_with_options(allow_network: bool) -> String {
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .canonicalize()
@@ -21,41 +21,49 @@ fn sandbox_profile() -> String {
         });
     let cwd_str = cwd.to_string_lossy();
 
+    let network_rule = if allow_network { "" } else { "(deny network*)\n" };
+
     format!(
-        concat!(
-            "(version 1)\n",
-            "(allow default)\n",
-            // No network access
-            "(deny network*)\n",
-            // No file reads under /Users (blocks reading secrets, SSH keys, other projects, etc.)
-            "(deny file-read-data (subpath \"/Users\"))\n",
-            "(deny file-read-metadata (subpath \"/Users\"))\n",
-            // No file writes under /Users
-            "(deny file-write* (subpath \"/Users\"))\n",
-            // No executing binaries from /Users
-            "(deny process-exec (subpath \"/Users\"))\n",
-            // Exception: allow full access to the working directory
-            "(allow file-read-data (subpath \"{cwd}\"))\n",
-            "(allow file-read-metadata (subpath \"{cwd}\"))\n",
-            "(allow file-write* (subpath \"{cwd}\"))\n",
-            "(allow process-exec (subpath \"{cwd}\"))\n",
-        ),
+        "(version 1)\n\
+         (allow default)\n\
+         {network}\
+         (deny file-read-data (subpath \"/Users\"))\n\
+         (deny file-read-metadata (subpath \"/Users\"))\n\
+         (deny file-write* (subpath \"/Users\"))\n\
+         (deny process-exec (subpath \"/Users\"))\n\
+         (allow file-read-data (subpath \"{cwd}\"))\n\
+         (allow file-read-metadata (subpath \"{cwd}\"))\n\
+         (allow file-write* (subpath \"{cwd}\"))\n\
+         (allow process-exec (subpath \"{cwd}\"))\n",
+        network = network_rule,
         cwd = cwd_str,
     )
 }
 
+/// Sandbox mode for shell execution.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// No sandbox — full access.
+    None,
+    /// Full sandbox — no network, filesystem restricted to CWD.
+    Full,
+    /// Online sandbox — network allowed, filesystem still restricted to CWD.
+    Online,
+}
+
 /// Build a `Command` for shell execution, optionally sandboxed on macOS.
-fn build_command(command: &str, sandboxed: bool) -> Command {
+fn build_command(command: &str, mode: SandboxMode) -> Command {
     #[cfg(target_os = "macos")]
-    if sandboxed {
-        let profile = sandbox_profile();
+    if mode != SandboxMode::None {
+        let allow_network = mode == SandboxMode::Online;
+        let profile = sandbox_profile_with_options(allow_network);
         let mut cmd = Command::new("sandbox-exec");
         cmd.arg("-p").arg(profile).arg("sh").arg("-c").arg(command);
         return cmd;
     }
 
     #[cfg(not(target_os = "macos"))]
-    let _ = sandboxed;
+    let _ = mode;
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(command);
@@ -63,8 +71,8 @@ fn build_command(command: &str, sandboxed: bool) -> Command {
 }
 
 /// Run a command to completion and return stdout.
-fn run_to_completion(command: &str, sandboxed: bool) -> Result<String> {
-    let output = build_command(command, sandboxed)
+fn run_to_completion(command: &str, mode: SandboxMode) -> Result<String> {
+    let output = build_command(command, mode)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -74,10 +82,10 @@ fn run_to_completion(command: &str, sandboxed: bool) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let label = if sandboxed {
-            "shell (sandboxed)"
-        } else {
-            "shell"
+        let label = match mode {
+            SandboxMode::None => "shell",
+            SandboxMode::Full => "shell (sandboxed)",
+            SandboxMode::Online => "shell (sandboxed+online)",
         };
         Err(Error::ActionFailed {
             action: label.to_string(),
@@ -87,10 +95,10 @@ fn run_to_completion(command: &str, sandboxed: bool) -> Result<String> {
 }
 
 /// Spawn a command and wait with a timeout.
-fn run_with_deadline(command: &str, sandboxed: bool, timeout_ms: u64) -> Result<String> {
+fn run_with_deadline(command: &str, mode: SandboxMode, timeout_ms: u64) -> Result<String> {
     use std::time::{Duration, Instant};
 
-    let mut child = build_command(command, sandboxed)
+    let mut child = build_command(command, mode)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -124,10 +132,10 @@ fn run_with_deadline(command: &str, sandboxed: bool, timeout_ms: u64) -> Result<
                     return Ok(String::from_utf8_lossy(&stdout).to_string());
                 } else {
                     let stderr_str = String::from_utf8_lossy(&stderr);
-                    let label = if sandboxed {
-                        "shell (sandboxed)"
-                    } else {
-                        "shell"
+                    let label = match mode {
+                        SandboxMode::None => "shell",
+                        SandboxMode::Full => "shell (sandboxed)",
+                        SandboxMode::Online => "shell (sandboxed+online)",
                     };
                     return Err(Error::ActionFailed {
                         action: label.to_string(),
@@ -171,30 +179,191 @@ fn env_timeout_ms() -> Option<u64> {
 /// Respects the `SCAFFOLD_SHELL_TIMEOUT_SECS` environment variable.
 pub fn execute(command: &str) -> Result<String> {
     if let Some(ms) = env_timeout_ms() {
-        return run_with_deadline(command, false, ms);
+        return run_with_deadline(command, SandboxMode::None, ms);
     }
-    run_to_completion(command, false)
+    run_to_completion(command, SandboxMode::None)
 }
 
 /// Execute a shell command with a timeout (in milliseconds).
 pub fn execute_with_timeout(command: &str, timeout_ms: u64) -> Result<String> {
-    run_with_deadline(command, false, timeout_ms)
+    run_with_deadline(command, SandboxMode::None, timeout_ms)
 }
 
 /// Execute a shell command in a sandbox (for meta-agent proposed commands).
 ///
-/// On macOS, wraps the command with `sandbox-exec` to deny network access.
+/// On macOS, wraps the command with `sandbox-exec` to deny network access
+/// and restrict filesystem to CWD.
 /// On other platforms, executes normally (no OS-level sandbox available).
 pub fn execute_sandboxed(command: &str) -> Result<String> {
     if let Some(ms) = env_timeout_ms() {
-        return run_with_deadline(command, true, ms);
+        return run_with_deadline(command, SandboxMode::Full, ms);
     }
-    run_to_completion(command, true)
+    run_to_completion(command, SandboxMode::Full)
 }
 
 /// Execute a sandboxed shell command with a timeout (in milliseconds).
 pub fn execute_sandboxed_with_timeout(command: &str, timeout_ms: u64) -> Result<String> {
-    run_with_deadline(command, true, timeout_ms)
+    run_with_deadline(command, SandboxMode::Full, timeout_ms)
+}
+
+/// Execute a shell command in an online sandbox (network allowed, filesystem restricted).
+///
+/// On macOS, wraps the command with `sandbox-exec` restricting filesystem to CWD
+/// but allowing network access. Use for meta-agent proposed tools that need internet.
+/// On other platforms, executes normally (no OS-level sandbox available).
+pub fn execute_sandboxed_online(command: &str) -> Result<String> {
+    if let Some(ms) = env_timeout_ms() {
+        return run_with_deadline(command, SandboxMode::Online, ms);
+    }
+    run_to_completion(command, SandboxMode::Online)
+}
+
+/// Execute an online-sandboxed shell command with a timeout (in milliseconds).
+pub fn execute_sandboxed_online_with_timeout(command: &str, timeout_ms: u64) -> Result<String> {
+    run_with_deadline(command, SandboxMode::Online, timeout_ms)
+}
+
+/// Execute a command given as argv (no shell interpolation) with optional stdin.
+///
+/// `mode` controls sandboxing. If `stdin_data` is provided, it is piped to the process.
+/// If `timeout_ms` is provided, the command is killed after that many milliseconds.
+pub fn execute_argv(
+    argv: &[String],
+    stdin_data: Option<&str>,
+    mode: SandboxMode,
+    timeout_ms: Option<u64>,
+) -> Result<String> {
+    if argv.is_empty() {
+        return Err(Error::ActionFailed {
+            action: "tool_spec".to_string(),
+            message: "empty argv".into(),
+        });
+    }
+
+    let mut cmd = match mode {
+        #[cfg(target_os = "macos")]
+        SandboxMode::Full | SandboxMode::Online => {
+            let allow_network = mode == SandboxMode::Online;
+            let profile = sandbox_profile_with_options(allow_network);
+            let mut c = Command::new("sandbox-exec");
+            c.arg("-p").arg(profile);
+            c.args(argv);
+            c
+        }
+        #[cfg(not(target_os = "macos"))]
+        SandboxMode::Full | SandboxMode::Online => {
+            let mut c = Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        }
+        SandboxMode::None => {
+            let mut c = Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            c
+        }
+    };
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+
+    let effective_timeout = timeout_ms.or_else(env_timeout_ms);
+
+    if let Some(ms) = effective_timeout {
+        use std::time::{Duration, Instant};
+
+        let mut child = cmd.spawn()?;
+
+        // Write stdin if provided
+        if let Some(data) = stdin_data {
+            if let Some(mut stdin_pipe) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin_pipe.write_all(data.as_bytes());
+                // Drop to close stdin so the child can proceed
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(ms);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = child.stdout.take().map(|mut s| {
+                        let mut buf = Vec::new();
+                        std::io::Read::read_to_end(&mut s, &mut buf).ok();
+                        buf
+                    }).unwrap_or_default();
+                    let stderr = child.stderr.take().map(|mut s| {
+                        let mut buf = Vec::new();
+                        std::io::Read::read_to_end(&mut s, &mut buf).ok();
+                        buf
+                    }).unwrap_or_default();
+
+                    if status.success() {
+                        return Ok(String::from_utf8_lossy(&stdout).to_string());
+                    } else {
+                        let stderr_str = String::from_utf8_lossy(&stderr);
+                        let label = match mode {
+                            SandboxMode::None => "tool_spec",
+                            SandboxMode::Full => "tool_spec (sandboxed)",
+                            SandboxMode::Online => "tool_spec (sandboxed+online)",
+                        };
+                        return Err(Error::ActionFailed {
+                            action: label.to_string(),
+                            message: format!("command failed: {}", stderr_str),
+                        });
+                    }
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(Error::Timeout(format!(
+                            "tool_spec command timed out after {}s",
+                            ms / 1000
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::Runtime(format!("failed to wait on child: {}", e)));
+                }
+            }
+        }
+    } else {
+        // No timeout path
+        let mut child = cmd.spawn()?;
+
+        if let Some(data) = stdin_data {
+            if let Some(mut stdin_pipe) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin_pipe.write_all(data.as_bytes());
+            }
+        }
+
+        let output = child.wait_with_output()?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let label = match mode {
+                SandboxMode::None => "tool_spec",
+                SandboxMode::Full => "tool_spec (sandboxed)",
+                SandboxMode::Online => "tool_spec (sandboxed+online)",
+            };
+            Err(Error::ActionFailed {
+                action: label.to_string(),
+                message: format!("command failed: {}", stderr),
+            })
+        }
+    }
 }
 
 /// Execute a shell command and return raw bytes.

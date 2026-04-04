@@ -4,7 +4,7 @@
 //! parent candidate, archive history, and available nodes, then proposes a
 //! structured mutation via an LLM call.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -248,14 +248,14 @@ RULES:
 
 4. Explore before exploiting. If the last 3+ mutations targeted the same node or used the same strategy, switch to a different lever: a different node, a different mutation kind, or a different structural pattern. Diminishing returns are real.
 
-5. Preserve what works. Compare the parent's pass/fail column with others. Target always-failing or flip-flopping cases. Avoid changes that risk flipping P→F on stable cases.
+5. Preserve what works. A hard regression gate protects cases that any previous best candidate passed — a mutation CANNOT produce a new best if it fails any protected case, even with a higher overall score. Target always-failing cases; never risk flipping protected P→F cases.
 
 6. Content mutations (rewrite_prompt, rewrite_system, rewrite_shell, rewrite_tool_spec, set_config) change a single node's behavior. Use when the graph structure is sound but a node's output is wrong — format, constraints, instructions.
 
 7. Structural mutations change the graph's topology. Use propose_decomposition for decomposition patterns, or individual structural mutations (insert_step, wrap_retry, insert_verify, etc.) for targeted changes.
 
 8. **Use propose_decomposition for adding structure.** When the "Suggested decompositions" section recommends a motif, use propose_decomposition. Motifs produce validated, tested graph transformations. Available motifs:
-   - **normalize_verify**: append a normalizer node that fixes spelling/case/alias. Use when failures are invalid format or label not in allowed set.
+   - **normalize_verify**: append a normalizer node that fixes spelling/case/alias. Use when failures are invalid format or label not in allowed set. normalize_verify is ONLY for format errors (wrong case, truncated, misspelled). It CANNOT fix semantic confusion where the model picks a valid but wrong label.
    - **shortlist_select**: replace one step with shortlist→choose→normalize. Narrows label space before selection. Use when errors are confusion among nearby labels.
    - **router_expert**: insert a domain router before the step. Use when clear domain clusters exist in the data.
    - **retrieve_decide**: insert a fact extraction step before decision. Use when the model lacks external knowledge.
@@ -293,6 +293,8 @@ RULES:
 13. Write generalizable prompts. The failure evidence shows training-set errors — use them to understand the KIND of mistake, not to hard-code fixes for specific cases. Do NOT embed specific label pairs (e.g. "distinguish X from Y"), case IDs, or error examples from the failure evidence into prompt rewrites. Instead, write instructions that teach the model the general principle (e.g. "read the full text before classifying" rather than "if you see symptoms X, output disease Y").
 
 14. Prefer generalizable example strategies. When using attach_example_policy, prefer `domain_conditioned` (selects examples matching the input's domain) or `nearest` (selects by input similarity) over `confusion_cover` (which overfits to training-set confusion pairs). Use confusion_cover only when domain_conditioned has already been tried.
+
+15. Consider simplifying before adding complexity. If the base classifier is strong (within 5% of best score without critique/repair), the critique loop may be adding noise rather than value. Use remove_step to ablate the critique pipeline and test whether the simpler graph performs equally well. Complexity must earn its keep.
 
 Return ONLY a single JSON object. No markdown, no explanation outside the JSON."#;
 
@@ -705,6 +707,7 @@ fn build_context(
                     if trend.saturated { "yes" } else { "no" },
                 ));
 
+                let mut non_best_count = 0usize;
                 for e in entries {
                     let score = e.eval.score().unwrap_or(0.0);
                     let parent_entry = e.delta
@@ -717,6 +720,16 @@ fn build_context(
                     };
                     let delta = score - parent_score;
 
+                    // Was this parent the best candidate when the mutation was applied?
+                    let was_best = {
+                        let best_at_time = archive.entries.iter()
+                            .filter(|x| x.delta.id < e.delta.id && x.eval.score().is_some())
+                            .max_by(|a, b| a.eval.score().unwrap().partial_cmp(&b.eval.score().unwrap()).unwrap_or(std::cmp::Ordering::Equal));
+                        best_at_time.map(|b| b.delta.id) == e.delta.parent_id
+                    };
+                    let parent_ctx = if was_best { "" } else { " (non-best parent)" };
+                    if !was_best { non_best_count += 1; }
+
                     // Flag likely runtime/template errors (0 passed out of N = total crash)
                     let crash_note = if score == 0.0 && e.eval.total_cases() > 0 && e.eval.cases_passed() == 0 {
                         " ⚠ LIKELY RUNTIME ERROR — mutation idea may be valid, template was broken"
@@ -724,7 +737,7 @@ fn build_context(
                         ""
                     };
                     ctx.push_str(&format!(
-                        "  {} ({}@{:.4} → {:.4}, Δ{}) passed {}/{}{}\n",
+                        "  {} ({}@{:.4} → {:.4}, Δ{}) passed {}/{}{}{}\n",
                         candidate_label(&e.delta, &e.eval),
                         parent_label,
                         parent_score,
@@ -732,6 +745,7 @@ fn build_context(
                         format_delta(delta),
                         e.eval.cases_passed(),
                         e.eval.total_cases(),
+                        parent_ctx,
                         crash_note,
                     ));
 
@@ -740,6 +754,12 @@ fn build_context(
                         let short: String = reasoning.chars().take(200).collect();
                         ctx.push_str(&format!("    Reasoning: \"{}\"\n", short));
                     }
+                }
+                if non_best_count > 0 && entries.len() > 1 {
+                    ctx.push_str(&format!(
+                        "  Note: {}/{} attempts were from non-best parents. Recovery deltas don't indicate general effectiveness.\n",
+                        non_best_count, entries.len(),
+                    ));
                 }
                 ctx.push('\n');
             }
@@ -830,16 +850,23 @@ fn build_context(
             })
             .collect();
 
+        // Classify error types for smarter motif suggestions
+        let (semantic_confusion, format_errors) = classify_error_types(parent_eval.train_case_results());
+
         // Quick Wins: lightweight fixes that should be tried before complex structural changes
         ctx.push_str("## Quick Wins (try these first)\n");
         ctx.push_str("Before complex structural changes, consider these lightweight fixes:\n");
         ctx.push_str("- **add_local_checker**: Add a validation expression after a node to catch bad outputs early.\n");
-        ctx.push_str("- **normalize_verify** (via propose_decomposition): Append a normalizer to fix spelling/case/format.\n");
+        if format_errors > 0 {
+            ctx.push_str("- **normalize_verify** (via propose_decomposition): Append a normalizer to fix spelling/case/format.\n");
+        } else if semantic_confusion > 0 {
+            ctx.push_str("- **rewrite_prompt**: Refine the classifier's instructions to reduce label confusion (the main error type).\n");
+        }
         ctx.push_str("- **attach_example_policy**: Inject few-shot examples from the example bank to guide the model.\n");
         ctx.push_str("These are cheap, composable, and often sufficient before investing in multi-node motifs.\n\n");
 
         // Motif suggestions based on failure patterns — prominent top-level section
-        let motif_suggestions = suggest_motifs(&failure_clusters);
+        let motif_suggestions = suggest_motifs(&failure_clusters, semantic_confusion, format_errors);
         if !motif_suggestions.is_empty() {
             ctx.push_str("## RECOMMENDED: Use propose_decomposition\n");
             ctx.push_str("The following motifs match the observed failure patterns. Use propose_decomposition:\n");
@@ -869,6 +896,14 @@ fn build_context(
                 ));
             }
             ctx.push('\n');
+        }
+
+        // Annotate when semantic confusion is dominant
+        if semantic_confusion > format_errors && semantic_confusion > 0 {
+            ctx.push_str(&format!(
+                "Note: {}/{} failures are valid-but-wrong labels (semantic confusion). normalize_verify CANNOT fix these — it only fixes format/spelling issues. Focus on rewrite_prompt, shortlist_select, router_expert, or attach_example_policy instead.\n\n",
+                semantic_confusion, semantic_confusion + format_errors,
+            ));
         }
     }
 
@@ -1033,6 +1068,62 @@ fn build_context(
             ctx.push('\n');
         }
         ctx.push('\n');
+
+        // Regression gate status
+        if !archive.regression_set.is_empty() {
+            let regressions = archive.count_regressions(parent_eval.train_passed_case_ids());
+            let reg_size = archive.regression_set.len();
+            if regressions > 0 {
+                ctx.push_str(&format!(
+                    "Regression gate: parent FAILS {}/{} protected cases — cannot become best even with higher score.\n",
+                    regressions, reg_size,
+                ));
+                let passed_set: std::collections::HashSet<&str> = parent_eval.train_passed_case_ids().iter().map(|s| s.as_str()).collect();
+                let regressed: Vec<&String> = archive.regression_set.iter()
+                    .filter(|id| !passed_set.contains(id.as_str()))
+                    .take(10)
+                    .collect();
+                ctx.push_str(&format!("  Must fix: [{}]\n", regressed.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+            } else {
+                ctx.push_str(&format!(
+                    "Regression gate: parent passes all {}/{} protected cases\n",
+                    reg_size, reg_size,
+                ));
+            }
+            ctx.push('\n');
+        }
+
+        // Per-domain breakdown: detect if optimizer is trading domains
+        {
+            let mut domain_stats: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // (passed, total)
+            for case in parent_eval.train_case_results() {
+                let domain = case.case_id.as_deref()
+                    .map(|id| id.split('_').next().unwrap_or("unknown"))
+                    .unwrap_or("unknown")
+                    .to_string();
+                let entry = domain_stats.entry(domain).or_insert((0, 0));
+                entry.1 += 1;
+                if case.passed { entry.0 += 1; }
+            }
+            if domain_stats.len() >= 2 {
+                ctx.push_str("Per-domain accuracy:\n");
+                let mut worst_pct = 100.0_f64;
+                let mut best_pct = 0.0_f64;
+                for (domain, (passed, total)) in &domain_stats {
+                    let pct = if *total > 0 { *passed as f64 / *total as f64 * 100.0 } else { 0.0 };
+                    ctx.push_str(&format!("  {}: {}/{} ({:.0}%)\n", domain, passed, total, pct));
+                    worst_pct = worst_pct.min(pct);
+                    best_pct = best_pct.max(pct);
+                }
+                if best_pct - worst_pct > 20.0 {
+                    ctx.push_str(&format!(
+                        "DOMAIN IMBALANCE: best={:.0}%, worst={:.0}%. The optimizer may be trading domains against each other. Consider router_expert to handle domains separately, or rewrite_prompt with domain-agnostic instructions.\n",
+                        best_pct, worst_pct,
+                    ));
+                }
+                ctx.push('\n');
+            }
+        }
 
         // Generalization signal: val checkpoint history
         if !archive.val_checkpoints.is_empty() {
@@ -1475,16 +1566,46 @@ struct FailureClusterSummary {
     cases: Vec<String>,
 }
 
+/// Returns (semantic_confusion_count, format_error_count) from failed cases.
+/// Semantic confusion = output matches an expected value from another case.
+/// Format error = output doesn't match any known expected value.
+fn classify_error_types(cases: &[crate::optimizer::CaseResult]) -> (usize, usize) {
+    let expected_set: HashSet<String> = cases.iter()
+        .filter_map(|c| c.expected_excerpt.as_ref())
+        .map(|e| e.trim().to_lowercase())
+        .collect();
+    let mut semantic = 0;
+    let mut format_err = 0;
+    for case in cases.iter().filter(|c| !c.passed) {
+        if let Some(ref output) = case.output_excerpt {
+            if expected_set.contains(&output.trim().to_lowercase()) {
+                semantic += 1;
+            } else {
+                format_err += 1;
+            }
+        } else {
+            format_err += 1;
+        }
+    }
+    (semantic, format_err)
+}
+
 /// Suggest relevant motifs based on failure cluster analysis.
-fn suggest_motifs(clusters: &[FailureClusterSummary]) -> Vec<(crate::motifs::Motif, String)> {
+fn suggest_motifs(clusters: &[FailureClusterSummary], semantic_confusion: usize, format_errors: usize) -> Vec<(crate::motifs::Motif, String)> {
     let mut suggestions = vec![];
-    // Always suggest NormalizeVerify first when any failures exist —
-    // it's the cheapest structural fix and catches format/case/whitespace issues.
-    let total_failures: usize = clusters.iter().map(|c| c.count).sum();
-    if total_failures > 0 {
+    // Only suggest NormalizeVerify when format errors exist (truncated, wrong case, not in allowed set).
+    // Skip when failures are predominantly semantic confusion (valid but wrong label).
+    if format_errors > 0 {
         suggestions.push((
             crate::motifs::Motif::NormalizeVerify,
-            format!("{} failing case(s) — normalize_verify is the cheapest structural fix", total_failures),
+            format!("{} format error(s) (truncated/case/whitespace) — normalize_verify can fix these", format_errors),
+        ));
+    }
+    if semantic_confusion > 0 && format_errors == 0 {
+        // Annotate that normalize won't help
+        suggestions.push((
+            crate::motifs::Motif::ShortlistSelect,
+            format!("{} semantic confusion(s) (valid but wrong label) — shortlist_select narrows the candidate space", semantic_confusion),
         ));
     }
     for cluster in clusters {
@@ -1951,6 +2072,17 @@ fn summarize_repair_behavior(candidate: &CandidateDelta, eval: &EvalResults, ir:
             all_steps.last().map(|(_, node)| node.clone())
         };
 
+        // Compare first prompt output (proposed answer) with final pipeline output.
+        // This catches VoteCritiqueRepair where critique outputs JSON but repair tool
+        // may keep the proposed answer unchanged.
+        let first_prompt_output = prompt_steps.first().map(|(_, _, v)| *v);
+        let final_output = case.step_trace.last().map(|(_, v)| v.as_str());
+        let pipeline_noop = match (first_prompt_output, final_output) {
+            (Some(a), Some(b)) => a.trim() == b.trim(),
+            _ => false,
+        };
+
+        // Also check original prompt_same for backward compatibility
         let prompt_same = prompt_steps.len() >= 2 && {
             let a = prompt_steps[prompt_steps.len() - 2].2;
             let b = prompt_steps[prompt_steps.len() - 1].2;
@@ -1964,7 +2096,7 @@ fn summarize_repair_behavior(candidate: &CandidateDelta, eval: &EvalResults, ir:
         let failure_same = non_agent_outputs.len() >= 2
             && failure_sig_first == failure_sig_last;
 
-        let outcome = if prompt_same {
+        let outcome = if pipeline_noop || prompt_same {
             RepairOutcome::NoOp
         } else if failure_same {
             RepairOutcome::SameError

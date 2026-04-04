@@ -1,0 +1,330 @@
+type ExerciseInput = { instructions: string, stub_filename: string, stub_content: string, language: string, exercise_dir: string }
+
+node solve_code: prompt {
+    in: { instructions: string, stub_filename: string, stub_content: string, language: string }
+    out: string
+    template: "You are given a programming exercise. Write a complete, correct solution.
+
+## Exercise Instructions
+{{ instructions }}
+
+## File: {{ stub_filename }}
+
+## Starting Code / Stub
+```
+{{ stub_content }}
+```
+
+## Language: {{ language }}
+
+## Critical Requirements
+Before writing code, carefully consider:
+
+1. **Return types**: If the test compares against a list, return a list. If it compares against a string, return a string. If it compares against a tuple, return a tuple. Read the instructions carefully for the expected return type.
+
+2. **Function signatures**: Match the exact function/method signatures from the stub. Use `*args` for variadic positional parameters when the stub shows them. Pay attention to keyword-only arguments.
+
+3. **Error messages**: When raising exceptions, use the EXACT error message strings specified in the instructions. Common patterns:
+   - `\"Tree could not be reoriented\"` (not \"Tree does not contain node X\")
+   - `\"Only root should have equal record and parent id.\"` (not generic messages)
+   - `\"Record id is invalid or out of order.\"` (not \"root record must have id 0\")
+   - `\"syntax error\"` (not \"unknown operation\")
+
+4. **Edge cases for common exercises**:
+   - **Hangman**: `remaining_guesses` starts at 9. Only decrement on WRONG guesses. A repeated guess of an already-guessed letter should also decrement remaining_guesses.
+   - **Connect/Hex**: Use fixed hex neighbor offsets `(-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0)` — do NOT use row-parity offsets.
+   - **React cells**: The compute function receives a LIST of input values: `compute_function([val1, val2, ...])`. InputCell needs a `set_value` method that propagates changes. Use BFS/topological propagation, not recursive DFS, to avoid duplicate callbacks.
+   - **Proverb**: The function uses `*args` for items. When qualifier is given, the expected return is a LIST of strings (one per verse), not a joined string.
+   - **Two Bucket**: Use BFS over all reachable states `(a, b)` with the constraint that the state where the non-starting bucket is full and the starting bucket is empty is forbidden. This finds the optimal solution.
+   - **PaasIO/MeteredFile**: Must subclass `io.BufferedRandom`. Do NOT use delegation. Override `read()`, `write()`, and track stats. The `__enter__` should return self without calling super().__enter__().
+   - **Transpose**: Process column-by-column. Pad shorter rows with spaces only up to the length of the longest row that has a character in that column.
+   - **Scale Generator**: Use flats (b) for keys: F, Bb, Eb, Ab, Db, Gb, d, g, c, f, bb, eb. Use sharps (#) for all others.
+
+5. **Data structures**: Match the exact API from the stub. If the stub defines a class with specific methods, implement all of them.
+
+## Output Rules
+- Output ONLY the complete source code for the file
+- Do NOT include markdown fences (no ```)
+- Do NOT include any commentary or explanation
+- The code must be complete and runnable"
+    system: file("examples/prompts/aider_solve/system")
+    model: "openai/gpt-5.4-mini"
+    temperature: 0.5
+}
+
+node fix_code: prompt {
+    in: { instructions: string, stub_filename: string, stub_content: string, language: string, previous_code: string, test_output: string }
+    out: string
+    template: "You are given a failing solution for a programming exercise. Your task is to analyze the test failure, identify the exact bug, and produce a corrected version of the code.
+
+## Exercise Instructions
+{{ instructions }}
+
+## File: {{ stub_filename }}
+
+## Language: {{ language }}
+
+## Previous Code (BUGGY)
+```
+{{ previous_code }}
+```
+
+## Test Output (FAILURE)
+```
+{{ test_output }}
+```
+
+## Debugging Process
+
+Before writing code, you MUST reason step-by-step:
+
+1. **Read the test error carefully.** What exact assertion failed? What was the expected value vs the actual value?
+2. **Trace through the buggy code** with the failing test input to find where the logic diverges from the expected output.
+3. **Identify the root cause.** Common bugs include:
+   - Wrong casing (uppercase vs lowercase)
+   - Wrong return type (string vs list, list of strings vs list of lists)
+   - Off-by-one errors in loops or ranges
+   - Missing edge cases (e.g., boundary conditions, special characters)
+   - Wrong error types (ValueError vs TypeError vs specific messages)
+   - Incorrect algorithm logic (wrong traversal, missing rules)
+   - Method returning wrong thing (e.g., `added()` should track return values of `add_student()`)
+4. **Describe the exact fix** you will make before writing the corrected code.
+
+## Important Rules
+- Do NOT rewrite the code from scratch. Make the MINIMUM targeted change to fix the identified bug.
+- If the test expects a specific return type (e.g., flat list of strings, not list of lists), match it exactly.
+- If the test expects specific casing (e.g., lowercase \"nine\" not \"Nine\"), match it exactly.
+- If the test expects specific error messages or types, match them exactly.
+- Pay close attention to the stub file structure — your code must define the same classes/functions.
+
+## Output
+First write your analysis in a brief comment block, then output the complete corrected {{ stub_filename }} file.
+Return ONLY the code for {{ stub_filename }}, no other files. Do NOT include markdown fences or filename headers — just the raw code."
+    system: file("examples/prompts/aider_solve/system")
+    model: "openai/gpt-5.4-mini"
+    temperature: 0
+}
+
+node eval_exercise: tool {
+    in: { code: string, exercise_dir: string, language: string }
+    out: string
+    timeout: 120
+    shell: ".venv/bin/python3 tools/eval_exercise.py --exercise-dir \"{{exercise_dir}}\" --language \"{{language}}\" <<'SCAFFOLD_HEREDOC_7f3a'
+{{code}}
+SCAFFOLD_HEREDOC_7f3a"
+}
+
+node fix_code2: prompt {
+    in: string
+    out: string
+    template: "You are given a failing solution for a programming exercise, along with an expert diagnosis of the bug. Apply the fix precisely.
+
+## Exercise Instructions
+{{ instructions }}
+
+## File: {{ stub_filename }}
+
+## Language: {{ language }}
+
+## Previous Code (BUGGY)
+```
+{{ previous_code }}
+```
+
+## Test Output (FAILURE)
+```
+{{ test_output }}
+```
+
+## Expert Bug Diagnosis
+{{ diagnosis }}
+
+## Your Task
+Apply the fix described in the diagnosis. Rules:
+- Make the MINIMUM change needed to fix the identified bug
+- Do NOT rewrite from scratch
+- Do NOT change working parts of the code
+- If the diagnosis mentions multiple issues, fix ALL of them
+- If the diagnosis says the return type is wrong, fix the return type
+- If the diagnosis says a constant value is wrong, fix that exact value
+- Output ONLY the complete corrected code, no explanations
+- The code must be complete and runnable"
+    system: "You are an expert programmer. You fix bugs precisely based on provided diagnoses. Output only the complete corrected source code for the file, no markdown fences, no commentary."
+    model: "openai/gpt-5.4-mini"
+}
+
+node solve_with_errors: prompt {
+    in: string
+    out: string
+    template: "You are given a programming exercise where a previous attempt FAILED. Study the failed code and test output carefully to avoid the same mistakes, then write a completely new solution from scratch.
+
+## Exercise Instructions
+{{ instructions }}
+
+## File: {{ stub_filename }}
+
+## Language: {{ language }}
+
+## Previous FAILED Code
+```
+{{ failed_code }}
+```
+
+## Test Failure Output
+```
+{{ test_output }}
+```
+
+## Critical Analysis
+Before writing code, analyze:
+1. What specific test assertion failed? What was expected vs actual?
+2. What is the root cause bug in the failed code?
+3. What approach will you take differently to avoid this bug?
+
+## Rules
+- Write a COMPLETE new solution (not a patch of the old one)
+- Ensure you handle ALL edge cases mentioned in the instructions
+- Pay close attention to expected return types, error types, and exact error messages
+- For exercises with specific data structures, match the expected API exactly
+- Output ONLY the complete source code for the file"
+    system: "You are an expert programmer. You solve programming exercises by writing complete, correct source code. Output ONLY the code, no markdown fences, no commentary."
+    model: "openai/gpt-5.4-mini"
+}
+
+node rethink_solve: prompt {
+    in: string
+    out: string
+    template: "You are given a programming exercise where a previous attempt FAILED after multiple repair attempts. You MUST write a fundamentally different solution.
+
+## Exercise Instructions
+{{ instructions }}
+
+## File: {{ stub_filename }}
+
+## Language: {{ language }}
+
+## Previous FAILED Code (DO NOT copy this approach)
+```
+{{ failed_code }}
+```
+
+## Test Failure Output
+```
+{{ test_output }}
+```
+
+## Critical Analysis Before Coding
+Before writing ANY code, you MUST:
+1. Read the test error message character by character. What EXACT value was expected vs produced?
+2. Identify the ROOT CAUSE in the failed code - what fundamental design flaw caused this?
+3. Design a DIFFERENT algorithm/approach that avoids this flaw entirely.
+
+## Common Pitfalls to Avoid
+- **Hangman**: remaining_guesses starts at 9. Only decrement on wrong guesses OR already-guessed letters. Correct new guesses do NOT decrement.
+- **Connect/Hex board**: The board uses space-separated characters per row. Parse by splitting on spaces, NOT by character index. Hex neighbors are: (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0). Do NOT use row-parity offsets.
+- **Dot DSL**: Graph data items can have varying tuple lengths. Edges have 4 elements: (EDGE, src, dst, attrs_dict). Nodes have 3: (NODE, name, attrs_dict). Attrs have 3: (ATTR, key, value_string).
+- **Grade School**: add_student() should NOT raise on duplicates - it should silently reject and added() tracks success/failure as True/False list.
+- **Forth**: Word definitions must expand references at definition time (snapshot semantics). `: foo 10 ;` then `: foo foo 1 + ;` means the second foo's body should expand to `10 1 +`.
+- **SGF Parsing**: After `;`, if the next character is a lowercase letter, raise ValueError('property must be in uppercase') BEFORE checking for empty node.
+- **Proverb**: Always return a list of strings, never a joined string.
+- **Transpose**: Pad shorter lines with spaces to match the longest line length before transposing.
+- **POV/Tree rerooting**: When rerooting, the target node keeps its original children AND gets a new child (its former parent with siblings).
+- **Scale Generator**: Use flats (b) for flat keys (F, Bb, Eb, Ab, Db, Gb, d, g, c, f, bb, eb) and sharps (#) for sharp keys.
+- **Wordy**: Unknown operations should raise ValueError('syntax error'), not 'unknown operation'.
+- **React**: Use topological ordering for callback propagation to avoid stale values.
+- **REST API**: The `post` method receives a dict, not a JSON string. Do NOT call json.loads on it.
+- **Bowling**: Validate pin counts during roll(), not just during score(). Two rolls in a frame cannot exceed 10.
+
+## Rules
+- Write a COMPLETE new solution from scratch
+- Use a DIFFERENT algorithmic approach than the failed code
+- Handle ALL edge cases from the instructions
+- Match exact return types, error types, and error message strings
+- Output ONLY the complete source code"
+    system: "You are an expert programmer who learns from failures. When given a failed solution, you identify the root cause and write a completely new solution using a different approach. Output ONLY code, no markdown fences, no commentary."
+    model: "openai/gpt-5.4-mini"
+}
+
+node analyze_error: prompt {
+    in: string
+    out: string
+    template: "You are a debugging expert. Analyze this test failure and produce a precise diagnosis.
+
+## Language: {{ language }}
+
+## Exercise Instructions (summary)
+{{ instructions }}
+
+## Stub/skeleton code
+```
+{{ stub_content }}
+```
+
+## Current (buggy) code
+```
+{{ previous_code }}
+```
+
+## Test failure output
+```
+{{ test_output }}
+```
+
+## Your Task
+Analyze the failure step by step:
+1. What exact assertion or error occurred? Quote the expected vs actual values.
+2. What specific line(s) in the code cause this? Trace the execution path.
+3. What is the ROOT CAUSE? (e.g., wrong constant value, wrong return type, missing edge case, wrong algorithm step, incorrect error message text)
+4. What is the EXACT minimal fix? Be very specific - which line, what change, why.
+5. Are there any other likely issues visible in the code that tests haven't caught yet?
+
+IMPORTANT: Focus on the SPECIFIC values in the error. If the test expects 9 but got 10, explain exactly why the code produces 10. If it expects ' ' but got '', explain the difference. Do NOT suggest rewriting from scratch."
+    system: "You are a precise debugging analyst. Your job is to identify the exact root cause of test failures. Be specific about line numbers, values, and logic flow. Never be vague."
+    model: "openai/gpt-5.4-mini"
+}
+
+graph solve {
+    in: ExerciseInput
+    out: string
+    step attempt = solve_code(instructions: input.instructions, stub_filename: input.stub_filename, stub_content: input.stub_content, language: input.language)
+    step result = eval_exercise(code: attempt, exercise_dir: input.exercise_dir, language: input.language)
+    loop (max: 6, while: json_parse(result).passed == false) {
+        step attempt = fix_code(instructions: input.instructions, stub_filename: input.stub_filename, stub_content: input.stub_content, language: input.language, previous_code: attempt, test_output: json_parse(result).test_output)
+        step result = eval_exercise(code: attempt, exercise_dir: input.exercise_dir, language: input.language)
+        carry attempt = attempt
+        carry result = result
+    }
+    if json_parse(result).passed == true {
+        emit result
+    } else {
+        step attempt2 = rethink_solve(instructions: input.instructions, stub_filename: input.stub_filename, stub_content: input.stub_content, language: input.language, failed_code: attempt, test_output: json_parse(result).test_output)
+        step result2 = eval_exercise(code: attempt2, exercise_dir: input.exercise_dir, language: input.language)
+        loop (max: 4, while: json_parse(result2).passed == false) {
+            step attempt2 = fix_code(instructions: input.instructions, stub_filename: input.stub_filename, stub_content: input.stub_content, language: input.language, previous_code: attempt2, test_output: json_parse(result2).test_output)
+            step result2 = eval_exercise(code: attempt2, exercise_dir: input.exercise_dir, language: input.language)
+            carry attempt2 = attempt2
+            carry result2 = result2
+        }
+        emit result2
+    }
+}
+
+objective aider_polyglot {
+    graph: solve
+    dataset: file("examples/datasets/aider_polyglot_python.jsonl")
+    checker tests_pass { json_parse(output).passed == true }
+    metric pass_rate { checker: tests_pass }
+    score: pass_rate
+    split { train: 0.7, val: 0.15, test: 0.15 }
+    select { primary: pass_rate }
+    tune {
+        solve_code.temperature in [0, 0.2, 0.5, 0.7, 1]
+        fix_code.temperature in [0, 0.2, 0.5]
+    }
+    topology {
+        mutations: [set_config, insert_step, remove_step, replace_component]
+        max_nodes: 8
+        target_score: 0.9
+    }
+}
+

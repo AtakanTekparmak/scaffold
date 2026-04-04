@@ -1,5 +1,5 @@
-// Text Classification Benchmark
-// Replicates Meta-Harness (Stanford, 2026) text classification setup.
+// Joint Text Classification — Meta-Harness Comparison
+// Merged: Symptom2Disease (22 classes) + LawBench (202 classes) + USPTO-50k (10 classes)
 // Graph has NO access to ground truth labels — must classify blind.
 
 // ── Types ──
@@ -46,13 +46,13 @@ graph classify {
 
 objective text_classify {
     graph: classify
-    dataset: file("examples/datasets/symptom2disease.jsonl")
+    dataset: file("examples/datasets/training/merged_training.jsonl")
 
     checker correct { output == expected.label }
     metric accuracy { checker: correct }
     score: accuracy
 
-    split { train: 0.28, val: 0.17, test: 0.55 }
+    split { train: 0.28, val: 0.16, test: 0.56 }
     select { primary: accuracy }
 
     tune {

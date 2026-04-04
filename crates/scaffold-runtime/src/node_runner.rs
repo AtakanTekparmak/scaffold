@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use scaffold_ir::ir::*;
 
 use crate::error::{Error, Result};
+use crate::example_bank::{ExampleBank, ExamplePolicy};
 use crate::llm::{self, LlmConfig};
 use crate::prompt::PromptManager;
 use crate::value::Value;
@@ -16,15 +17,20 @@ use crate::value::Value;
 /// - **Tool**: shell command or json expression evaluation
 /// - **Agent**: multi-turn LLM + tools loop
 /// - **Verify**: LLM call → parse verdict with `pass` field
+///
+/// When `online` is true, meta-agent proposed shell commands use an online sandbox
+/// (network allowed, filesystem restricted) instead of the full sandbox.
 pub async fn run_node(
     node: &NodeIR,
     input: Value,
     overrides: &HashMap<String, serde_json::Value>,
     prompt_mgr: &PromptManager,
+    online: bool,
+    example_bank: Option<&ExampleBank>,
 ) -> Result<Value> {
     match node.kind {
-        NodeKindIR::Prompt => run_prompt(node, input, overrides, prompt_mgr).await,
-        NodeKindIR::Tool => run_tool(node, input, overrides).await,
+        NodeKindIR::Prompt => run_prompt(node, input, overrides, prompt_mgr, example_bank).await,
+        NodeKindIR::Tool => run_tool(node, input, overrides, online).await,
         NodeKindIR::Agent => run_agent(node, input, overrides, prompt_mgr).await,
         NodeKindIR::Verify => run_verify(node, input, overrides, prompt_mgr).await,
     }
@@ -62,6 +68,7 @@ fn resolve_max_tokens(
     }
     config.max_tokens
 }
+
 
 /// Load template content from StringOrFileIR.
 pub(crate) fn load_template(sof: &StringOrFileIR) -> Result<String> {
@@ -129,6 +136,7 @@ async fn run_prompt(
     input: Value,
     overrides: &HashMap<String, serde_json::Value>,
     prompt_mgr: &PromptManager,
+    example_bank: Option<&ExampleBank>,
 ) -> Result<Value> {
     let config = &node.config;
 
@@ -161,7 +169,43 @@ async fn run_prompt(
         }
     };
 
-    let prompt_text = render_template(&template_source, &ctx, prompt_mgr)?;
+    let mut prompt_text = render_template(&template_source, &ctx, prompt_mgr)?;
+
+    // Example injection: if _example_policy override + bank exist, select and prepend
+    if let (Some(bank), Some(policy_val)) = (example_bank, overrides.get("_example_policy")) {
+        if let Ok(policy) = serde_json::from_value::<ExamplePolicy>(policy_val.clone()) {
+            // Per-case deterministic seed from input
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            input.to_string().hash(&mut hasher);
+            let seed = hasher.finish();
+
+            // Extract domain from input for domain-conditioned selection
+            let input_domain = match &input {
+                Value::Map(m) => m.get("domain").or_else(|| m.get("category"))
+                    .and_then(|v| match v { Value::String(s) => Some(s.clone()), _ => None }),
+                Value::Struct { fields, .. } => fields.get("domain").or_else(|| fields.get("category"))
+                    .and_then(|v| match v { Value::String(s) => Some(s.clone()), _ => None }),
+                _ => None,
+            };
+
+            let examples = bank.select(&node.name, &policy, seed, input_domain.as_deref());
+            if !examples.is_empty() {
+                let mut block = String::from("Examples:\n\n");
+                for (i, ex) in examples.iter().enumerate() {
+                    block.push_str(&format!(
+                        "Example {}:\nInput: {}\nOutput: {}\n\n",
+                        i + 1,
+                        ex.input_excerpt,
+                        ex.output,
+                    ));
+                }
+                block.push_str(&prompt_text);
+                prompt_text = block;
+            }
+        }
+    }
 
     // Load system prompt (overrides take priority)
     let system = if let Some(v) = overrides.get("system") {
@@ -213,8 +257,61 @@ async fn run_tool(
     node: &NodeIR,
     input: Value,
     overrides: &HashMap<String, serde_json::Value>,
+    online: bool,
 ) -> Result<Value> {
     let config = &node.config;
+
+    // ToolSpec override: structured argv-based execution (preferred over raw shell)
+    if let Some(spec_value) = overrides.get("_tool_spec") {
+        if let Ok(spec) = serde_json::from_value::<crate::mutations::ToolSpec>(spec_value.clone()) {
+            let ctx = match &input {
+                Value::Map(m) => Value::Map(m.clone()),
+                Value::Struct { fields, .. } => Value::Map(fields.clone()),
+                other => {
+                    let mut map = HashMap::new();
+                    map.insert("input".to_string(), other.clone());
+                    Value::Map(map)
+                }
+            };
+            let prompt_mgr = PromptManager::new();
+
+            // Render each argv element as a template
+            let rendered_argv: Vec<String> = spec
+                .argv
+                .iter()
+                .map(|arg| prompt_mgr.interpolate(arg, &ctx))
+                .collect::<Result<Vec<_>>>()?;
+
+            // Render stdin template if present
+            let rendered_stdin = match &spec.stdin_template {
+                Some(tmpl) => Some(prompt_mgr.interpolate(tmpl, &ctx)?),
+                None => None,
+            };
+
+            // Determine sandbox mode: ToolSpec is always meta-agent proposed → sandboxed.
+            // spec.net controls whether network is allowed.
+            let mode = if spec.net {
+                crate::shell::SandboxMode::Online
+            } else {
+                crate::shell::SandboxMode::Full
+            };
+
+            let timeout_ms = if spec.timeout > 0 {
+                Some(spec.timeout * 1000)
+            } else {
+                None
+            };
+
+            let output = crate::shell::execute_argv(
+                &rendered_argv,
+                rendered_stdin.as_deref(),
+                mode,
+                timeout_ms,
+            )?;
+
+            return Ok(Value::String(output.trim_end().to_string()));
+        }
+    }
 
     // Shell tool: run a shell command (check override first)
     let shell_override = overrides
@@ -240,18 +337,25 @@ async fn run_tool(
             .and_then(|v| v.as_u64())
             .or(config.timeout);
 
-        // Meta-agent proposed shell commands run sandboxed (no network access).
+        // Meta-agent proposed shell commands run sandboxed.
+        // With --online, the sandbox allows network access but still restricts filesystem.
         let is_meta_proposed = shell_override.is_some();
-        let output = match (is_meta_proposed, timeout) {
-            (true, Some(t)) => {
+        let output = match (is_meta_proposed, online, timeout) {
+            (true, true, Some(t)) => {
+                crate::shell::execute_sandboxed_online_with_timeout(&rendered_cmd, t * 1000)?
+            }
+            (true, true, None) => crate::shell::execute_sandboxed_online(&rendered_cmd)?,
+            (true, false, Some(t)) => {
                 crate::shell::execute_sandboxed_with_timeout(&rendered_cmd, t * 1000)?
             }
-            (true, None) => crate::shell::execute_sandboxed(&rendered_cmd)?,
-            (false, Some(t)) => crate::shell::execute_with_timeout(&rendered_cmd, t * 1000)?,
-            (false, None) => crate::shell::execute(&rendered_cmd)?,
+            (true, false, None) => crate::shell::execute_sandboxed(&rendered_cmd)?,
+            (false, _, Some(t)) => {
+                crate::shell::execute_with_timeout(&rendered_cmd, t * 1000)?
+            }
+            (false, _, None) => crate::shell::execute(&rendered_cmd)?,
         };
 
-        return Ok(Value::String(output));
+        return Ok(Value::String(output.trim_end().to_string()));
     }
 
     // JSON tool: evaluate json expression fields

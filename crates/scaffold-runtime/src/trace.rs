@@ -811,7 +811,11 @@ fn summarize_text(text: &str, max_len: usize) -> String {
     if squashed.len() <= max_len {
         squashed
     } else {
-        format!("{}...", &squashed[..max_len])
+        let mut end = max_len;
+        while end > 0 && !squashed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &squashed[..end])
     }
 }
 
