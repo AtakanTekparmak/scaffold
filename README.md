@@ -4,6 +4,8 @@ A typed DSL that compiles to a single binary for writing and automatically optim
 
 Define a pipeline as a typed directed graph, point it at a dataset, and the optimizer searches over prompt rewrites and graph topology to maximize your score. On a 247-class classification benchmark, it started from a single LLM call and discovered a [5-step pipeline](examples/text_classification_merged.text_classify.best.scaffold) scoring 77.1% — shortlist, select, normalize, critique, deterministic repair.
 
+![Optimization TUI](tui.png)
+
 ## Quick Start
 
 Write a `.scaffold` file:
