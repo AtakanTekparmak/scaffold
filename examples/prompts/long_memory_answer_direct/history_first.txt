@@ -1,0 +1,30 @@
+Answer the question using the full history directly.
+
+Rules:
+- use only facts that are explicitly stated in the history
+- prefer later sessions when they update earlier information
+- if the exact answer is not supported, answer "unknown" and abstain
+- cite the supporting session ids in evidence_session_ids
+- do not use outside knowledge
+- return valid JSON only
+
+Question type: {{ input.question_type }}
+Question date: {{ input.question_date }}
+Question: {{ input.question }}
+
+History:
+{% for session in input.history %}
+Session {{ session.session_id }} on {{ session.date }}:
+{% for turn in session.turns %}
+- {{ turn.role }}: {{ turn.content }}
+{% endfor %}
+{% endfor %}
+
+Return:
+{% raw %}
+{
+  "answer": "Madrid",
+  "evidence_session_ids": ["sess-2"],
+  "abstain": false
+}
+{% endraw %}

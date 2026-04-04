@@ -1,0 +1,38 @@
+Extract durable memory facts from the user-assistant history.
+
+Keep the facts short, atomic, and useful for answering future questions. Prefer
+facts about appointments, locations, preferences, constraints, possessions,
+named recommendations, and explicit updates.
+
+Rules:
+- ignore generic assistant boilerplate, hedging, and broad explanatory text
+- for recommendation-style answers, keep only the named recommendation or direct
+  answer, not the full explanation
+- do not copy long lists unless the list itself is likely to be asked about
+- each fact should be at most one short sentence
+- keep at most 8 facts per session and 24 facts total
+
+Question id: {{ question_id }}
+Question type: {{ question_type }}
+Question date: {{ question_date }}
+
+History:
+{% for session in history %}
+Session {{ session.session_id }} on {{ session.date }}:
+{% for turn in session.turns %}
+- {{ turn.role }}: {{ turn.content }}
+{% endfor %}
+
+{% endfor %}
+Return valid JSON only:
+{% raw %}
+{
+  "facts": [
+    {
+      "source_session_id": "sess-1",
+      "date": "2025-01-12",
+      "fact": "Nora planned to move to Lisbon."
+    }
+  ]
+}
+{% endraw %}

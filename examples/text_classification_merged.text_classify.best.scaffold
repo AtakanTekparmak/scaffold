@@ -1,0 +1,154 @@
+type ClassifyInput = { task_text: string, label_guide: string }
+
+node classify_text: prompt {
+    in: { task_text: string, label_guide: string }
+    out: string
+    template: file("examples/prompts/classify/template")
+    system: file("examples/prompts/classify/system")
+    model: "openai/gpt-oss-120b"
+    temperature: 0
+}
+
+node retry_classify: prompt {
+    in: { task_text: string, label_guide: string, previous_prediction: string }
+    out: string
+    template: file("examples/prompts/classify_retry/template")
+    system: file("examples/prompts/classify/system")
+    model: "openai/gpt-oss-120b"
+    temperature: 0
+}
+
+node _motif.result_proposed.choose: prompt {
+    in: string
+    out: string
+    template: "You must select exactly ONE correct category from the shortlisted candidates below.
+
+## Text
+
+{{task_text}}
+
+## Candidate Categories (shortlisted)
+
+{{candidates}}
+
+## Full Category List (for reference)
+
+{{label_guide}}
+
+## Instructions
+
+1. For EACH candidate, identify the specific evidence in the text that supports or contradicts it.
+2. Pay close attention to distinguishing details: specific legal terms, specific symptoms/disease patterns, specific chemical transformations.
+3. Choose the candidate with the STRONGEST and most SPECIFIC match to the text content.
+4. If none of the candidates seem right, you may choose from the full category list instead.
+5. Output ONLY the single exact category label. No explanation."
+}
+
+node _motif.result.critique: prompt {
+    in: string
+    out: string
+    template: "You are a skeptical classification auditor. Your job is to CHALLENGE the proposed classification and determine if a better option exists.
+
+## Original Text
+
+{{task_text}}
+
+## Available Categories
+
+{{label_guide}}
+
+## Proposed Classification
+
+{{proposed}}
+
+## Audit Protocol
+
+Do NOT assume the proposed label is correct. Follow these steps:
+
+1. IGNORE the proposed label initially. Read the text fresh and independently identify the 3 most likely categories from the list.
+2. For EACH of your top 3 candidates, list the specific evidence from the text that supports it.
+3. Now compare: does the proposed label match your top choice? If not, which category has the STRONGEST specific evidence?
+4. Watch for these common errors:
+   - Generic/broad category chosen when a more SPECIFIC subcategory exists (e.g., a general crime label when a specialized statute applies)
+   - Superficially similar categories confused (e.g., similar symptoms pointing to different diseases, similar chemical reactions in different classes)
+   - Truncated or incomplete label names that miss qualifying details
+5. Check that the proposed label is written EXACTLY as it appears in the category list - character for character, word for word. Even one missing character means it needs correction.
+
+After your analysis, output ONLY this JSON on the final line:
+{\"verdict\": \"keep\" or \"change\", \"better_label\": \"the exact correct label copied character-by-character from the category list\", \"confidence\": 0.0 to 1.0}
+
+IMPORTANT: If you have ANY doubt, use \"change\". The better_label must be copied EXACTLY from the category list above - verify every character. Even if the verdict is \"keep\", the better_label must exactly match an entry from the list."
+}
+
+node _motif.result.repair: tool {
+    in: string
+    out: string
+    template: ""
+}
+
+node _motif.result_proposed.shortlist: prompt {
+    in: string
+    out: string
+    template: "Read the following text carefully and identify the {{shortlist_k}} most likely category labels from the provided list.
+
+## Text
+
+{{task_text}}
+
+## All Categories
+
+{{label_guide}}
+
+## Instructions
+
+1. Read the ENTIRE text to understand the core subject, actions, entities, and domain.
+2. Consider ALL categories in the list — do not default to common/frequent ones.
+3. Select the {{shortlist_k}} categories that are the BEST possible matches.
+4. Output ONLY the {{shortlist_k}} category labels, one per line, in order of likelihood (most likely first).
+5. Copy each label EXACTLY as written in the category list — character for character."
+}
+
+node _motif.result_proposed.normalize: prompt {
+    in: string
+    out: string
+    template: "Given this classification output, extract and return ONLY the exact category label. Remove any explanation, numbering, or extra text. If the label appears truncated, try to match it to the closest entry in the category list.
+
+Classification output: {{raw}}
+
+Category list:
+{{label_guide}}
+
+Output ONLY the exact label, nothing else."
+    system: "You are a precise assistant. Output ONLY the requested value. No explanation, no markdown formatting, no quotes around the answer, no preamble. Just the raw answer text."
+}
+
+graph classify {
+    in: ClassifyInput
+    out: string
+    step result_proposed_shortlist = _motif.result_proposed.shortlist(input: input, task_text: input.task_text, label_guide: input.label_guide)
+    step result_proposed_choose = _motif.result_proposed.choose(input: input, candidates: result_proposed_shortlist, task_text: input.task_text, label_guide: input.label_guide)
+    step result_proposed = _motif.result_proposed.normalize(input: input, raw: result_proposed_choose, label_guide: input.label_guide)
+    step result_critique = _motif.result.critique(input: input, proposed: result_proposed, task_text: input.task_text, label_guide: input.label_guide)
+    step result = _motif.result.repair(input: input, proposed: result_proposed, critique: result_critique, task_text: input.task_text, label_guide: input.label_guide)
+    emit result
+}
+
+objective text_classify {
+    graph: classify
+    dataset: file("examples/datasets/training/merged_training.jsonl")
+    checker correct { output == expected.label }
+    metric accuracy { checker: correct }
+    score: accuracy
+    split { train: 0.28, val: 0.16, test: 0.56 }
+    select { primary: accuracy }
+    tune {
+        classify_text.temperature in [0, 0.2, 0.5, 0.7, 1]
+        retry_classify.temperature in [0, 0.2, 0.5]
+    }
+    topology {
+        mutations: [set_config, insert_step, remove_step, replace_component]
+        max_nodes: 8
+        target_score: 0.9
+    }
+}
+

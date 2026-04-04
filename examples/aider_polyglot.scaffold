@@ -1,0 +1,99 @@
+// Aider Polyglot Benchmark – Python subset
+
+// ── Types ──
+
+type ExerciseInput = {
+    instructions: string,
+    stub_filename: string,
+    stub_content: string,
+    language: string,
+    exercise_dir: string
+}
+
+// ── Nodes ──
+
+node solve_code: prompt {
+    in: { instructions: string, stub_filename: string, stub_content: string, language: string }
+    out: string
+    template: file("examples/prompts/aider_solve/template")
+    system: file("examples/prompts/aider_solve/system")
+    model: "openai/gpt-5.4-mini"
+    temperature: 0.2
+}
+
+node fix_code: prompt {
+    in: { instructions: string, stub_filename: string, stub_content: string, language: string, previous_code: string, test_output: string }
+    out: string
+    template: file("examples/prompts/aider_fix/template")
+    system: file("examples/prompts/aider_solve/system")
+    model: "openai/gpt-5.4-mini"
+    temperature: 0.2
+}
+
+node eval_exercise: tool {
+    in: { code: string, exercise_dir: string, language: string }
+    out: string
+    shell: ".venv/bin/python3 tools/eval_exercise.py --exercise-dir \"{{exercise_dir}}\" --language \"{{language}}\" <<'SCAFFOLD_HEREDOC_7f3a'\n{{code}}\nSCAFFOLD_HEREDOC_7f3a"
+    timeout: 120
+}
+
+// ── Graph ──
+
+graph solve {
+    in: ExerciseInput
+    out: string
+
+    // Attempt 1: generate solution from instructions + stub
+    step attempt1 = solve_code(
+        instructions: input.instructions,
+        stub_filename: input.stub_filename,
+        stub_content: input.stub_content,
+        language: input.language
+    )
+    step result1 = eval_exercise(
+        code: attempt1,
+        exercise_dir: input.exercise_dir,
+        language: input.language
+    )
+
+    // Attempt 2: fix based on test error output (only if attempt 1 failed)
+    if json_parse(result1).passed == false {
+        step attempt2 = fix_code(
+            instructions: input.instructions,
+            stub_filename: input.stub_filename,
+            stub_content: input.stub_content,
+            language: input.language,
+            previous_code: attempt1,
+            test_output: json_parse(result1).test_output
+        )
+        step result2 = eval_exercise(
+            code: attempt2,
+            exercise_dir: input.exercise_dir,
+            language: input.language
+        )
+        emit result2
+    } else {
+        emit result1
+    }
+}
+
+// ── Objective ──
+
+objective aider_polyglot {
+    graph: solve
+    dataset: file("examples/datasets/aider_polyglot_python.jsonl")
+
+    checker tests_pass { json_parse(output).passed == true }
+    metric pass_rate { checker: tests_pass }
+    score: pass_rate
+
+    split { train: 0.7, val: 0.15, test: 0.15 }
+    select { primary: pass_rate }
+
+    tune {
+        solve_code.temperature in [0.0, 0.2, 0.5, 0.7, 1.0]
+        fix_code.temperature in [0.0, 0.2, 0.5]
+    }
+
+    topology { mutations: [set_config, insert_step, remove_step, replace_component] max_nodes: 8 target_score: 0.9 }
+}

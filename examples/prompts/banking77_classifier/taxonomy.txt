@@ -1,0 +1,12 @@
+Choose the single best Banking77 intent label for the user message.
+
+Allowed labels:
+{label_guide}
+
+Treat underscores as spaces when reading the labels, but return the original label slug exactly as listed.
+Focus on the user's requested action or problem, not just isolated keywords.
+
+User message:
+{text}
+
+Return exactly one label from the allowed list.

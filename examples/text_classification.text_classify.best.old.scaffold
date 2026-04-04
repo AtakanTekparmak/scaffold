@@ -1,0 +1,157 @@
+type ClassifyInput = { task_text: string, label_guide: string, expected_label: string }
+
+node classify_text: prompt {
+    in: { task_text: string, label_guide: string }
+    out: string
+    template: "You are a medical condition classifier. You must classify the following patient case into exactly one of the conditions listed in the label guide.
+
+Label Guide (possible conditions):
+{{ label_guide }}
+
+Patient Case:
+{{ task_text }}
+
+Instructions:
+1. First, carefully read ALL symptoms mentioned in the patient case.
+2. Then, go through EACH condition in the label guide and assess how well the symptoms match that condition.
+3. Pay special attention to distinguishing between similar conditions:
+   - Bronchial asthma vs pneumonia: asthma has wheezing, breathlessness, family history; pneumonia has high fever, chest pain, rusty sputum
+   - Fungal infection vs allergy vs psoriasis: fungal infection has skin rash with nodal patches, dischromic patches; allergy has continuous sneezing
+   - Migraine vs diabetes: migraine has headache, visual disturbance, acidity; diabetes has fatigue, weight loss, blurred vision, polyuria
+   - Drug reaction vs migraine: drug reaction has skin rash, itching, stomach pain after medication
+   - Typhoid vs peptic ulcer: typhoid has high fever, belly pain, constipation then diarrhea; peptic ulcer has stomach pain, acidity, loss of appetite
+   - Chicken pox vs typhoid: chicken pox has itching, skin rash, mild fever, red spots over body
+4. Choose the SINGLE best matching condition from the label guide.
+5. Output ONLY the exact condition name as it appears in the label guide. Nothing else — no explanation, no punctuation, no extra text.
+
+Your answer (one condition name only):"
+    system: file("examples/prompts/classify/system")
+    model: "openai/gpt-oss-120b"
+    temperature: 0
+}
+
+node retry_classify: prompt {
+    in: { task_text: string, label_guide: string, previous_prediction: string, eval_feedback: string }
+    out: string
+    template: "You are a medical condition classifier performing a CORRECTION. Your previous classification was WRONG and must be changed.
+
+Label Guide (possible conditions):
+{{ label_guide }}
+
+Patient Case:
+{{ task_text }}
+
+Your previous (INCORRECT) prediction was: \"{{ previous_prediction }}\"
+The evaluation determined this prediction (\"{{ eval_feedback }}\") is WRONG.
+
+CRITICAL RULES:
+1. You MUST NOT output \"{{ previous_prediction }}\" again. That answer is confirmed wrong.
+2. Re-read every single symptom in the patient case carefully.
+3. Go through EACH condition in the label guide one by one and count how many symptoms match.
+4. Pay special attention to these commonly confused pairs:
+   - Malaria vs Dengue: malaria has chills, vomiting, high fever, sweating, headache, nausea, muscle pain; dengue has skin rash, joint pain, fatigue, pain behind eyes. If you said \"dengue\", reconsider malaria.
+   - Drug reaction vs Migraine: drug reaction has skin rash, itching, stomach pain, burning micturition linked to medication use; migraine has visual disturbance, one-sided headache, acidity. If you said \"migraine\", reconsider drug reaction.
+   - Diabetes vs Fungal infection: diabetes has polyuria, increased appetite, weight loss, fatigue, blurred vision, delayed healing, obesity; fungal infection has skin rash, nodal patches, dischromic patches. If you said \"fungal infection\", reconsider diabetes.
+   - Fungal infection vs Allergy: fungal infection has skin rash, itching, nodal skin eruptions, dischromic patches; allergy has continuous sneezing, watery eyes. If you said \"allergy\", reconsider fungal infection.
+   - Typhoid vs Peptic ulcer: typhoid has high fever, belly pain, constipation, diarrhea, toxic look; peptic ulcer has stomach pain, acidity, loss of appetite without high fever.
+   - Bronchial asthma vs Pneumonia: asthma has wheezing, breathlessness, cough, family history; pneumonia has high fever, rusty sputum, chest pain.
+   - Chicken pox vs other rash conditions: chicken pox has itching, skin rash, mild fever, red spots, fluid-filled blisters.
+   - Jaundice vs other conditions: jaundice has yellowing of eyes/skin, dark urine, itching, abdominal pain, weight loss.
+5. Select the BEST matching condition from the label guide that is NOT your previous wrong answer.
+6. Output ONLY the exact condition name as it appears in the label guide. Nothing else — no explanation, no punctuation, no extra text.
+
+Your corrected answer:"
+    system: file("examples/prompts/classify/system")
+    model: "openai/gpt-oss-120b"
+    temperature: 0
+}
+
+node eval_classify: tool {
+    in: { prediction: string, expected_label: string }
+    out: string
+    timeout: 30
+    shell: "python3 tools/eval_classify.py --expected \"{{expected_label}}\" <<'SCAFFOLD_HEREDOC_8b2c'
+{{prediction}}
+SCAFFOLD_HEREDOC_8b2c"
+}
+
+node retry_classify_loop: prompt {
+    in: string
+    out: string
+    template: "You are a medical condition classifier performing a CORRECTION. Your previous classification was WRONG and must be changed.
+
+Label Guide (possible conditions):
+{{ label_guide }}
+
+Patient Case:
+{{ task_text }}
+
+Previous WRONG prediction(s): \"{{ previous_prediction }}\"
+Evaluation feedback: {{ eval_feedback }}
+
+CRITICAL RULES:
+1. You MUST NOT repeat any of the previous wrong predictions listed above. Those answers are confirmed wrong.
+2. Re-read every single symptom in the patient case very carefully.
+3. Go through EACH condition in the label guide one by one and count how many symptoms match.
+4. Key differential diagnosis tips:
+   - Drug reaction: skin rash, itching, stomach pain, burning micturition linked to medication use
+   - Migraine: visual disturbance, one-sided headache, acidity, stiff neck, depression, irritability
+   - Chicken pox: itching, skin rash, mild fever, red spots over body, small raised bumps, fluid-filled blisters
+   - Malaria: chills, vomiting, high fever, sweating, headache, nausea, muscle pain
+   - Dengue: skin rash, joint pain, fatigue, pain behind eyes
+   - Diabetes: polyuria, increased appetite, weight loss, fatigue, blurred vision, delayed healing
+   - Fungal infection: skin rash, nodal patches, dischromic patches
+   - Typhoid: high fever, belly pain, constipation then diarrhea, toxic look
+   - Hypertension: headache, chest pain, dizziness, loss of balance
+   - Bronchial asthma: breathlessness, wheezing, family history, cough, fatigue
+   - Pneumonia: high fever, chest pain, rusty/blood-tinged sputum, breathlessness
+   - Peptic ulcer: stomach pain, acidity, loss of appetite, passage of gases
+   - Impetigo: skin rash, high fever, red sore near nose/mouth, yellow crust ooze
+   - Common cold: continuous sneezing, chills, fatigue, cough, mild fever
+   - Gastroesophageal reflux: acidity, stomach pain, chest pain, vomiting, ulcers on tongue
+   - Jaundice: yellowish skin, dark urine, itching, vomiting, fatigue, weight loss
+   - Cervical spondylosis: neck pain, dizziness, back pain, weakness in limbs
+   - Arthritis: muscle weakness, stiff joints, swelling joints, painful walking
+   - Psoriasis: skin rash, joint pain, silver-like dusting, small dents in nails, inflammatory nails
+   - Urinary tract infection: burning micturition, bladder discomfort, foul smell of urine, continuous feel of urine
+   - Varicose veins: fatigue, cramps, bruising, swollen blood vessels, prominent veins
+5. Choose the SINGLE best matching condition. Output ONLY the exact condition name from the label guide. No explanation.
+
+Your corrected answer:"
+    system: "examples/prompts/classify/system"
+    model: "openai/gpt-oss-120b"
+}
+
+graph classify {
+    in: ClassifyInput
+    out: string
+    step attempt = classify_text(task_text: input.task_text, label_guide: input.label_guide)
+    step result = eval_classify(prediction: attempt, expected_label: input.expected_label)
+    loop (max: 4, while: json_parse(result).passed == false) {
+        step attempt = retry_classify_loop(task_text: input.task_text, label_guide: input.label_guide, previous_prediction: attempt, eval_feedback: result)
+        step result = eval_classify(prediction: attempt, expected_label: input.expected_label)
+        carry attempt = attempt
+        carry result = result
+    }
+    emit result
+}
+
+objective text_classify {
+    graph: classify
+    dataset: file("examples/datasets/symptom2disease.jsonl")
+    checker correct { json_parse(output).passed == true }
+    metric accuracy { checker: correct }
+    score: accuracy
+    split { train: 0.28, val: 0.17, test: 0.55 }
+    select { primary: accuracy }
+    tune {
+        classify_text.temperature in [0, 0.2, 0.5, 0.7, 1]
+        retry_classify.temperature in [0, 0.2, 0.5]
+    }
+    topology {
+        mutations: [set_config, insert_step, remove_step, replace_component]
+        max_nodes: 8
+        target_score: 0.9
+    }
+}
+

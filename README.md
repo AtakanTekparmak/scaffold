@@ -1,105 +1,78 @@
-Scaffold Lang
-=============
+Scaffold
+========
 
---WIP--
+A typed DSL and runtime for building, evaluating, and optimizing LLM computation graphs.
 
-Purpose
--------
-- A tools‑first DSL and runtime for LLM‑authored automation that remains verifiable, analyzable, and safe to execute.
-- Guarantees that generation mistakes are caught at compile time via parsing, typing and verification — not at runtime.
-- Enables an interpreted inner loop for rapid iteration, with optional code generation for production binaries.
-
-Why not “just Python”
----------------------
-- Python accepts any syntactically valid program, but it does not encode scaffold semantics. An LLM can produce Python that runs yet violates the intended pipeline/tool contracts.
-- Scaffold encodes those contracts in the language: typed I/O, restricted forms, analyzable control flow, and declared interfaces for tools/prompts/agents/pipelines.
-- Errors surface at compile time:
-  - Unknown tool/prompt/agent references
-  - Type mismatches across steps and fields
-  - Invalid field access or binding names
-  - Ill‑typed pre/postconditions and agent expressions
+Overview
+--------
+Scaffold provides a language for defining typed computation graphs that wire together LLM prompts, tools, and control flow. Programs are verified at compile time (parsing, type-checking, static analysis) and executed by a built-in interpreter. An evolutionary optimizer with an optional LLM-guided meta-agent searches over graph structure and prompt content to maximize objective scores on datasets.
 
 Core Concepts
 -------------
-- Types: Primitive, struct, list, map, option, result, and named aliases. Used everywhere for I/O and validation.
-- Tools: Deterministic, typed building blocks. Implementations are restricted expressions/blocks (shell, foreign calls, control flow) with optional spec (pre/post, pure).
-- Prompts: Single LLM calls with typed I/O; templates interpolate input values. Output schema is enforced.
-- Agents: Multi‑turn LLM controllers with an explicit tool list, system prompt, reward/done/timeout policies.
-- Pipelines: Fixed sequences of tool/prompt/evaluable expressions with typed input and output.
+- **Types**: Primitive, struct, list, map, option, and named aliases. Used everywhere for I/O validation.
+- **Nodes**: Typed components — `prompt`, `tool`, `agent`, `verify` — with declared input/output types.
+- **Graphs**: Computation graphs that wire nodes via steps, loops, conditionals, parallel fan-out, and emit.
+- **Objectives**: Evaluation contracts that bind a graph to a dataset with checkers, metrics, and a score expression.
+- **Topology**: Structural mutation rules (insert/remove steps, verify wrappers, component swaps) that the optimizer explores.
+- **Meta-agent**: An LLM-guided mutation proposer that analyzes the optimization archive and proposes targeted mutations instead of random search.
 
-What Scaffold Guarantee
------------------
-- Parse‑time safety: The grammar only admits the constructs we support. No implicit execution of arbitrary host code.
-- Type‑time safety: A checker validates every declaration and expression with a global type environment.
-- Verify‑time checks: Optional static analyses (bounds, reachability/deadlock) reject ill‑formed orchestrations.
-- Runtime safety: Interpreter and generated code continue to check pre/postconditions and report structured errors.
+What Scaffold Guarantees
+------------------------
+- **Parse-time safety**: The grammar only admits supported constructs.
+- **Type-time safety**: A checker validates every declaration and expression.
+- **Verify-time checks**: Optional static analyses (bounds, reachability) reject ill-formed orchestrations.
+- **Runtime safety**: The interpreter validates inputs, outputs, and step wiring at execution time.
 
-Workflow
---------
-- Author: Write a `.scaffold` file using types, tools, prompts, agents, and pipelines.
-- Check: `scaffold check file.scaffold` — parse + type + verification errors are surfaced with spans.
-- Interpret (inner loop): `scaffold run file.scaffold --pipeline my_flow --input '{"..."}'` — no compilation required.
-- Codegen (production): `scaffold codegen file.scaffold -o out_dir` — generates a Rust crate with CLI.
-- Build (one‑shot binary): `scaffold build file.scaffold -o out_dir [--release]` — codegen + cargo build.
+CLI
+---
+```
+scaffold check FILE                     # parse + type check + verify
+scaffold compile FILE [-o ir.json]      # lower to IR JSON
+scaffold run FILE                       # execute the default graph
+scaffold evaluate FILE --objective OBJ  # evaluate on dataset
+scaffold optimize FILE --objective OBJ  # evolutionary optimization
+  --max-candidates N                    # evolutionary generations
+  --meta-model MODEL                    # enable LLM-guided meta-agent
+  --meta-full-traces                    # full execution traces for meta-agent
+  --concurrency N                       # parallel case evaluation
+  --live                                # TUI visualization
+  --report-dir DIR                      # persist reports
+  --write-best FILE                     # freeze best candidate
+```
 
-Compile‑Time Constraints (Examples)
------------------------------------
-- Undefined references:
-  - Agents: tools listed must exist.
-  - Pipelines: steps must resolve to a known tool or prompt when called.
-- Type mismatches:
-  - Pipeline steps must pass arguments that match the callee’s input type.
-  - Field access must target declared fields of a struct‑typed value.
-  - Pre/postconditions must be boolean; reward/done expressions must type‑check.
+Optimization
+------------
+The optimizer runs in three phases:
 
-Interpreter vs Codegen
-----------------------
-- Interpreter (development/hot reload):
-  - Executes IR directly with strong runtime checks.
-  - Enforces typed shell parsing (int/float/bool/string/bytes) and assembles declared struct outputs from bindings.
-  - Supports field access in pipeline assignments (e.g., `let words = result.count`).
-- Codegen (production):
-  - Emits a Rust crate that uses the same typed interfaces, native JSON schemas for LLM calls, and the same safety rails.
-  - Generated crates can be built and distributed without this repository.
+1. **Seeding** — evaluate the original graph as baseline.
+2. **Tunable sweep** — enumerate all declared parameter combinations (skipped when meta-agent is active).
+3. **Evolutionary** — mutate parent candidates via topology changes and content rewrites.
 
-CLI Cheatsheet
---------------
-- `scaffold check FILE` — parse + type check + verify a scaffold file.
-- `scaffold parse FILE` — syntax only (for debugging).
-- `scaffold compile FILE [-o ir.json]` — lower to IR JSON.
-- `scaffold run FILE [--tool T|--prompt P|--agent A|--pipeline X] --input JSON` — interpret and execute.
-- `scaffold codegen FILE -o DIR [--format]` — generate a Rust crate.
-- `scaffold build FILE -o DIR [--release] [--runtime-path PATH|SCAFFOLD_RUNTIME_VERSION=x.y]` — generate and compile a binary.
+**Meta-agent** (`--meta-model`): Instead of random mutations, an LLM analyzes the archive (scores, failures, templates) and proposes targeted mutations. Content rewrites use an instructions-only approach that mechanically preserves data bindings and format blocks from the original template.
+
+**Full execution traces** (`--meta-full-traces`): Sends full step-by-step execution traces for all failed cases to the meta-agent (instead of only the first 5). Also adds changed-case trace analysis showing traces for cases that flipped between generations, giving the meta-agent concrete evidence of what each mutation changed.
+
+**Hierarchical optimization**: Objectives with `sub` blocks optimize sub-graphs first, freeze the best results into the IR, then optimize the parent graph.
 
 Repository Layout
 -----------------
-- `crates/scaffold-syntax` — lexer/parser for the DSL.
-- `crates/scaffold-types` — type checker and type environment.
-- `crates/scaffold-verify` — static analyses (bounds, reachability, deadlock).
-- `crates/scaffold-ir` — serializable IR: types, tools, prompts, agents, pipelines.
-- `crates/scaffold-interpreter` — interpreter for the IR (Loader/Executor/ForeignRegistry).
-- `crates/scaffold-runtime` — runtime utilities (shell, LLM, prompt manager, error, value, tracing).
-- `crates/scaffold-codegen` — Rust code generator for tools/prompts/agents/pipelines.
-- `crates/scaffold-cli` — command line interface providing `scaffold`.
+- `crates/scaffold-syntax` — lexer/parser for the DSL
+- `crates/scaffold-types` — type checker and type environment
+- `crates/scaffold-verify` — static analyses (bounds, reachability, deadlock)
+- `crates/scaffold-ir` — serializable IR and pretty-printer
+- `crates/scaffold-runtime` — interpreter, LLM integration, optimizer, meta-agent
+- `crates/scaffold-cli` — CLI binary with TUI visualization
+
+Examples
+--------
+- `examples/long_memory_oracle_mini.scaffold` — hierarchical memory retrieval benchmark
+- `examples/aider_polyglot.scaffold` — Aider polyglot coding benchmark (Python)
+- `examples/text_classification.scaffold` — text classification benchmark (Meta-Harness comparison)
 
 For LLMs
 --------
-- Read the authoring guide: `docs/LLM_GUIDE.md` for exact syntax, patterns, and constraints to generate correct scaffolds.
-
-Design Principles
------------------
-- Constrain the representation so an LLM can reliably produce correct scaffolds and failures are detectable early.
-- Keep semantics explicit and analyzable: typed I/O everywhere, named interfaces, finite control constructs.
-- Prefer clear, small, composable primitives (tools/prompts) over unconstrained general‑purpose code.
-- Separate development and production paths: interpreter for the inner loop, codegen for distribution.
-
-Status
-------
-- Parser, type checker, IR, interpreter, runtime, and CLI are complete and integrated.
-- Codegen covers tools/prompts/agents/pipelines; binary builds are supported.
-- Ongoing: deeper verification passes, more foreign module patterns, and expanded examples.
+Read the authoring guide: `docs/LLM_GUIDE.md` for syntax, patterns, and constraints to generate correct scaffolds.
 
 Contributing
 ------------
-- Please open issues/PRs with clear problem statements and repros.
-- Keep additions aligned with the core goal: verifiable, analyzable scaffolds authored by LLMs.
+Please open issues/PRs with clear problem statements and repros.

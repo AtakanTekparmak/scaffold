@@ -1,647 +1,532 @@
-//! Serialization and AST-to-IR lowering
-
-use std::collections::HashMap;
+//! AST-to-IR lowering for Scaffold v2
 
 use scaffold_syntax::ast::*;
-use scaffold_types::TypeEnv;
 
 use crate::ir::*;
 
-/// Error during IR lowering
+/// Error during lowering
 #[derive(Debug, Clone)]
 pub struct LowerError {
     pub message: String,
     pub span: Span,
 }
 
-impl LowerError {
-    pub fn new(message: impl Into<String>, span: Span) -> Self {
-        Self {
-            message: message.into(),
-            span,
-        }
+impl std::fmt::Display for LowerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lower error at {:?}: {}", self.span, self.message)
     }
 }
 
-pub type LowerResult<T> = Result<T, LowerError>;
+/// Lower a program AST to IR
+pub fn lower(program: &Program) -> Result<ScaffoldIR, Vec<LowerError>> {
+    let mut lowerer = Lowerer::new();
+    lowerer.lower_program(program)?;
+    Ok(lowerer.ir)
+}
 
-/// Lower AST to IR
+/// Serialize IR to JSON string
+pub fn to_json(ir: &ScaffoldIR) -> Result<String, String> {
+    serde_json::to_string_pretty(ir).map_err(|e| e.to_string())
+}
+
+/// Serialize IR to compact JSON
+pub fn to_json_compact(ir: &ScaffoldIR) -> Result<String, String> {
+    serde_json::to_string(ir).map_err(|e| e.to_string())
+}
+
+/// Deserialize IR from JSON string
+pub fn from_json(json: &str) -> Result<ScaffoldIR, String> {
+    serde_json::from_str(json).map_err(|e| e.to_string())
+}
+
+/// Parse .scaffold source and lower to IR in one step.
+pub fn parse_and_lower(source: &str) -> Result<ScaffoldIR, String> {
+    let program = scaffold_syntax::parser::parse(source).map_err(|e| format!("{}", e))?;
+    lower(&program).map_err(|errs| {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 pub struct Lowerer {
-    /// Source file name (for debugging)
-    source_file: Option<String>,
-    /// Known tool names (for classifying pipeline calls)
-    tool_names: std::collections::HashSet<String>,
-    /// Known prompt names (for classifying pipeline calls)
-    prompt_names: std::collections::HashSet<String>,
+    ir: ScaffoldIR,
+    errors: Vec<LowerError>,
 }
 
 impl Lowerer {
     pub fn new() -> Self {
         Self {
-            source_file: None,
-            tool_names: std::collections::HashSet::new(),
-            prompt_names: std::collections::HashSet::new(),
+            ir: ScaffoldIR::default(),
+            errors: Vec::new(),
         }
     }
 
-    pub fn with_source_file(mut self, file: String) -> Self {
-        self.source_file = Some(file);
-        self
-    }
-
-    /// Lower a complete program to IR
-    pub fn lower(&self, program: &Program, _type_env: &TypeEnv) -> LowerResult<ScaffoldIR> {
-        // First pass: collect tool and prompt names for classifying pipeline calls
-        let mut tool_names = std::collections::HashSet::new();
-        let mut prompt_names = std::collections::HashSet::new();
-
+    pub fn lower_program(&mut self, program: &Program) -> Result<(), Vec<LowerError>> {
         for decl in &program.declarations {
             match decl {
-                Declaration::Tool(tool) => {
-                    tool_names.insert(tool.name.node.clone());
-                }
-                Declaration::Prompt(prompt) => {
-                    prompt_names.insert(prompt.name.node.clone());
-                }
-                _ => {}
+                Declaration::Type(td) => self.lower_type_decl(td),
+                Declaration::Node(nd) => self.lower_node_decl(nd),
+                Declaration::Graph(gd) => self.lower_graph_decl(gd),
+                Declaration::Objective(od) => self.lower_objective_decl(od),
             }
         }
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(self.errors.clone())
+        }
+    }
 
-        // Create a new lowerer with the collected names
-        let lowerer = Lowerer {
-            source_file: self.source_file.clone(),
-            tool_names,
-            prompt_names,
+    fn lower_type_decl(&mut self, td: &TypeDecl) {
+        let ty = lower_type_expr(&td.ty);
+        self.ir.types.push(TypeDefIR {
+            name: td.name.name.clone(),
+            ty,
+        });
+    }
+
+    fn lower_node_decl(&mut self, nd: &NodeDecl) {
+        let kind = match nd.kind.node {
+            NodeKind::Prompt => NodeKindIR::Prompt,
+            NodeKind::Tool => NodeKindIR::Tool,
+            NodeKind::Agent => NodeKindIR::Agent,
+            NodeKind::Verify => NodeKindIR::Verify,
         };
 
-        // Second pass: lower all declarations
-        let mut ir = ScaffoldIR::new();
-
-        for decl in &program.declarations {
-            match decl {
-                Declaration::Type(type_decl) => {
-                    ir.types.push(lowerer.lower_type_decl(type_decl)?);
-                }
-                Declaration::ExternCrate(extern_crate) => {
-                    ir.extern_crates
-                        .push(lowerer.lower_extern_crate(extern_crate)?);
-                }
-                Declaration::Foreign(foreign) => {
-                    ir.foreign_modules.push(lowerer.lower_foreign(foreign)?);
-                }
-                Declaration::Tool(tool) => {
-                    ir.tools.push(lowerer.lower_tool(tool)?);
-                }
-                Declaration::Prompt(prompt) => {
-                    ir.prompts.push(lowerer.lower_prompt(prompt)?);
-                }
-                Declaration::Agent(agent) => {
-                    ir.agents.push(lowerer.lower_agent(agent)?);
-                }
-                Declaration::Pipeline(pipeline) => {
-                    ir.pipelines.push(lowerer.lower_pipeline(pipeline)?);
-                }
-            }
-        }
-
-        Ok(ir)
-    }
-
-    fn lower_type_decl(&self, type_decl: &TypeDecl) -> LowerResult<TypeDefIR> {
-        Ok(TypeDefIR {
-            name: type_decl.name.node.clone(),
-            definition: self.lower_type_expr(&type_decl.ty.node)?,
-        })
-    }
-
-    fn lower_type_ref(&self, ty: &Spanned<TypeExpr>) -> LowerResult<TypeRefIR> {
-        match &ty.node {
-            TypeExpr::Named(name) => Ok(TypeRefIR::Named {
-                ref_name: name.clone(),
+        let config = NodeConfigIR {
+            template: nd.config.template.as_ref().map(lower_string_or_file),
+            system: nd.config.system.as_ref().map(lower_string_or_file),
+            model: nd.config.model.clone(),
+            temperature: nd.config.temperature,
+            max_tokens: nd.config.max_tokens,
+            tools: nd.config.tools.iter().map(|i| i.name.clone()).collect(),
+            max_turns: nd.config.max_turns,
+            timeout: nd.config.timeout,
+            on_error: nd.config.on_error.as_ref().map(|e| match e {
+                ErrorStrategy::Abort => ErrorStrategyIR::Abort,
+                ErrorStrategy::Retry(n) => ErrorStrategyIR::Retry { max: *n },
             }),
-            _ => Ok(TypeRefIR::Inline(self.lower_type_expr(&ty.node)?)),
-        }
+            shell: nd.config.shell.clone(),
+            json: nd.config.json.as_ref().map(|fields| {
+                fields
+                    .iter()
+                    .map(|f| JsonFieldIR {
+                        key: f.key.clone(),
+                        value: lower_expr(&f.value),
+                    })
+                    .collect()
+            }),
+        };
+
+        self.ir.nodes.push(NodeIR {
+            name: nd.name.name.clone(),
+            kind,
+            input: lower_type_expr(&nd.input),
+            output: lower_type_expr(&nd.output),
+            config,
+        });
     }
 
-    fn lower_type_expr(&self, ty: &TypeExpr) -> LowerResult<TypeIR> {
-        match ty {
-            TypeExpr::Primitive(p) => match p {
-                PrimitiveType::Bool => Ok(TypeIR::Bool),
-                PrimitiveType::Int => Ok(TypeIR::Int),
-                PrimitiveType::Float => Ok(TypeIR::Float),
-                PrimitiveType::String => Ok(TypeIR::String),
-                PrimitiveType::Bytes => Ok(TypeIR::Bytes),
-                PrimitiveType::Any => Ok(TypeIR::Any),
+    fn lower_graph_decl(&mut self, gd: &GraphDecl) {
+        let body = gd.body.iter().map(lower_graph_stmt).collect();
+        self.ir.graphs.push(GraphIR {
+            name: gd.name.name.clone(),
+            input: lower_type_expr(&gd.input),
+            output: lower_type_expr(&gd.output),
+            body,
+        });
+    }
+
+    fn lower_objective_decl(&mut self, od: &ObjectiveDecl) {
+        let subs = od
+            .subs
+            .iter()
+            .map(|sub| SubObjectiveIR {
+                name: sub.name.name.clone(),
+                graph: sub.graph.name.clone(),
+                dataset: lower_dataset_spec(&sub.dataset),
+                checkers: lower_checkers(&sub.checkers),
+                judges: lower_judges(&sub.judges),
+                metrics: lower_metrics(&sub.metrics),
+                score: lower_expr(&sub.score),
+                repeats: sub.repeats,
+                split: lower_split(&sub.split),
+                select: lower_select(&sub.select),
+                tunables: lower_tunables(&sub.tunables),
+                topology: lower_topology(&sub.topology),
+            })
+            .collect();
+
+        self.ir.objectives.push(ObjectiveIR {
+            name: od.name.name.clone(),
+            graph: od.graph.name.clone(),
+            dataset: lower_dataset_spec(&od.dataset),
+            checkers: lower_checkers(&od.checkers),
+            judges: lower_judges(&od.judges),
+            metrics: lower_metrics(&od.metrics),
+            score: lower_expr(&od.score),
+            repeats: od.repeats,
+            split: lower_split(&od.split),
+            select: lower_select(&od.select),
+            tunables: lower_tunables(&od.tunables),
+            topology: lower_topology(&od.topology),
+            subs,
+        });
+    }
+}
+
+fn lower_dataset_spec(ds: &DatasetSpec) -> DatasetSpecIR {
+    match ds {
+        DatasetSpec::File(path) => DatasetSpecIR::File {
+            path: path.clone(),
+        },
+        DatasetSpec::Inline { cases } => DatasetSpecIR::Inline {
+            cases: cases
+                .iter()
+                .map(|c| InlineCaseIR {
+                    input: lower_expr(&c.input),
+                    expected: lower_expr(&c.expected),
+                    id: c.id.clone(),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn lower_checkers(checkers: &[CheckerDecl]) -> Vec<CheckerIR> {
+    checkers
+        .iter()
+        .map(|c| CheckerIR {
+            name: c.name.name.clone(),
+            expr: lower_expr(&c.expr),
+        })
+        .collect()
+}
+
+fn lower_judges(judges: &[JudgeDecl]) -> Vec<JudgeIR> {
+    judges
+        .iter()
+        .map(|j| JudgeIR {
+            name: j.name.name.clone(),
+            model: j.model.clone(),
+            template: j.template.as_ref().map(lower_string_or_file),
+            rubric: j.rubric.as_ref().map(lower_string_or_file),
+        })
+        .collect()
+}
+
+fn lower_metrics(metrics: &[MetricDecl]) -> Vec<MetricIR> {
+    metrics
+        .iter()
+        .map(|m| MetricIR {
+            name: m.name.name.clone(),
+            checker: m.checker.name.clone(),
+        })
+        .collect()
+}
+
+fn lower_split(split: &Option<SplitDecl>) -> Option<SplitIR> {
+    split.as_ref().map(|s| SplitIR {
+        train: s.train,
+        val: s.val,
+        test: s.test,
+    })
+}
+
+fn lower_select(select: &Option<SelectDecl>) -> Option<SelectIR> {
+    select.as_ref().map(|s| SelectIR {
+        primary: s.primary.name.clone(),
+        tie_breakers: s.tie_breakers.iter().map(|i| i.name.clone()).collect(),
+    })
+}
+
+fn lower_tunables(tunables: &[TuneStmt]) -> Vec<TunableIR> {
+    tunables
+        .iter()
+        .map(|t| TunableIR {
+            path: t.path.iter().map(|i| i.name.clone()).collect(),
+            domain: t.domain.iter().map(lower_expr).collect(),
+        })
+        .collect()
+}
+
+fn lower_topology(topology: &Option<TopologyDecl>) -> Option<TopologyIR> {
+    topology.as_ref().map(|t| TopologyIR {
+        mutations: t.mutations.clone(),
+        max_nodes: t.max_nodes,
+        max_depth: t.max_depth,
+        preserve: t.preserve.clone(),
+        target_score: t.target_score,
+    })
+}
+
+fn lower_type_expr(texpr: &Spanned<TypeExpr>) -> TypeIR {
+    match &texpr.node {
+        TypeExpr::Primitive(p) => match p {
+            PrimitiveType::Bool => TypeIR::Bool,
+            PrimitiveType::Int => TypeIR::Int,
+            PrimitiveType::Float => TypeIR::Float,
+            PrimitiveType::String => TypeIR::String,
+            PrimitiveType::Bytes => TypeIR::Bytes,
+            PrimitiveType::Any => TypeIR::Any,
+        },
+        TypeExpr::Named(name) => TypeIR::Named { name: name.clone() },
+        TypeExpr::List(inner) => TypeIR::List {
+            element: Box::new(lower_type_expr(inner)),
+        },
+        TypeExpr::Map(key, val) => TypeIR::Map {
+            key: Box::new(lower_type_expr(key)),
+            value: Box::new(lower_type_expr(val)),
+        },
+        TypeExpr::Option(inner) => TypeIR::Option {
+            inner: Box::new(lower_type_expr(inner)),
+        },
+        TypeExpr::Struct(fields) => TypeIR::Struct {
+            fields: fields
+                .iter()
+                .map(|f| FieldIR {
+                    name: f.name.name.clone(),
+                    ty: lower_type_expr(&f.ty),
+                })
+                .collect(),
+        },
+    }
+}
+
+fn lower_string_or_file(sof: &StringOrFile) -> StringOrFileIR {
+    match sof {
+        StringOrFile::Literal(s) => StringOrFileIR::Literal { value: s.clone() },
+        StringOrFile::File(p) => StringOrFileIR::File { path: p.clone() },
+    }
+}
+
+fn lower_graph_stmt(stmt: &GraphStmt) -> GraphStmtIR {
+    match stmt {
+        GraphStmt::Step(s) => GraphStmtIR::Step(StepIR {
+            name: s.name.name.clone(),
+            node: s.node.name.clone(),
+            args: s.args.iter().map(lower_step_arg).collect(),
+        }),
+        GraphStmt::Loop(l) => GraphStmtIR::Loop(LoopIR {
+            max: lower_expr(&l.max),
+            while_cond: lower_expr(&l.while_cond),
+            body: l.body.iter().map(lower_graph_stmt).collect(),
+        }),
+        GraphStmt::If(i) => GraphStmtIR::If(IfIR {
+            cond: lower_expr(&i.cond),
+            then_body: i.then_body.iter().map(lower_graph_stmt).collect(),
+            else_body: i.else_body.iter().map(lower_graph_stmt).collect(),
+        }),
+        GraphStmt::Choose(c) => GraphStmtIR::Choose(ChooseIR {
+            alternatives: c.alternatives.iter().map(|i| i.name.clone()).collect(),
+        }),
+        GraphStmt::Parallel(p) => GraphStmtIR::Parallel(ParallelIR {
+            var: p.var.name.clone(),
+            collection: lower_expr(&p.collection),
+            reduce: p.reduce.as_ref().map(|i| i.name.clone()),
+            body: p.body.iter().map(lower_graph_stmt).collect(),
+        }),
+        GraphStmt::Emit(e) => GraphStmtIR::Emit(match e {
+            EmitStmt::Direct { value, .. } => EmitIR::Direct {
+                value: lower_expr(value),
             },
-            TypeExpr::Named(name) => Ok(TypeIR::Named { name: name.clone() }),
-            TypeExpr::List(inner) => Ok(TypeIR::List {
-                element: Box::new(self.lower_type_expr(&inner.node)?),
-            }),
-            TypeExpr::Map(key, value) => Ok(TypeIR::Map {
-                key: Box::new(self.lower_type_expr(&key.node)?),
-                value: Box::new(self.lower_type_expr(&value.node)?),
-            }),
-            TypeExpr::Option(inner) => Ok(TypeIR::Option {
-                inner: Box::new(self.lower_type_expr(&inner.node)?),
-            }),
-            TypeExpr::Result(ok, err) => Ok(TypeIR::Result {
-                ok: Box::new(self.lower_type_expr(&ok.node)?),
-                err: Box::new(self.lower_type_expr(&err.node)?),
-            }),
-            TypeExpr::Struct(fields) => {
-                let mut ir_fields = HashMap::new();
-                for field in fields {
-                    ir_fields.insert(
-                        field.name.node.clone(),
-                        self.lower_type_expr(&field.ty.node)?,
-                    );
-                }
-                Ok(TypeIR::Struct { fields: ir_fields })
-            }
-        }
-    }
-
-    fn lower_expr(&self, expr: &Expr) -> LowerResult<ExprIR> {
-        match expr {
-            Expr::Literal(lit) => Ok(ExprIR::Literal {
-                value: self.lower_literal(lit),
-            }),
-            Expr::Ident(name) => Ok(ExprIR::Ident { name: name.clone() }),
-            Expr::FieldAccess(base, field) => Ok(ExprIR::FieldAccess {
-                base: Box::new(self.lower_expr(&base.node)?),
-                field: field.node.clone(),
-            }),
-            Expr::Binary(left, op, right) => Ok(ExprIR::Binary {
-                left: Box::new(self.lower_expr(&left.node)?),
-                op: op.to_string(),
-                right: Box::new(self.lower_expr(&right.node)?),
-            }),
-            Expr::Call(name, args) => {
-                let mut ir_args = Vec::new();
-                for arg in args {
-                    ir_args.push(self.lower_expr(&arg.node)?);
-                }
-                Ok(ExprIR::Call {
-                    function: name.clone(),
-                    args: ir_args,
-                })
-            }
-            Expr::ForeignCall {
-                module,
-                function,
-                args,
-            } => {
-                let mut ir_args = Vec::new();
-                for arg in args {
-                    ir_args.push(self.lower_expr(&arg.node)?);
-                }
-                Ok(ExprIR::ForeignCall {
-                    module: module.clone(),
-                    function: function.clone(),
-                    args: ir_args,
-                })
-            }
-            Expr::Paren(inner) => self.lower_expr(&inner.node),
-        }
-    }
-
-    fn lower_literal(&self, lit: &Literal) -> LiteralIR {
-        match lit {
-            Literal::Int(n) => LiteralIR::Int { value: *n },
-            Literal::Float(n) => LiteralIR::Float { value: *n },
-            Literal::String(s) => LiteralIR::String { value: s.clone() },
-            Literal::Bool(b) => LiteralIR::Bool { value: *b },
-            Literal::Null => LiteralIR::Null,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn make_span(&self, span: Span) -> SourceSpanIR {
-        let mut ir_span = SourceSpanIR::new(span.start, span.end);
-        if let Some(ref file) = self.source_file {
-            ir_span = ir_span.with_file(file.clone());
-        }
-        ir_span
-    }
-
-    // ============================================
-    // Foreign and Tool Lowering
-    // ============================================
-
-    fn lower_extern_crate(&self, decl: &ExternCrateDecl) -> LowerResult<ExternCrateIR> {
-        Ok(ExternCrateIR {
-            name: decl.name.node.clone(),
-            version: decl.version.clone(),
-            features: decl.features.clone(),
-        })
-    }
-
-    fn lower_foreign(&self, decl: &ForeignDecl) -> LowerResult<ForeignModuleIR> {
-        let mut type_aliases = Vec::new();
-        for alias in &decl.type_aliases {
-            type_aliases.push(ForeignTypeAliasIR {
-                name: alias.name.node.clone(),
-                external_type: alias.external_type.clone(),
-            });
-        }
-
-        let mut functions = Vec::new();
-        for func in &decl.functions {
-            let mut params = Vec::new();
-            for param in &func.params {
-                params.push(ForeignParamIR {
-                    name: param.name.node.clone(),
-                    ty: self.lower_type_expr(&param.ty.node)?,
-                });
-            }
-            functions.push(ForeignFnIR {
-                name: func.name.node.clone(),
-                params,
-                return_type: self.lower_type_expr(&func.return_type.node)?,
-            });
-        }
-
-        Ok(ForeignModuleIR {
-            language: decl.language.node.clone(),
-            name: decl.name.node.clone(),
-            type_aliases,
-            functions,
-        })
-    }
-
-    fn lower_tool(&self, decl: &ToolDecl) -> LowerResult<ToolIR> {
-        let implementation = match &decl.implementation {
-            Some(impl_) => Some(self.lower_tool_impl(impl_)?),
-            None => None,
-        };
-
-        let spec = match &decl.spec {
-            Some(spec) => Some(self.lower_tool_spec(spec)?),
-            None => None,
-        };
-
-        let mut variants = Vec::new();
-        for variant in &decl.variants {
-            variants.push(ToolVariantIR {
-                name: variant.name.node.clone(),
-                implementation: self.lower_tool_impl(&variant.implementation)?,
-            });
-        }
-
-        Ok(ToolIR {
-            name: decl.name.node.clone(),
-            input: self.lower_type_expr(&decl.input.node)?,
-            output: self.lower_type_expr(&decl.output.node)?,
-            implementation,
-            spec,
-            variants,
-        })
-    }
-
-    fn lower_tool_impl(&self, impl_: &ToolImpl) -> LowerResult<ToolImplIR> {
-        match impl_ {
-            ToolImpl::Expr(expr) => Ok(ToolImplIR::Expr {
-                expr: self.lower_tool_expr(&expr.node)?,
-            }),
-            ToolImpl::Sequence(stmts) => {
-                let mut ir_stmts = Vec::new();
-                for stmt in stmts {
-                    ir_stmts.push(self.lower_tool_statement(stmt)?);
-                }
-                Ok(ToolImplIR::Sequence {
-                    statements: ir_stmts,
-                })
-            }
-            ToolImpl::Parallel(stmts) => {
-                let mut ir_stmts = Vec::new();
-                for stmt in stmts {
-                    ir_stmts.push(self.lower_tool_statement(stmt)?);
-                }
-                Ok(ToolImplIR::Parallel {
-                    statements: ir_stmts,
-                })
-            }
-        }
-    }
-
-    fn lower_tool_expr(&self, expr: &ToolExpr) -> LowerResult<ToolExprIR> {
-        match expr {
-            ToolExpr::Ident(name) => Ok(ToolExprIR::Ident { name: name.clone() }),
-            ToolExpr::FieldAccess(base, field) => Ok(ToolExprIR::FieldAccess {
-                base: Box::new(self.lower_tool_expr(&base.node)?),
-                field: field.node.clone(),
-            }),
-            ToolExpr::ForeignCall {
-                module,
-                function,
-                args,
-            } => {
-                let mut ir_args = Vec::new();
-                for arg in args {
-                    ir_args.push(self.lower_tool_expr(&arg.node)?);
-                }
-                Ok(ToolExprIR::ForeignCall {
-                    module: module.clone(),
-                    function: function.clone(),
-                    args: ir_args,
-                })
-            }
-            ToolExpr::ToolCall { tool, args } => {
-                let mut ir_args = Vec::new();
-                for arg in args {
-                    ir_args.push(self.lower_tool_expr(&arg.node)?);
-                }
-                Ok(ToolExprIR::ToolCall {
-                    tool: tool.clone(),
-                    args: ir_args,
-                })
-            }
-            ToolExpr::Shell(cmd) => Ok(ToolExprIR::Shell {
-                command: cmd.clone(),
-            }),
-            ToolExpr::Pipe(left, right) => Ok(ToolExprIR::Pipe {
-                left: Box::new(self.lower_tool_expr(&left.node)?),
-                right: Box::new(self.lower_tool_expr(&right.node)?),
-            }),
-            ToolExpr::If {
-                condition,
-                then_branch,
-                else_branch,
-            } => Ok(ToolExprIR::If {
-                condition: self.lower_expr(&condition.node)?,
-                then_branch: Box::new(self.lower_tool_impl(then_branch)?),
-                else_branch: match else_branch {
-                    Some(branch) => Some(Box::new(self.lower_tool_impl(branch)?)),
-                    None => None,
-                },
-            }),
-            ToolExpr::Match { scrutinee, arms } => {
-                let mut ir_arms = Vec::new();
-                for arm in arms {
-                    ir_arms.push(MatchArmIR {
-                        pattern: self.lower_expr(&arm.pattern.node)?,
-                        body: self.lower_tool_impl(&arm.body)?,
-                    });
-                }
-                Ok(ToolExprIR::Match {
-                    scrutinee: Box::new(self.lower_tool_expr(&scrutinee.node)?),
-                    arms: ir_arms,
-                })
-            }
-            ToolExpr::For {
-                variable,
-                iterable,
-                body,
-            } => Ok(ToolExprIR::For {
-                variable: variable.node.clone(),
-                iterable: Box::new(self.lower_tool_expr(&iterable.node)?),
-                body: Box::new(self.lower_tool_impl(body)?),
-            }),
-            ToolExpr::While { condition, body } => Ok(ToolExprIR::While {
-                condition: self.lower_expr(&condition.node)?,
-                body: Box::new(self.lower_tool_impl(body)?),
-            }),
-            ToolExpr::Loop { body } => Ok(ToolExprIR::Loop {
-                body: Box::new(self.lower_tool_impl(body)?),
-            }),
-            ToolExpr::Break => Ok(ToolExprIR::Break),
-            ToolExpr::Continue => Ok(ToolExprIR::Continue),
-            ToolExpr::Literal(lit) => Ok(ToolExprIR::Literal {
-                value: self.lower_literal(lit),
-            }),
-            ToolExpr::Expr(expr) => Ok(ToolExprIR::Expr {
-                expr: Box::new(self.lower_expr(&expr.node)?),
-            }),
-        }
-    }
-
-    fn lower_tool_statement(&self, stmt: &ToolStatement) -> LowerResult<ToolStatementIR> {
-        Ok(ToolStatementIR {
-            binding: stmt.binding.as_ref().map(|b| b.node.clone()),
-            expr: self.lower_tool_expr(&stmt.expr.node)?,
-        })
-    }
-
-    fn lower_tool_spec(&self, spec: &ToolSpec) -> LowerResult<ToolSpecIR> {
-        let mut preconditions = Vec::new();
-        for pre in &spec.preconditions {
-            preconditions.push(self.lower_expr(&pre.node)?);
-        }
-
-        let mut postconditions = Vec::new();
-        for post in &spec.postconditions {
-            postconditions.push(self.lower_expr(&post.node)?);
-        }
-
-        Ok(ToolSpecIR {
-            preconditions,
-            postconditions,
-            pure: spec.pure,
-        })
-    }
-
-    // ============================================
-    // Prompt, Agent, Pipeline Lowering
-    // ============================================
-
-    fn lower_prompt(&self, decl: &PromptDecl) -> LowerResult<PromptIR> {
-        Ok(PromptIR {
-            name: decl.name.node.clone(),
-            input: self.lower_type_expr(&decl.input.node)?,
-            output: self.lower_type_expr(&decl.output.node)?,
-            template: self.lower_string_or_file(&decl.template),
-            system: decl.system.as_ref().map(|s| self.lower_string_or_file(s)),
-        })
-    }
-
-    fn lower_agent(&self, decl: &AgentDecl) -> LowerResult<AgentIR> {
-        let reward = match &decl.reward {
-            Some(expr) => Some(self.lower_expr(&expr.node)?),
-            None => None,
-        };
-        let done = match &decl.done {
-            Some(expr) => Some(self.lower_expr(&expr.node)?),
-            None => None,
-        };
-        let on_error = self.lower_error_strategy(&decl.on_error);
-
-        Ok(AgentIR {
-            name: decl.name.node.clone(),
-            input: self.lower_type_expr(&decl.input.node)?,
-            output: self.lower_type_expr(&decl.output.node)?,
-            tools: decl.tools.iter().map(|t| t.node.clone()).collect(),
-            system: self.lower_string_or_file(&decl.system),
-            max_turns: decl.max_turns,
-            reward,
-            done,
-            on_error,
-            timeout: decl.timeout,
-        })
-    }
-
-    fn lower_error_strategy(
-        &self,
-        strategy: &scaffold_syntax::ast::ErrorStrategy,
-    ) -> ErrorStrategyIR {
-        match strategy {
-            scaffold_syntax::ast::ErrorStrategy::Abort => ErrorStrategyIR::Abort,
-            scaffold_syntax::ast::ErrorStrategy::Retry(count) => {
-                ErrorStrategyIR::Retry { count: *count }
-            }
-        }
-    }
-
-    fn lower_pipeline(&self, decl: &PipelineDecl) -> LowerResult<PipelineIR> {
-        let mut steps = Vec::new();
-        for step in &decl.steps {
-            steps.push(self.lower_pipeline_step(step)?);
-        }
-
-        let reward = match &decl.reward {
-            Some(expr) => Some(self.lower_expr(&expr.node)?),
-            None => None,
-        };
-
-        Ok(PipelineIR {
-            name: decl.name.node.clone(),
-            input: self.lower_type_expr(&decl.input.node)?,
-            output: self.lower_type_expr(&decl.output.node)?,
-            steps,
-            reward,
-        })
-    }
-
-    fn lower_pipeline_step(&self, step: &PipelineStep) -> LowerResult<PipelineStepIR> {
-        let call = match &step.call {
-            PipelineCall::Prompt { name, args } => {
-                let mut ir_args = Vec::new();
-                for arg in args {
-                    ir_args.push(self.lower_tool_expr(&arg.node)?);
-                }
-                PipelineCallIR::Prompt {
-                    name: name.clone(),
-                    args: ir_args,
-                }
-            }
-            PipelineCall::Tool { name, args } => {
-                let mut ir_args = Vec::new();
-                for arg in args {
-                    ir_args.push(self.lower_tool_expr(&arg.node)?);
-                }
-                // Check if this is actually a prompt call (parser doesn't distinguish)
-                if self.prompt_names.contains(name) {
-                    PipelineCallIR::Prompt {
-                        name: name.clone(),
-                        args: ir_args,
-                    }
-                } else {
-                    PipelineCallIR::Tool {
-                        name: name.clone(),
-                        args: ir_args,
-                    }
-                }
-            }
-            PipelineCall::Expr(expr) => {
-                let e = self.lower_tool_expr(&expr.node)?;
-                PipelineCallIR::Expr { expr: e }
-            }
-        };
-
-        Ok(PipelineStepIR {
-            binding: step.binding.as_ref().map(|b| b.node.clone()),
-            call,
-        })
-    }
-
-    fn lower_string_or_file(&self, sof: &StringOrFile) -> StringOrFileIR {
-        match sof {
-            StringOrFile::Literal(s) => StringOrFileIR::Literal { value: s.clone() },
-            StringOrFile::File(path) => StringOrFileIR::File { path: path.clone() },
-        }
+            EmitStmt::Record { fields, .. } => EmitIR::Record {
+                fields: fields
+                    .iter()
+                    .map(|f| EmitFieldIR {
+                        name: f.name.name.clone(),
+                        value: lower_expr(&f.value),
+                    })
+                    .collect(),
+            },
+        }),
+        GraphStmt::Carry(c) => GraphStmtIR::Carry(CarryIR {
+            name: c.name.name.clone(),
+            value: lower_expr(&c.value),
+        }),
     }
 }
 
-impl Default for Lowerer {
-    fn default() -> Self {
-        Self::new()
+fn lower_step_arg(arg: &StepArg) -> StepArgIR {
+    match arg {
+        StepArg::Positional(expr) => StepArgIR::Positional {
+            value: lower_expr(expr),
+        },
+        StepArg::Named { name, value } => StepArgIR::Named {
+            name: name.name.clone(),
+            value: lower_expr(value),
+        },
     }
 }
 
-/// Serialize IR to JSON
-pub fn to_json(ir: &ScaffoldIR) -> Result<String, serde_json::Error> {
-    serde_json::to_string_pretty(ir)
-}
-
-/// Serialize IR to compact JSON
-pub fn to_json_compact(ir: &ScaffoldIR) -> Result<String, serde_json::Error> {
-    serde_json::to_string(ir)
-}
-
-/// Deserialize IR from JSON
-pub fn from_json(json: &str) -> Result<ScaffoldIR, serde_json::Error> {
-    serde_json::from_str(json)
+fn lower_expr(expr: &Spanned<Expr>) -> ExprIR {
+    match &expr.node {
+        Expr::Literal(lit) => match lit {
+            Literal::Int(v) => ExprIR::LitInt { value: *v },
+            Literal::Float(v) => ExprIR::LitFloat { value: *v },
+            Literal::String(s) => ExprIR::LitString { value: s.clone() },
+            Literal::Bool(b) => ExprIR::LitBool { value: *b },
+            Literal::Null => ExprIR::LitNull,
+        },
+        Expr::Ident(name) => ExprIR::Ident { name: name.clone() },
+        Expr::FieldAccess(base, field) => ExprIR::FieldAccess {
+            base: Box::new(lower_expr(base)),
+            field: field.name.clone(),
+        },
+        Expr::Index(base, index) => ExprIR::Index {
+            base: Box::new(lower_expr(base)),
+            index: Box::new(lower_expr(index)),
+        },
+        Expr::UnaryNot(operand) => ExprIR::UnaryNot {
+            operand: Box::new(lower_expr(operand)),
+        },
+        Expr::UnaryNeg(operand) => ExprIR::UnaryNeg {
+            operand: Box::new(lower_expr(operand)),
+        },
+        Expr::Binary(left, op, right) => ExprIR::Binary {
+            left: Box::new(lower_expr(left)),
+            op: op.to_string(),
+            right: Box::new(lower_expr(right)),
+        },
+        Expr::Call(name, args) => ExprIR::Call {
+            name: name.clone(),
+            args: args.iter().map(lower_expr).collect(),
+        },
+        Expr::List(elements) => ExprIR::List {
+            elements: elements.iter().map(lower_expr).collect(),
+        },
+        Expr::Record(fields) => ExprIR::Record {
+            fields: fields
+                .iter()
+                .map(|f| ExprFieldIR {
+                    key: f.key.name.clone(),
+                    value: lower_expr(&f.value),
+                })
+                .collect(),
+        },
+        Expr::Paren(inner) => lower_expr(inner),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scaffold_syntax::parse;
-    use scaffold_types::check;
+    use scaffold_syntax::parser::parse;
 
     #[test]
-    fn test_lower_and_serialize() {
-        let source = r#"
-            type Position = { x: int, y: int }
-
-            tool get_position {
-                input: { id: int }
-                output: Position
+    fn lower_and_serialize() {
+        let src = r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "Solve: {{ input }}"
             }
 
-            prompt summarize {
-                input: { text: string }
-                output: { summary: string }
-                template: "Summarize: {text}"
+            graph solve {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
             }
+        "#;
+        let program = parse(src).unwrap();
+        let ir = lower(&program).unwrap();
+        assert_eq!(ir.nodes.len(), 1);
+        assert_eq!(ir.graphs.len(), 1);
+        assert_eq!(ir.nodes[0].name, "solver");
+        assert_eq!(ir.graphs[0].name, "solve");
 
-            agent researcher {
-                input: { query: string }
-                output: { answer: string }
-                tools: [get_position]
-                system: "You are a researcher."
+        // Test JSON round-trip
+        let json = to_json(&ir).unwrap();
+        let ir2 = from_json(&json).unwrap();
+        assert_eq!(ir2.nodes.len(), 1);
+        assert_eq!(ir2.graphs.len(), 1);
+    }
+
+    #[test]
+    fn lower_objective_with_subs() {
+        let src = r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "Solve: {{ input }}"
             }
+            graph inner {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+            graph outer {
+                in: string
+                out: string
+                step s = inner(input)
+                emit s
+            }
+            objective eval {
+                graph: outer
+                dataset: cases [{ input: "x", expected: "y" }]
+                checker exact { output == expected }
+                metric acc { checker: exact }
+                score: acc
 
-            pipeline main_pipeline {
-                input: { data: string }
-                output: { response: string }
-                steps {
-                    let summary = summarize(data)
+                sub inner_opt {
+                    graph: inner
+                    dataset: cases [{ input: "a", expected: "b" }]
+                    checker sub_exact { output == expected }
+                    metric sub_acc { checker: sub_exact }
+                    score: sub_acc
+                    tune {
+                        solver.model in ["gpt-4o", "gpt-4o-mini"]
+                    }
                 }
             }
         "#;
+        let program = parse(src).unwrap();
+        let ir = lower(&program).unwrap();
+        assert_eq!(ir.objectives.len(), 1);
+        assert_eq!(ir.objectives[0].subs.len(), 1);
+        assert_eq!(ir.objectives[0].subs[0].name, "inner_opt");
+        assert_eq!(ir.objectives[0].subs[0].graph, "inner");
+        assert_eq!(ir.objectives[0].subs[0].tunables.len(), 1);
 
-        let program = parse(source).unwrap();
-        let type_env = check(&program).unwrap();
-
-        let lowerer = Lowerer::new().with_source_file("test.scaffold".to_string());
-        let ir = lowerer.lower(&program, &type_env).unwrap();
-
-        // Check basic structure
-        assert_eq!(ir.version, IR_VERSION);
-        assert_eq!(ir.types.len(), 1);
-        assert_eq!(ir.tools.len(), 1);
-        assert_eq!(ir.prompts.len(), 1);
-        assert_eq!(ir.agents.len(), 1);
-        assert_eq!(ir.pipelines.len(), 1);
-
-        // Serialize and deserialize
+        // JSON round-trip with subs
         let json = to_json(&ir).unwrap();
-        let deserialized = from_json(&json).unwrap();
+        let ir2 = from_json(&json).unwrap();
+        assert_eq!(ir2.objectives[0].subs.len(), 1);
+        assert_eq!(ir2.objectives[0].subs[0].name, "inner_opt");
+    }
 
-        assert_eq!(deserialized.types.len(), ir.types.len());
-        assert_eq!(deserialized.tools[0].name, "get_position");
-        assert_eq!(deserialized.prompts[0].name, "summarize");
-        assert_eq!(deserialized.agents[0].name, "researcher");
-        assert_eq!(deserialized.pipelines[0].name, "main_pipeline");
+    #[test]
+    fn test_parse_and_lower() {
+        let src = r#"
+            node solver: prompt {
+                in: string
+                out: string
+                model: "gpt-4o"
+                template: "Solve: {{ input }}"
+            }
+            graph solve {
+                in: string
+                out: string
+                step s = solver(input)
+                emit s
+            }
+        "#;
+        let ir = super::parse_and_lower(src).unwrap();
+        assert_eq!(ir.nodes.len(), 1);
+        assert_eq!(ir.graphs.len(), 1);
+        assert_eq!(ir.nodes[0].name, "solver");
+        assert_eq!(ir.graphs[0].name, "solve");
+    }
+
+    #[test]
+    fn test_parse_and_lower_error() {
+        let result = super::parse_and_lower("this is not valid scaffold source {{{");
+        assert!(result.is_err());
     }
 }

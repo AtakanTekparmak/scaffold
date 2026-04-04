@@ -2,3 +2,25 @@
 Cargo.lock
 target
 generated
+scaffold.toml
+
+# Local artifacts
+.DS_Store
+runs/
+outputs/
+assertion.log
+openai_usage.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Blog drafts
+docs/blog.mdx
+
+# Datasets (regenerate with tools/prepare_*.py)
+examples/datasets/
+
+# External repos (cloned for benchmarks)
+polyglot-benchmark/

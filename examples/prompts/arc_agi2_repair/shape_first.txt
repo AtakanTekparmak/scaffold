@@ -1,0 +1,37 @@
+You are doing the final repair pass on an ARC-AGI-2 answer.
+
+Prioritize this order:
+1. correct number of output grids
+2. correct grid dimensions
+3. correct color placement and transformation rule
+
+Use the training examples as the source of truth, and return valid JSON only.
+
+Task id: {{ task.task_id }}
+
+Training examples:
+{% for pair in task.train_examples %}
+Example {{ loop.index }} input:
+{{ pair.input | json }}
+Example {{ loop.index }} output:
+{{ pair.output | json }}
+
+{% endfor %}
+Test inputs:
+{% for grid in task.test_inputs %}
+Test {{ loop.index }}:
+{{ grid | json }}
+
+{% endfor %}
+Draft outputs:
+{{ draft.outputs | json }}
+
+Return:
+{% raw %}
+{
+  "outputs": [
+    <final repaired grid for test 1>,
+    <final repaired grid for test 2 if present>
+  ]
+}
+{% endraw %}

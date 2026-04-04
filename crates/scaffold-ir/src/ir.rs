@@ -1,70 +1,43 @@
-//! Intermediate Representation (IR) definitions for the Scaffold DSL
+//! Scaffold v2 Intermediate Representation
 //!
-//! The IR is designed to be:
-//! - Serializable: JSON/binary format for storage and transmission
-//! - Executable: Sufficient info for a runtime to execute
-//! - Debuggable: Preserve source locations for error messages
+//! Mirrors AST but spanless, serde-friendly, with tagged unions.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-/// Current IR version
-pub const IR_VERSION: &str = "0.1.0";
-
-/// Top-level scaffold IR
+/// Top-level IR container
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScaffoldIR {
-    /// IR version for compatibility checking
     pub version: String,
-    /// Type definitions
+    #[serde(default)]
     pub types: Vec<TypeDefIR>,
-    /// External crate declarations
-    pub extern_crates: Vec<ExternCrateIR>,
-    /// Foreign module declarations
-    pub foreign_modules: Vec<ForeignModuleIR>,
-    /// Tool definitions (deterministic code)
-    pub tools: Vec<ToolIR>,
-    /// Prompt definitions (single LLM calls)
-    pub prompts: Vec<PromptIR>,
-    /// Agent definitions (multi-turn LLM with tools)
-    pub agents: Vec<AgentIR>,
-    /// Pipeline definitions (fixed sequences)
-    pub pipelines: Vec<PipelineIR>,
-}
-
-impl ScaffoldIR {
-    pub fn new() -> Self {
-        Self {
-            version: IR_VERSION.to_string(),
-            types: Vec::new(),
-            extern_crates: Vec::new(),
-            foreign_modules: Vec::new(),
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            agents: Vec::new(),
-            pipelines: Vec::new(),
-        }
-    }
+    pub nodes: Vec<NodeIR>,
+    pub graphs: Vec<GraphIR>,
+    #[serde(default)]
+    pub objectives: Vec<ObjectiveIR>,
 }
 
 impl Default for ScaffoldIR {
     fn default() -> Self {
-        Self::new()
+        Self {
+            version: "2.0.0".to_string(),
+            types: Vec::new(),
+            nodes: Vec::new(),
+            graphs: Vec::new(),
+            objectives: Vec::new(),
+        }
     }
 }
 
-/// Type definition IR
+// ── Types ──
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeDefIR {
-    /// Type name
     pub name: String,
-    /// Type structure
-    pub definition: TypeIR,
+    pub ty: TypeIR,
 }
 
-/// Type IR
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TypeIR {
     Bool,
     Int,
@@ -72,400 +45,317 @@ pub enum TypeIR {
     String,
     Bytes,
     Any,
-    List {
-        element: Box<TypeIR>,
-    },
-    Map {
-        key: Box<TypeIR>,
-        value: Box<TypeIR>,
-    },
-    Option {
-        inner: Box<TypeIR>,
-    },
-    Result {
-        ok: Box<TypeIR>,
-        err: Box<TypeIR>,
-    },
-    Struct {
-        fields: HashMap<String, TypeIR>,
-    },
-    Named {
-        name: String,
-    },
+    Named { name: String },
+    List { element: Box<TypeIR> },
+    Map { key: Box<TypeIR>, value: Box<TypeIR> },
+    Option { inner: Box<TypeIR> },
+    Struct { fields: Vec<FieldIR> },
 }
 
-/// Type reference IR (for input/output types)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TypeRefIR {
-    Named { ref_name: String },
-    Inline(TypeIR),
-}
-
-/// Expression IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum ExprIR {
-    Literal {
-        value: LiteralIR,
-    },
-    Ident {
-        name: String,
-    },
-    FieldAccess {
-        base: Box<ExprIR>,
-        field: String,
-    },
-    Binary {
-        left: Box<ExprIR>,
-        op: String,
-        right: Box<ExprIR>,
-    },
-    Call {
-        function: String,
-        args: Vec<ExprIR>,
-    },
-    ForeignCall {
-        module: String,
-        function: String,
-        args: Vec<ExprIR>,
-    },
-}
-
-/// Literal value IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum LiteralIR {
-    Int { value: i64 },
-    Float { value: f64 },
-    String { value: String },
-    Bool { value: bool },
-    Null,
-}
-
-// ============================================
-// Foreign and Tool IR
-// ============================================
-
-/// External crate declaration IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternCrateIR {
-    /// Crate name
+pub struct FieldIR {
     pub name: String,
-    /// Version requirement
-    pub version: String,
-    /// Optional features
-    pub features: Vec<String>,
-}
-
-/// Foreign module declaration IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForeignModuleIR {
-    /// Language (e.g., "rust")
-    pub language: String,
-    /// Module name
-    pub name: String,
-    /// Type aliases
-    pub type_aliases: Vec<ForeignTypeAliasIR>,
-    /// Function declarations
-    pub functions: Vec<ForeignFnIR>,
-}
-
-/// Foreign type alias IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForeignTypeAliasIR {
-    /// Scaffold type name
-    pub name: String,
-    /// External type path
-    pub external_type: String,
-}
-
-/// Foreign function declaration IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForeignFnIR {
-    /// Function name
-    pub name: String,
-    /// Parameters
-    pub params: Vec<ForeignParamIR>,
-    /// Return type
-    pub return_type: TypeIR,
-}
-
-/// Foreign function parameter IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForeignParamIR {
-    /// Parameter name
-    pub name: String,
-    /// Parameter type
     pub ty: TypeIR,
 }
 
-/// Tool definition IR
+// ── Nodes ──
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolIR {
-    /// Tool name
+pub struct NodeIR {
     pub name: String,
-    /// Input type
+    pub kind: NodeKindIR,
     pub input: TypeIR,
-    /// Output type
     pub output: TypeIR,
-    /// Tool implementation
-    pub implementation: Option<ToolImplIR>,
-    /// Tool specification
-    pub spec: Option<ToolSpecIR>,
-    /// Implementation variants
-    pub variants: Vec<ToolVariantIR>,
+    pub config: NodeConfigIR,
 }
 
-/// Tool implementation IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum ToolImplIR {
-    /// Simple expression
-    Expr { expr: ToolExprIR },
-    /// Sequence of operations
-    Sequence { statements: Vec<ToolStatementIR> },
-    /// Parallel operations
-    Parallel { statements: Vec<ToolStatementIR> },
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKindIR {
+    Prompt,
+    Tool,
+    Agent,
+    Verify,
 }
 
-/// Tool expression IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum ToolExprIR {
-    /// Variable reference
-    Ident { name: String },
-    /// Field access
-    FieldAccess {
-        base: Box<ToolExprIR>,
-        field: String,
-    },
-    /// Foreign function call
-    ForeignCall {
-        module: String,
-        function: String,
-        args: Vec<ToolExprIR>,
-    },
-    /// Local tool call
-    ToolCall { tool: String, args: Vec<ToolExprIR> },
-    /// Shell command
-    Shell { command: String },
-    /// Pipe expression
-    Pipe {
-        left: Box<ToolExprIR>,
-        right: Box<ToolExprIR>,
-    },
-    /// Conditional
-    If {
-        condition: ExprIR,
-        then_branch: Box<ToolImplIR>,
-        else_branch: Option<Box<ToolImplIR>>,
-    },
-    /// Match expression
-    Match {
-        scrutinee: Box<ToolExprIR>,
-        arms: Vec<MatchArmIR>,
-    },
-    /// For loop
-    For {
-        variable: String,
-        iterable: Box<ToolExprIR>,
-        body: Box<ToolImplIR>,
-    },
-    /// While loop
-    While {
-        condition: ExprIR,
-        body: Box<ToolImplIR>,
-    },
-    /// Infinite loop
-    Loop { body: Box<ToolImplIR> },
-    /// Break out of loop
-    Break,
-    /// Continue to next iteration
-    Continue,
-    /// Literal value
-    Literal { value: LiteralIR },
-    /// General expression (arithmetic, comparisons, etc.)
-    Expr { expr: Box<ExprIR> },
-}
-
-/// Tool statement IR (for sequence/parallel blocks)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolStatementIR {
-    /// Optional binding name
-    pub binding: Option<String>,
-    /// The expression
-    pub expr: ToolExprIR,
-}
-
-/// Match arm IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchArmIR {
-    /// Pattern (as expression)
-    pub pattern: ExprIR,
-    /// Body
-    pub body: ToolImplIR,
-}
-
-/// Tool specification IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolSpecIR {
-    /// Preconditions
-    pub preconditions: Vec<ExprIR>,
-    /// Postconditions
-    pub postconditions: Vec<ExprIR>,
-    /// Whether the tool is pure
-    pub pure: bool,
-}
-
-/// Tool variant IR
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolVariantIR {
-    /// Variant name
-    pub name: String,
-    /// Implementation
-    pub implementation: ToolImplIR,
-}
-
-/// Source span IR for debugging
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceSpanIR {
-    /// Start byte offset
-    pub start: usize,
-    /// End byte offset
-    pub end: usize,
-    /// Source file (if known)
-    pub file: Option<String>,
-}
-
-impl SourceSpanIR {
-    pub fn new(start: usize, end: usize) -> Self {
-        Self {
-            start,
-            end,
-            file: None,
-        }
-    }
-
-    pub fn with_file(mut self, file: String) -> Self {
-        self.file = Some(file);
-        self
-    }
-}
-
-// ============================================
-// Prompt IR (Single LLM Call)
-// ============================================
-
-/// Prompt definition IR - single LLM call with typed I/O
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptIR {
-    /// Prompt name
-    pub name: String,
-    /// Input type
-    pub input: TypeIR,
-    /// Output type
-    pub output: TypeIR,
-    /// Template string (with {var} interpolation)
-    pub template: StringOrFileIR,
-    /// Optional system prompt
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodeConfigIR {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<StringOrFileIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<StringOrFileIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<ErrorStrategyIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<Vec<JsonFieldIR>>,
 }
 
-/// String literal or file reference
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StringOrFileIR {
-    /// Inline string
     Literal { value: String },
-    /// File reference
     File { path: String },
 }
 
-// ============================================
-// Agent IR (Multi-turn LLM)
-// ============================================
-
-/// Error handling strategy for agents
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ErrorStrategyIR {
-    /// Fail immediately on error (default)
     Abort,
-    /// Retry up to N times before failing
-    Retry { count: u64 },
+    Retry { max: u64 },
 }
 
-impl Default for ErrorStrategyIR {
-    fn default() -> Self {
-        ErrorStrategyIR::Abort
-    }
-}
-
-/// Agent definition IR - multi-turn LLM with tool access
-/// In the RL optimization context, agents act as subgoals with process rewards
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentIR {
-    /// Agent name
+pub struct JsonFieldIR {
+    pub key: String,
+    pub value: ExprIR,
+}
+
+// ── Graphs ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphIR {
     pub name: String,
-    /// Input type
     pub input: TypeIR,
-    /// Output type
     pub output: TypeIR,
-    /// Available tools (list of tool names)
-    pub tools: Vec<String>,
-    /// System prompt (defines agent behavior)
-    pub system: StringOrFileIR,
-    /// Maximum turns before termination
-    pub max_turns: Option<u64>,
-    /// Process reward expression (for RL optimization)
-    pub reward: Option<ExprIR>,
-    /// Explicit termination condition (beyond max_turns)
-    pub done: Option<ExprIR>,
-    /// Error handling strategy
+    pub body: Vec<GraphStmtIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GraphStmtIR {
+    Step(StepIR),
+    Loop(LoopIR),
+    If(IfIR),
+    Choose(ChooseIR),
+    Parallel(ParallelIR),
+    Emit(EmitIR),
+    Carry(CarryIR),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepIR {
+    pub name: String,
+    pub node: String,
+    pub args: Vec<StepArgIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StepArgIR {
+    Positional { value: ExprIR },
+    Named { name: String, value: ExprIR },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopIR {
+    pub max: ExprIR,
+    pub while_cond: ExprIR,
+    pub body: Vec<GraphStmtIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IfIR {
+    pub cond: ExprIR,
+    pub then_body: Vec<GraphStmtIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub else_body: Vec<GraphStmtIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChooseIR {
+    pub alternatives: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelIR {
+    pub var: String,
+    pub collection: ExprIR,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduce: Option<String>,
+    pub body: Vec<GraphStmtIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "emit_kind", rename_all = "snake_case")]
+pub enum EmitIR {
+    Direct { value: ExprIR },
+    Record { fields: Vec<EmitFieldIR> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmitFieldIR {
+    pub name: String,
+    pub value: ExprIR,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CarryIR {
+    pub name: String,
+    pub value: ExprIR,
+}
+
+// ── Objectives ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectiveIR {
+    pub name: String,
+    pub graph: String,
+    pub dataset: DatasetSpecIR,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkers: Vec<CheckerIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judges: Vec<JudgeIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricIR>,
+    pub score: ExprIR,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select: Option<SelectIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunables: Vec<TunableIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<TopologyIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subs: Vec<SubObjectiveIR>,
+}
+
+/// A sub-objective for hierarchical optimization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubObjectiveIR {
+    pub name: String,
+    pub graph: String,
+    pub dataset: DatasetSpecIR,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkers: Vec<CheckerIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judges: Vec<JudgeIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricIR>,
+    pub score: ExprIR,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub select: Option<SelectIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunables: Vec<TunableIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<TopologyIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckerIR {
+    pub name: String,
+    pub expr: ExprIR,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeIR {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<StringOrFileIR>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rubric: Option<StringOrFileIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricIR {
+    pub name: String,
+    pub checker: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DatasetSpecIR {
+    File { path: String },
+    Inline { cases: Vec<InlineCaseIR> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineCaseIR {
+    pub input: ExprIR,
+    pub expected: ExprIR,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitIR {
+    pub train: f64,
+    pub val: f64,
+    pub test: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectIR {
+    pub primary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tie_breakers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunableIR {
+    pub path: Vec<String>,
+    pub domain: Vec<ExprIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyIR {
     #[serde(default)]
-    pub on_error: ErrorStrategyIR,
-    /// Execution timeout in seconds
-    pub timeout: Option<u64>,
+    pub mutations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserve: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_score: Option<f64>,
 }
 
-// ============================================
-// Pipeline IR (Fixed Sequence)
-// ============================================
+// ── Expressions ──
 
-/// Pipeline definition IR - fixed sequence of prompts/tools
-/// In the RL optimization context, pipelines represent task decomposition
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineIR {
-    /// Pipeline name
-    pub name: String,
-    /// Input type
-    pub input: TypeIR,
-    /// Output type
-    pub output: TypeIR,
-    /// Sequence of steps
-    pub steps: Vec<PipelineStepIR>,
-    /// Total task reward expression (for RL optimization)
-    pub reward: Option<ExprIR>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExprIR {
+    LitInt { value: i64 },
+    LitFloat { value: f64 },
+    LitString { value: String },
+    LitBool { value: bool },
+    LitNull,
+    Ident { name: String },
+    FieldAccess { base: Box<ExprIR>, field: String },
+    Index { base: Box<ExprIR>, index: Box<ExprIR> },
+    UnaryNot { operand: Box<ExprIR> },
+    UnaryNeg { operand: Box<ExprIR> },
+    Binary { left: Box<ExprIR>, op: String, right: Box<ExprIR> },
+    Call { name: String, args: Vec<ExprIR> },
+    List { elements: Vec<ExprIR> },
+    Record { fields: Vec<ExprFieldIR> },
 }
 
-/// Step in a pipeline
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineStepIR {
-    /// Optional binding name
-    pub binding: Option<String>,
-    /// The call
-    pub call: PipelineCallIR,
-}
-
-/// Call in a pipeline step
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum PipelineCallIR {
-    /// Call a prompt
-    Prompt { name: String, args: Vec<ToolExprIR> },
-    /// Call a tool
-    Tool { name: String, args: Vec<ToolExprIR> },
-    /// Evaluate an expression
-    Expr { expr: ToolExprIR },
+pub struct ExprFieldIR {
+    pub key: String,
+    pub value: ExprIR,
 }

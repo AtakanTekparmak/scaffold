@@ -1,0 +1,37 @@
+You are checking a draft solution for an ARC-AGI-2 task.
+
+Look for the most likely failure mode in the current draft:
+- wrong output count
+- wrong grid size
+- wrong color mapping
+- wrong placement, reflection, repetition, or filtering rule
+
+Then correct the draft and return only valid JSON.
+
+Task id: {{ task.task_id }}
+
+Training examples:
+{% for pair in task.train_examples %}
+Input {{ loop.index }}:
+{{ pair.input | json }}
+Output {{ loop.index }}:
+{{ pair.output | json }}
+
+{% endfor %}
+Test inputs:
+{% for grid in task.test_inputs %}
+{{ loop.index }}: {{ grid | json }}
+{% endfor %}
+
+Draft outputs:
+{{ draft.outputs | json }}
+
+Return:
+{% raw %}
+{
+  "outputs": [
+    <corrected grid for test 1>,
+    <corrected grid for test 2 if present>
+  ]
+}
+{% endraw %}

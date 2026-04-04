@@ -1,0 +1,20 @@
+Solve the following task.
+
+## Task
+
+{{ task_prompt }}
+
+{% if env_tools and env_tools != "[]" %}
+## Available Tools
+
+You have access to the following tools. If the task requires using a tool, format your response as valid JSON matching the tool's input schema.
+
+{{ env_tools }}
+{% endif %}
+
+## Requirements
+
+- Provide a clear, direct answer to the task
+- If tools are available and needed, respond with a JSON object matching the tool input schema
+- Do not include markdown code fences around JSON tool calls
+- Think step by step before answering

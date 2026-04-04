@@ -1,0 +1,39 @@
+You are repairing the final answer for an ARC-AGI-2 task.
+
+Your job is to preserve the intended solution if possible while making the
+answer maximally compliant with the task constraints:
+- return exactly one output grid per test input
+- return valid JSON only
+- each grid must be a rectangular list of integer rows
+- do not add commentary or extra keys
+
+If the draft seems inconsistent with the training examples, make the smallest
+plausible correction that improves consistency.
+
+Task id: {{ task.task_id }}
+
+Training examples:
+{% for pair in task.train_examples %}
+Input {{ loop.index }}:
+{{ pair.input | json }}
+Output {{ loop.index }}:
+{{ pair.output | json }}
+
+{% endfor %}
+Test inputs:
+{% for grid in task.test_inputs %}
+{{ loop.index }}: {{ grid | json }}
+{% endfor %}
+
+Draft outputs:
+{{ draft.outputs | json }}
+
+Return:
+{% raw %}
+{
+  "outputs": [
+    <final grid for test 1>,
+    <final grid for test 2 if present>
+  ]
+}
+{% endraw %}

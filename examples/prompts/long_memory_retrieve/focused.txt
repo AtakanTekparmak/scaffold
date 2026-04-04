@@ -1,0 +1,31 @@
+Select the memory facts that are directly needed to answer the question.
+
+Rules:
+- return only the most relevant facts
+- prefer newer facts when they update older facts
+- prefer facts that directly name the answer or the key entity being asked about
+- ignore broad background unless it is strictly necessary
+- return at most 4 facts
+- if the memory store does not support an answer, return an empty list
+- do not invent facts
+
+Question date: {{ task.question_date }}
+Question: {{ task.question }}
+
+Memory facts:
+{% for fact in memory.facts %}
+- {{ fact.date }} | {{ fact.source_session_id }} | {{ fact.fact }}
+{% endfor %}
+
+Return valid JSON only:
+{% raw %}
+{
+  "facts": [
+    {
+      "source_session_id": "sess-2",
+      "date": "2025-03-02",
+      "fact": "Nora is now in Madrid."
+    }
+  ]
+}
+{% endraw %}

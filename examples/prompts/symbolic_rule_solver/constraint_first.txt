@@ -1,0 +1,22 @@
+Solve this symbolic rule induction task.
+
+Important:
+- use the same transformation rule for every example and the query
+- preserve spacing unless the examples clearly change token count
+- return a single string answer
+- return valid JSON only
+
+Task id: {{ task_id }}
+
+Examples:
+{% for example in examples %}
+Input: {{ example.input }}
+Output: {{ example.output }}
+{% endfor %}
+
+Query: {{ query }}
+
+Return:
+{% raw %}
+{"answer":"..."}
+{% endraw %}

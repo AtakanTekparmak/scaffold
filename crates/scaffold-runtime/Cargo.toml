@@ -8,10 +8,17 @@ description = "Runtime library for scaffold-generated code"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+scaffold-ir.workspace = true
 minijinja = "2.0"  # Fast Jinja2-compatible templating
 tokio = { version = "1.0", features = ["full"] }
+futures.workspace = true
 toml = "0.8"
 dirs = "5.0"
+dotenvy = "0.15"
+
+# Built-in tool primitives (sync HTTP, regex)
+ureq = "2"
+regex = "1"
 
 # LLM providers via rig.rs
 rig = { package = "rig-core", version = "0.29" }

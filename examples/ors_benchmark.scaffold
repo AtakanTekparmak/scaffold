@@ -1,0 +1,94 @@
+// ORS (Open Reward Standard) Benchmark — generic bridge for any ORS environment
+
+// ── Types ──
+
+type OrsTaskInput = {
+    task_id: string,
+    task_prompt: string,
+    env_tools: string,
+    env_name: string
+}
+
+// ── Nodes ──
+
+node solve_task: prompt {
+    in: { task_prompt: string, env_tools: string }
+    out: string
+    template: file("examples/prompts/ors_solve/template")
+    system: file("examples/prompts/ors_solve/system")
+    model: "openai/gpt-4.1-mini"
+    temperature: 0.2
+}
+
+node retry_task: prompt {
+    in: { task_prompt: string, env_tools: string, previous_answer: string, observation: string }
+    out: string
+    template: file("examples/prompts/ors_retry/template")
+    system: file("examples/prompts/ors_solve/system")
+    model: "openai/gpt-4.1-mini"
+    temperature: 0.2
+}
+
+node ors_eval: tool {
+    in: { answer: string, task_id: string, env_name: string }
+    out: string
+    shell: "uv run tools/ors_eval.py --env \"{{env_name}}\" --task-id \"{{task_id}}\" --tool submit <<'SCAFFOLD_HEREDOC_ORS'\n{{answer}}\nSCAFFOLD_HEREDOC_ORS"
+    timeout: 120
+}
+
+// ── Graph ──
+
+graph solve {
+    in: OrsTaskInput
+    out: string
+
+    // Attempt 1: solve the task from the prompt
+    step attempt1 = solve_task(
+        task_prompt: input.task_prompt,
+        env_tools: input.env_tools
+    )
+    step result1 = ors_eval(
+        answer: attempt1,
+        task_id: input.task_id,
+        env_name: input.env_name
+    )
+
+    // Attempt 2: retry with feedback if first attempt failed
+    if json_parse(result1).passed == false {
+        step attempt2 = retry_task(
+            task_prompt: input.task_prompt,
+            env_tools: input.env_tools,
+            previous_answer: attempt1,
+            observation: json_parse(result1).observation
+        )
+        step result2 = ors_eval(
+            answer: attempt2,
+            task_id: input.task_id,
+            env_name: input.env_name
+        )
+        emit result2
+    } else {
+        emit result1
+    }
+}
+
+// ── Objective ──
+
+objective ors_benchmark {
+    graph: solve
+    dataset: file("examples/datasets/ors_dataset.jsonl")
+
+    checker task_passed { json_parse(output).passed == true }
+    metric pass_rate { checker: task_passed }
+    score: pass_rate
+
+    split { train: 0.7, val: 0.15, test: 0.15 }
+    select { primary: pass_rate }
+
+    tune {
+        solve_task.temperature in [0.0, 0.2, 0.5, 0.7, 1.0]
+        retry_task.temperature in [0.0, 0.2, 0.5]
+    }
+
+    topology { mutations: [set_config, insert_step, remove_step, replace_component] max_nodes: 8 target_score: 0.9 }
+}

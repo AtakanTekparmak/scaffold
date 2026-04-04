@@ -1,0 +1,12 @@
+Map the banking support message to one allowed intent label.
+
+Allowed labels:
+{label_guide}
+
+Internally compare the two or three most plausible labels before deciding.
+Prefer the most specific intent that explains what the user wants to do or fix.
+
+User message:
+{text}
+
+Return exactly one label string from the list above.

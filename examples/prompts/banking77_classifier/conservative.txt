@@ -1,0 +1,12 @@
+Pick the closest supported Banking77 label for the message below.
+
+Allowed labels:
+{label_guide}
+
+Be conservative about the output format:
+- return one label only
+- use the exact label slug
+- never explain the answer
+
+User message:
+{text}

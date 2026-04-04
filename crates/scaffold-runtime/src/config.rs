@@ -15,6 +15,23 @@ use std::sync::OnceLock;
 /// Global config singleton
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
+/// Initialize global config from a specific file path.
+/// Must be called before any `config()` access.
+pub fn init_from_path(path: &std::path::Path) -> Result<(), String> {
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    init_from_str(&content)
+}
+
+/// Initialize global config from a TOML string.
+/// Must be called before any `config()` access.
+pub fn init_from_str(toml_str: &str) -> Result<(), String> {
+    let mut config: Config = toml::from_str(toml_str).map_err(|e| e.to_string())?;
+    config.apply_env_overrides();
+    CONFIG
+        .set(config)
+        .map_err(|_| "Config already initialized".to_string())
+}
+
 /// Get the global config (loads on first access)
 pub fn config() -> &'static Config {
     CONFIG.get_or_init(Config::load)
@@ -61,6 +78,10 @@ pub struct LlmConfig {
     #[serde(default)]
     pub anthropic: ProviderConfig,
 
+    /// OpenRouter configuration (unified API for all models)
+    #[serde(default)]
+    pub openrouter: ProviderConfig,
+
     /// Custom providers (name -> config)
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
@@ -91,6 +112,7 @@ pub struct ProviderConfig {
 impl Config {
     /// Load configuration from all sources
     pub fn load() -> Self {
+        let _ = dotenvy::dotenv();
         let mut config = Config::default();
 
         // Load from ~/.scaffold/config.toml
@@ -149,6 +171,9 @@ impl Config {
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             self.llm.anthropic.api_key = Some(key);
         }
+        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+            self.llm.openrouter.api_key = Some(key);
+        }
 
         // Base URLs
         if let Ok(url) = std::env::var("OPENAI_BASE_URL") {
@@ -174,6 +199,7 @@ impl Config {
         match provider {
             "openai" => self.llm.openai.api_key.as_deref(),
             "anthropic" => self.llm.anthropic.api_key.as_deref(),
+            "openrouter" => self.llm.openrouter.api_key.as_deref(),
             other => self
                 .llm
                 .providers
@@ -187,6 +213,7 @@ impl Config {
         match provider {
             "openai" => self.llm.openai.base_url.as_deref(),
             "anthropic" => self.llm.anthropic.base_url.as_deref(),
+            "openrouter" => self.llm.openrouter.base_url.as_deref(),
             other => self
                 .llm
                 .providers
@@ -200,6 +227,7 @@ impl Config {
         match provider {
             "openai" => Some(&self.llm.openai),
             "anthropic" => Some(&self.llm.anthropic),
+            "openrouter" => Some(&self.llm.openrouter),
             other => self.llm.providers.get(other),
         }
     }
@@ -209,6 +237,7 @@ impl LlmConfig {
     fn merge(mut self, other: LlmConfig) -> LlmConfig {
         self.openai = self.openai.merge(other.openai);
         self.anthropic = self.anthropic.merge(other.anthropic);
+        self.openrouter = self.openrouter.merge(other.openrouter);
 
         for (name, config) in other.providers {
             self.providers.insert(name, config);

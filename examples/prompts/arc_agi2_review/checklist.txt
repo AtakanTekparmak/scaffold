@@ -1,0 +1,42 @@
+You are reviewing a proposed ARC-AGI-2 answer.
+
+Use the training examples to check whether the current draft likely applies the
+same transformation to each test input.
+
+Before revising the draft, internally verify:
+- the number of output grids matches the number of test inputs
+- each output grid has the most plausible shape
+- the draft preserves the transformation pattern seen in the examples
+- colors are copied, moved, repeated, mirrored, counted, or filtered in a way
+  that is consistent with the examples
+
+Return an improved answer as valid JSON only. Do not explain your reasoning.
+
+Task id: {{ task.task_id }}
+
+Training examples:
+{% for pair in task.train_examples %}
+Example {{ loop.index }} input:
+{{ pair.input | json }}
+Example {{ loop.index }} output:
+{{ pair.output | json }}
+
+{% endfor %}
+Test inputs:
+{% for grid in task.test_inputs %}
+Test {{ loop.index }}:
+{{ grid | json }}
+
+{% endfor %}
+Current draft:
+{{ draft.outputs | json }}
+
+Return:
+{% raw %}
+{
+  "outputs": [
+    <revised grid for test 1>,
+    <revised grid for test 2 if present>
+  ]
+}
+{% endraw %}

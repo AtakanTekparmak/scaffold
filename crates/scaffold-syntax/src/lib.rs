@@ -1,4 +1,4 @@
-//! Scaffold DSL syntax: lexer, parser, and AST definitions
+//! Scaffold v2 syntax: lexer, parser, and AST definitions
 
 pub mod ast;
 pub mod lexer;

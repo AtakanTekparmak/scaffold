@@ -1,37 +1,45 @@
-//! Scaffold DSL CLI
+//! Scaffold v2 CLI
 //!
 //! Commands:
-//! - check: Parse and type check a scaffold file
-//! - compile: Compile to IR and output JSON
-//! - codegen: Generate Rust code from scaffold file
-//! - run: Execute a scaffold file directly (interpreter)
+//! - check: Parse, type check, and verify a scaffold file
+//! - compile: Lower to IR and output JSON
+//! - run: Execute a named graph with JSON input
+//! - evaluate: Evaluate one candidate for an objective
+//! - optimize: Full optimization with topology mutations
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
-use scaffold_codegen::CodeGenerator;
-use scaffold_interpreter::Interpreter;
-use scaffold_ir::{to_json, Lowerer};
-use scaffold_runtime::Value;
+use scaffold_ir::{lower, pretty_print, to_json, to_json_compact, ScaffoldIR};
+use scaffold_runtime::trace::{init_tracer, TraceFormat, TraceLevel, TraceOutput, TracerConfig};
+use scaffold_runtime::{GraphExecutor, OptimizationBackend, OptimizationOptions, Value};
 use scaffold_syntax::parse;
 use scaffold_types::check;
 use scaffold_verify::{verify, Severity};
 
+mod tui;
+
 #[derive(Parser)]
 #[command(name = "scaffold")]
-#[command(author, version, about = "Scaffold DSL compiler", long_about = None)]
+#[command(author, version, about = "Scaffold v2 DSL compiler and runtime", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum OptimizeBackendArg {
+    Grid,
+    Evolutionary,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Parse and type check a scaffold file
+    /// Parse, type check, and verify a scaffold file
     Check {
         /// Input file
         #[arg(value_name = "FILE")]
@@ -42,115 +50,135 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Compile a scaffold file to IR
+    /// Compile to IR and output JSON
     Compile {
         /// Input file
         #[arg(value_name = "FILE")]
         file: PathBuf,
 
-        /// Output file (defaults to stdout)
+        /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
         /// Compact JSON output
-        #[arg(short, long)]
+        #[arg(long)]
         compact: bool,
     },
 
-    /// Parse only (for debugging)
-    Parse {
-        /// Input file
-        #[arg(value_name = "FILE")]
-        file: PathBuf,
-    },
-
-    /// Generate Rust code from scaffold file
-    Codegen {
-        /// Input file
-        #[arg(value_name = "FILE")]
-        file: PathBuf,
-
-        /// Output directory
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Format generated code with rustfmt (enabled by default)
-        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
-        format: bool,
-
-        /// Enforce strict validation (no unresolved identifiers/calls)
-        #[arg(long)]
-        strict: bool,
-    },
-
-    /// Build a native binary from a scaffold file (codegen + cargo build)
-    Build {
-        /// Input file
-        #[arg(value_name = "FILE")]
-        file: PathBuf,
-
-        /// Output directory for the generated crate (defaults to ./generated)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// Binary name override (defaults to first pipeline/tool name)
-        #[arg(long)]
-        bin_name: Option<String>,
-
-        /// Format generated code with rustfmt (enabled by default)
-        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
-        format: bool,
-
-        /// Enforce strict validation (no unresolved identifiers/calls)
-        #[arg(long)]
-        strict: bool,
-
-        /// Path to scaffold-runtime crate (auto-detected if not specified)
-        #[arg(long)]
-        runtime_path: Option<String>,
-
-        /// Build in release mode
-        #[arg(long)]
-        release: bool,
-    },
-
-    /// Run a scaffold file directly (interpreter mode)
+    /// Execute a named graph with JSON input
     Run {
         /// Input file
         #[arg(value_name = "FILE")]
         file: PathBuf,
 
-        /// Task to execute
-        #[arg(short, long)]
-        task: Option<String>,
-
-        /// Tool to execute (alternative to task)
+        /// Graph name to execute
         #[arg(long)]
-        tool: Option<String>,
+        graph: String,
 
-        /// Prompt to execute
+        /// Input JSON (or @file for file input)
         #[arg(long)]
-        prompt: Option<String>,
-
-        /// Agent to execute
-        #[arg(long)]
-        agent: Option<String>,
-
-        /// Pipeline to execute
-        #[arg(long)]
-        pipeline: Option<String>,
-
-        /// Input JSON (or @filename for file input)
-        #[arg(short, long, default_value = "{}")]
         input: String,
 
-        /// Show verbose output
-        #[arg(short, long)]
-        verbose: bool,
-
-        /// Enable verification checks
+        /// Enable live tracing
         #[arg(long)]
-        verify: bool,
+        live: bool,
+    },
+
+    /// Evaluate one candidate for an objective
+    Evaluate {
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Objective name
+        #[arg(long)]
+        objective: String,
+
+        /// Tunable overrides as JSON (node.field=value pairs)
+        #[arg(long)]
+        assignments: Option<String>,
+
+        /// Override the objective's dataset with a different file
+        #[arg(long)]
+        dataset: Option<PathBuf>,
+
+        /// Enable live tracing
+        #[arg(long)]
+        live: bool,
+    },
+
+    /// Run optimization for an objective
+    Optimize {
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Objective name
+        #[arg(long)]
+        objective: String,
+
+        /// Maximum candidates to evaluate
+        #[arg(long, default_value = "20")]
+        max_candidates: usize,
+
+        /// Optimization backend
+        #[arg(long, default_value = "evolutionary")]
+        backend: OptimizeBackendArg,
+
+        /// Directory to write optimization reports
+        #[arg(long)]
+        report_dir: Option<PathBuf>,
+
+        /// Write the best candidate `.scaffold` to this file
+        #[arg(long)]
+        write_best: Option<PathBuf>,
+
+        /// Enable live tracing
+        #[arg(long)]
+        live: bool,
+
+        /// Number of dataset cases to evaluate concurrently per candidate
+        #[arg(long, default_value = "1")]
+        concurrency: usize,
+
+        /// LLM model for meta-agent guided mutations (e.g. gpt-4o). Omit for random mutations.
+        #[arg(long)]
+        meta_model: Option<String>,
+
+        /// Path to a debug log file for meta-agent context/responses.
+        #[arg(long)]
+        meta_log: Option<PathBuf>,
+
+        /// Restart meta-agent context every N generations to prevent context bloat.
+        #[arg(long)]
+        meta_restart: Option<usize>,
+
+        /// Show full execution traces for all failed cases in meta-agent context.
+        /// Also enables changed-case trace analysis between generations.
+        #[arg(long)]
+        meta_full_traces: bool,
+
+        /// Number of training cases to sample per generation for meta-agent context.
+        /// Only effective when the objective declares a split.
+        #[arg(long)]
+        batch_size: Option<usize>,
+
+        /// Pool train+val cases and sample a fresh random subset for each candidate
+        /// evaluation. Prevents overfitting to a small fixed val set.
+        #[arg(long)]
+        rotating_val: bool,
+
+        /// Allow meta-agent proposed tool nodes to access the network.
+        /// Filesystem sandbox remains active (CWD only).
+        #[arg(long)]
+        online: bool,
+    },
+
+    /// Pretty-print IR back to scaffold source
+    Print {
+        /// Input file (scaffold source or IR JSON)
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
     },
 }
 
@@ -164,843 +192,678 @@ fn main() -> ExitCode {
             output,
             compact,
         } => cmd_compile(&file, output.as_deref(), compact),
-        Commands::Parse { file } => cmd_parse(&file),
-        Commands::Codegen {
-            file,
-            output,
-            format,
-            strict,
-        } => cmd_codegen(&file, &output, format, strict),
-        Commands::Build {
-            file,
-            output,
-            bin_name,
-            format,
-            strict,
-            runtime_path,
-            release,
-        } => cmd_build(
-            &file,
-            output.as_deref(),
-            bin_name.as_deref(),
-            format,
-            strict,
-            runtime_path.as_deref(),
-            release,
-        ),
         Commands::Run {
             file,
-            task,
-            tool,
-            prompt,
-            agent,
-            pipeline,
+            graph,
             input,
-            verbose,
-            verify,
-        } => {
-            // Run the async runtime
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(cmd_run(
-                &file,
-                task.as_deref(),
-                tool.as_deref(),
-                prompt.as_deref(),
-                agent.as_deref(),
-                pipeline.as_deref(),
-                &input,
-                verbose,
-                verify,
-            ))
-        }
+            live,
+        } => cmd_run(&file, &graph, &input, live),
+        Commands::Evaluate {
+            file,
+            objective,
+            assignments,
+            dataset,
+            live,
+        } => cmd_evaluate(&file, &objective, assignments.as_deref(), dataset, live),
+        Commands::Optimize {
+            file,
+            objective,
+            max_candidates,
+            backend,
+            report_dir,
+            write_best,
+            live,
+            concurrency,
+            meta_model,
+            meta_log,
+            meta_restart,
+            meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
+        } => cmd_optimize(
+            &file,
+            &objective,
+            max_candidates,
+            backend,
+            report_dir,
+            write_best,
+            live,
+            concurrency,
+            meta_model,
+            meta_log,
+            meta_restart,
+            meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
+        ),
+        Commands::Print { file } => cmd_print(&file),
     }
 }
+
+// ── Check ──
 
 fn cmd_check(file: &PathBuf, verbose: bool) -> ExitCode {
     let source = match fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error reading file: {}", e);
+            eprintln!("error: cannot read {}: {}", file.display(), e);
             return ExitCode::FAILURE;
         }
     };
 
-    let file_name = file.display().to_string();
+    let filename = file.to_string_lossy().to_string();
 
     // Parse
     let program = match parse(&source) {
         Ok(p) => p,
         Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Parse error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
+            print_parse_error(&filename, &source, &e);
             return ExitCode::FAILURE;
         }
     };
 
     if verbose {
-        println!("Parsed {} declarations", program.declarations.len());
+        eprintln!("parsed {} declarations", program.declarations.len());
     }
 
     // Type check
-    let type_env = match check(&program) {
-        Ok(env) => env,
-        Err(errors) => {
-            for error in &errors {
-                Report::build(ReportKind::Error, &file_name, error.span.start)
-                    .with_message("Type error")
-                    .with_label(
-                        Label::new((&file_name, error.span.start..error.span.end))
-                            .with_message(&error.message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((&file_name, Source::from(&source)))
-                    .unwrap();
+    let (_type_env, type_errors) = check(&program);
+    let mut has_errors = false;
+    for err in &type_errors {
+        Report::build(ReportKind::Error, &filename, err.span.start)
+            .with_label(
+                Label::new((&filename, err.span.start..err.span.end))
+                    .with_message(&err.message)
+                    .with_color(Color::Red),
+            )
+            .finish()
+            .eprint((&filename, Source::from(&source)))
+            .ok();
+        has_errors = true;
+    }
+
+    // Lower to IR for verification
+    let ir = match lower(&program) {
+        Ok(ir) => ir,
+        Err(e) => {
+            for le in &e {
+                eprintln!("error: lowering: {}", le);
             }
             return ExitCode::FAILURE;
         }
     };
 
-    if verbose {
-        println!("Type checking passed");
-        println!("  {} types defined", type_env.types.len());
-    }
-
     // Verify
-    let verify_result = verify(&program, &type_env);
-
-    let mut has_errors = false;
-    for error in &verify_result.errors {
-        let kind = match error.severity {
+    let findings = verify(&ir);
+    for finding in &findings {
+        match finding.severity {
             Severity::Error => {
+                eprintln!("[error] {}", finding);
                 has_errors = true;
-                ReportKind::Error
             }
-            Severity::Warning => ReportKind::Warning,
-        };
-
-        Report::build(kind, &file_name, error.span.start)
-            .with_message("Verification")
-            .with_label(
-                Label::new((&file_name, error.span.start..error.span.end))
-                    .with_message(&error.message)
-                    .with_color(if has_errors {
-                        Color::Red
-                    } else {
-                        Color::Yellow
-                    }),
-            )
-            .finish()
-            .eprint((&file_name, Source::from(&source)))
-            .unwrap();
+            Severity::Warning => {
+                if verbose {
+                    eprintln!("[warning] {}", finding);
+                }
+            }
+        }
     }
 
     if has_errors {
-        return ExitCode::FAILURE;
+        eprintln!("check failed");
+        ExitCode::FAILURE
+    } else {
+        eprintln!("OK");
+        ExitCode::SUCCESS
     }
-
-    if verbose {
-        println!("Verification passed");
-        if !verify_result.deadlock.is_empty() {
-            println!(
-                "  Deadlock analysis: {} tasks checked",
-                verify_result.deadlock.len()
-            );
-        }
-        if !verify_result.bounds.is_empty() {
-            println!(
-                "  Bounds analysis: {} subgoals checked",
-                verify_result.bounds.len()
-            );
-        }
-    }
-
-    println!("{}: OK", file.display());
-    ExitCode::SUCCESS
 }
 
-fn cmd_compile(file: &PathBuf, output: Option<&Path>, compact: bool) -> ExitCode {
+// ── Compile ──
+
+fn cmd_compile(file: &PathBuf, output: Option<&std::path::Path>, compact: bool) -> ExitCode {
     let source = match fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error reading file: {}", e);
+            eprintln!("error: cannot read {}: {}", file.display(), e);
             return ExitCode::FAILURE;
         }
     };
 
-    let file_name = file.display().to_string();
-
-    // Parse
     let program = match parse(&source) {
         Ok(p) => p,
         Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Parse error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
+            let filename = file.to_string_lossy().to_string();
+            print_parse_error(&filename, &source, &e);
             return ExitCode::FAILURE;
         }
     };
 
-    // Type check
-    let type_env = match check(&program) {
-        Ok(env) => env,
-        Err(errors) => {
-            for error in &errors {
-                Report::build(ReportKind::Error, &file_name, error.span.start)
-                    .with_message("Type error")
-                    .with_label(
-                        Label::new((&file_name, error.span.start..error.span.end))
-                            .with_message(&error.message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((&file_name, Source::from(&source)))
-                    .unwrap();
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Verify
-    let verify_result = verify(&program, &type_env);
-
-    if verify_result.has_errors() {
-        for error in &verify_result.errors {
-            if error.severity == Severity::Error {
-                Report::build(ReportKind::Error, &file_name, error.span.start)
-                    .with_message("Verification error")
-                    .with_label(
-                        Label::new((&file_name, error.span.start..error.span.end))
-                            .with_message(&error.message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((&file_name, Source::from(&source)))
-                    .unwrap();
-            }
-        }
-        return ExitCode::FAILURE;
-    }
-
-    // Lower to IR
-    let lowerer = Lowerer::new().with_source_file(file_name.clone());
-    let ir = match lowerer.lower(&program, &type_env) {
+    let ir = match lower(&program) {
         Ok(ir) => ir,
         Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Lowering error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
+            for le in &e {
+                eprintln!("error: lowering: {}", le);
+            }
             return ExitCode::FAILURE;
         }
     };
 
-    // Serialize to JSON
     let json = if compact {
-        scaffold_ir::to_json_compact(&ir)
+        to_json_compact(&ir).unwrap()
     } else {
-        to_json(&ir)
+        to_json(&ir).unwrap()
     };
 
-    let json = match json {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("Error serializing IR: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Write output
     match output {
         Some(path) => {
             if let Err(e) = fs::write(path, &json) {
-                eprintln!("Error writing output file: {}", e);
+                eprintln!("error: cannot write {}: {}", path.display(), e);
                 return ExitCode::FAILURE;
             }
-            eprintln!("Compiled to {}", path.display());
+            eprintln!("wrote {}", path.display());
         }
-        None => {
-            println!("{}", json);
-        }
+        None => println!("{}", json),
     }
 
     ExitCode::SUCCESS
 }
 
-fn cmd_parse(file: &PathBuf) -> ExitCode {
-    let source = match fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error reading file: {}", e);
+// ── Run ──
+
+fn cmd_run(file: &PathBuf, graph_name: &str, input_arg: &str, live: bool) -> ExitCode {
+    if live {
+        setup_tracer();
+    }
+
+    let ir = match load_ir(file) {
+        Ok(ir) => ir,
+        Err(msg) => {
+            eprintln!("{}", msg);
             return ExitCode::FAILURE;
         }
     };
 
-    let file_name = file.display().to_string();
+    // Parse input
+    let input = match parse_input(input_arg) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {}", msg);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    match parse(&source) {
-        Ok(program) => {
-            println!("Parsed successfully!");
-            println!("Declarations: {}", program.declarations.len());
-            for decl in &program.declarations {
-                match decl {
-                    scaffold_syntax::Declaration::Type(t) => {
-                        println!("  type {}", t.name.node);
-                    }
-                    scaffold_syntax::Declaration::ExternCrate(e) => {
-                        println!("  extern crate {} = \"{}\"", e.name.node, e.version);
-                    }
-                    scaffold_syntax::Declaration::Foreign(f) => {
-                        println!("  foreign {} {}", f.language.node, f.name.node);
-                    }
-                    scaffold_syntax::Declaration::Tool(t) => {
-                        println!("  tool {}", t.name.node);
-                    }
-                    scaffold_syntax::Declaration::Prompt(p) => {
-                        println!("  prompt {}", p.name.node);
-                    }
-                    scaffold_syntax::Declaration::Agent(a) => {
-                        println!("  agent {}", a.name.node);
-                    }
-                    scaffold_syntax::Declaration::Pipeline(p) => {
-                        println!("  pipeline {}", p.name.node);
-                    }
-                }
-            }
+    // Set up prompt manager from the file's directory
+    let prompt_mgr = setup_prompt_manager(file);
+
+    let executor = GraphExecutor::new(ir).with_prompt_manager(prompt_mgr);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    match rt.block_on(executor.execute_graph(graph_name, input)) {
+        Ok(result) => {
+            let json: serde_json::Value = result.into();
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
             ExitCode::SUCCESS
         }
         Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Parse error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
+            eprintln!("error: {}", e);
             ExitCode::FAILURE
         }
     }
 }
 
-/// Try to auto-detect scaffold-runtime path from the CLI executable location
-fn detect_runtime_path() -> Option<String> {
-    // If env var is already set, use that
-    if std::env::var("SCAFFOLD_RUNTIME_PATH").is_ok()
-        || std::env::var("SCAFFOLD_RUNTIME_VERSION").is_ok()
-    {
-        return None;
-    }
+// ── Evaluate ──
 
-    // Try to find scaffold-runtime relative to the current executable
-    if let Ok(exe_path) = std::env::current_exe() {
-        // Go up from target/debug or target/release to find crates/scaffold-runtime
-        let mut path = exe_path.clone();
-        for _ in 0..5 {
-            path = match path.parent() {
-                Some(p) => p.to_path_buf(),
-                None => break,
-            };
-            let runtime_path = path.join("crates/scaffold-runtime");
-            if runtime_path.join("Cargo.toml").exists() {
-                return Some(runtime_path.to_string_lossy().to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn cmd_codegen(file: &PathBuf, output: &PathBuf, format: bool, strict: bool) -> ExitCode {
-    // Auto-detect scaffold-runtime path
-    if let Some(runtime_path) = detect_runtime_path() {
-        std::env::set_var("SCAFFOLD_RUNTIME_PATH", runtime_path);
-    }
-    let source = match fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error reading file: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let file_name = file.display().to_string();
-
-    // Parse
-    let program = match parse(&source) {
-        Ok(p) => p,
-        Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Parse error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Type check
-    let type_env = match check(&program) {
-        Ok(env) => env,
-        Err(errors) => {
-            for error in &errors {
-                Report::build(ReportKind::Error, &file_name, error.span.start)
-                    .with_message("Type error")
-                    .with_label(
-                        Label::new((&file_name, error.span.start..error.span.end))
-                            .with_message(&error.message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((&file_name, Source::from(&source)))
-                    .unwrap();
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Verify
-    let verify_result = verify(&program, &type_env);
-
-    if verify_result.has_errors() {
-        for error in &verify_result.errors {
-            if error.severity == Severity::Error {
-                Report::build(ReportKind::Error, &file_name, error.span.start)
-                    .with_message("Verification error")
-                    .with_label(
-                        Label::new((&file_name, error.span.start..error.span.end))
-                            .with_message(&error.message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((&file_name, Source::from(&source)))
-                    .unwrap();
-            }
-        }
-        return ExitCode::FAILURE;
-    }
-
-    // Lower to IR
-    let lowerer = Lowerer::new().with_source_file(file_name.clone());
-    let ir = match lowerer.lower(&program, &type_env) {
-        Ok(ir) => ir,
-        Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Lowering error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Generate code
-    let generator = CodeGenerator::new()
-        .with_formatting(format)
-        .with_strict(strict);
-    let generated = match generator.generate(&ir) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Code generation error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Write output
-    if let Err(e) = generated.write_to_dir(output) {
-        eprintln!("Error writing output: {}", e);
-        return ExitCode::FAILURE;
-    }
-
-    eprintln!(
-        "Generated {} files to {}",
-        generated.files.len(),
-        output.display()
-    );
-    for path in generated.files.keys() {
-        eprintln!("  {}", path);
-    }
-
-    ExitCode::SUCCESS
-}
-
-fn cmd_build(
+fn cmd_evaluate(
     file: &PathBuf,
-    output: Option<&Path>,
-    bin_name: Option<&str>,
-    format: bool,
-    strict: bool,
-    runtime_path: Option<&str>,
-    release: bool,
+    objective_name: &str,
+    assignments: Option<&str>,
+    dataset_override: Option<PathBuf>,
+    live: bool,
 ) -> ExitCode {
-    let source = match fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error reading file: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    if live {
+        setup_tracer();
+    }
 
-    let file_name = file.display().to_string();
-
-    // Parse
-    let program = match parse(&source) {
-        Ok(p) => p,
-        Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Parse error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Type check
-    let type_env = match check(&program) {
-        Ok(env) => env,
-        Err(errors) => {
-            for error in &errors {
-                Report::build(ReportKind::Error, &file_name, error.span.start)
-                    .with_message("Type error")
-                    .with_label(
-                        Label::new((&file_name, error.span.start..error.span.end))
-                            .with_message(&error.message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint((&file_name, Source::from(&source)))
-                    .unwrap();
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Lower to IR
-    let lowerer = Lowerer::new().with_source_file(file_name.clone());
-    let ir = match lowerer.lower(&program, &type_env) {
+    let ir = match load_ir(file) {
         Ok(ir) => ir,
-        Err(e) => {
-            Report::build(ReportKind::Error, &file_name, e.span.start)
-                .with_message("Lowering error")
-                .with_label(
-                    Label::new((&file_name, e.span.start..e.span.end))
-                        .with_message(&e.message)
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint((&file_name, Source::from(&source)))
-                .unwrap();
+        Err(msg) => {
+            eprintln!("{}", msg);
             return ExitCode::FAILURE;
         }
     };
 
-    // Prepare output dir
-    let out_dir = output
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("generated"));
-    if let Err(e) = fs::create_dir_all(&out_dir) {
-        eprintln!("Error creating output dir {}: {}", out_dir.display(), e);
-        return ExitCode::FAILURE;
-    }
-
-    // Configure runtime path env for codegen
-    if let Some(path) = runtime_path {
-        std::env::set_var("SCAFFOLD_RUNTIME_PATH", path);
-    } else if let Some(detected) = detect_runtime_path() {
-        std::env::set_var("SCAFFOLD_RUNTIME_PATH", detected);
-    }
-
-    // Generate code
-    let generator = CodeGenerator::new()
-        .with_formatting(format)
-        .with_strict(strict);
-    let generated = match generator.generate(&ir) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("Code generation error: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if let Err(e) = generated.write_to_dir(&out_dir) {
-        eprintln!("Error writing output: {}", e);
-        return ExitCode::FAILURE;
-    }
-
-    // Optionally rename binary in Cargo.toml by modifying package/bin name
-    if let Some(name) = bin_name {
-        let manifest_path = out_dir.join("Cargo.toml");
-        if let Ok(mut cargo_toml) = fs::read_to_string(&manifest_path) {
-            // Replace package name and bin name heuristically
-            // If no pipeline/tool present, default name is scaffold_generated
-            if cargo_toml.contains("name = \"scaffold_generated\"") {
-                cargo_toml = cargo_toml.replace(
-                    "name = \"scaffold_generated\"",
-                    &format!("name = \"{}\"", name),
-                );
-            }
-            if cargo_toml.contains("[[bin]]\nname = \"scaffold_generated\"") {
-                cargo_toml = cargo_toml.replace(
-                    "[[bin]]\nname = \"scaffold_generated\"",
-                    &format!("[[bin]]\nname = \"{}\"", name),
-                );
-            }
-            if let Err(e) = fs::write(&manifest_path, cargo_toml) {
-                eprintln!("Warning: failed to set bin name: {}", e);
-            }
-        }
-    }
-
-    // Run cargo build in the generated dir
-    let mut cmd = std::process::Command::new("cargo");
-    cmd.arg("build");
-    if release {
-        cmd.arg("--release");
-    }
-    cmd.current_dir(&out_dir);
-    match cmd.status() {
-        Ok(status) if status.success() => {
-            // Print path to binary
-            let pkg_name = bin_name.map(|s| s.to_string()).unwrap_or_else(|| {
-                ir.pipelines
-                    .first()
-                    .map(|p| p.name.clone())
-                    .or_else(|| ir.tools.first().map(|t| t.name.clone()))
-                    .unwrap_or_else(|| "scaffold_generated".to_string())
-            });
-            let bin_dir = if release { "release" } else { "debug" };
-            let bin_path = out_dir.join("target").join(bin_dir).join(&pkg_name);
-            println!("Built binary: {}", bin_path.display());
-            ExitCode::SUCCESS
-        }
-        Ok(status) => {
-            eprintln!("cargo build failed with status: {}", status);
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("Failed to run cargo build: {}", e);
-            ExitCode::FAILURE
-        }
-    }
-}
-
-async fn cmd_run(
-    file: &PathBuf,
-    _task: Option<&str>, // Deprecated - tasks removed
-    tool: Option<&str>,
-    prompt: Option<&str>,
-    agent: Option<&str>,
-    pipeline: Option<&str>,
-    input_str: &str,
-    verbose: bool,
-    _verify_enabled: bool,
-) -> ExitCode {
-    // Parse input JSON
-    let input: Value = if input_str.starts_with('@') {
-        // Read from file
-        let input_path = &input_str[1..];
-        match fs::read_to_string(input_path) {
-            Ok(content) => match serde_json::from_str(&content) {
+    // Parse assignments
+    let overrides = match assignments {
+        Some(json_str) => {
+            let parsed: serde_json::Value = match serde_json::from_str(json_str) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("Error parsing input JSON from {}: {}", input_path, e);
+                    eprintln!("error: invalid assignments JSON: {}", e);
                     return ExitCode::FAILURE;
                 }
-            },
-            Err(e) => {
-                eprintln!("Error reading input file {}: {}", input_path, e);
-                return ExitCode::FAILURE;
+            };
+            match parsed.as_object() {
+                Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                None => {
+                    eprintln!("error: assignments must be a JSON object");
+                    return ExitCode::FAILURE;
+                }
             }
         }
-    } else {
-        match serde_json::from_str(input_str) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Error parsing input JSON: {}", e);
-                return ExitCode::FAILURE;
-            }
-        }
+        None => std::collections::HashMap::new(),
     };
 
-    if verbose {
-        eprintln!("Loading: {}", file.display());
-    }
-
-    // Load the interpreter
-    let mut interpreter = match Interpreter::load(file) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("Error loading scaffold file: {}", e);
+    let objective = match ir.objectives.iter().find(|o| o.name == objective_name) {
+        Some(o) => o,
+        None => {
+            eprintln!("error: objective '{}' not found", objective_name);
             return ExitCode::FAILURE;
         }
     };
 
-    if verbose {
-        eprintln!("Available tools: {:?}", interpreter.tool_names());
-        eprintln!("Available prompts: {:?}", interpreter.prompt_names());
-        eprintln!("Available agents: {:?}", interpreter.agent_names());
-        eprintln!("Available pipelines: {:?}", interpreter.pipeline_names());
-    }
-
-    // Execute based on what was requested
-    let result = if let Some(tool_name) = tool {
-        if verbose {
-            eprintln!("Running tool: {}", tool_name);
-        }
-        interpreter.run_tool(tool_name, input).await
-    } else if let Some(prompt_name) = prompt {
-        if verbose {
-            eprintln!("Running prompt: {}", prompt_name);
-        }
-        interpreter.run_prompt(prompt_name, input).await
-    } else if let Some(agent_name) = agent {
-        if verbose {
-            eprintln!("Running agent: {}", agent_name);
-        }
-        interpreter.run_agent(agent_name, input).await
-    } else if let Some(pipeline_name) = pipeline {
-        if verbose {
-            eprintln!("Running pipeline: {}", pipeline_name);
-        }
-        interpreter.run_pipeline(pipeline_name, input).await
-    } else {
-        // Default: try to run first tool/agent/etc or list available
-        let tools: Vec<String> = interpreter
-            .tool_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let prompts: Vec<String> = interpreter
-            .prompt_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let agents: Vec<String> = interpreter
-            .agent_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let pipelines: Vec<String> = interpreter
-            .pipeline_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let total = tools.len() + prompts.len() + agents.len() + pipelines.len();
-
-        if total == 0 {
+    let _graph = match ir.graphs.iter().find(|g| g.name == objective.graph) {
+        Some(g) => g,
+        None => {
             eprintln!(
-                "No tools, prompts, agents, or pipelines found in {}",
-                file.display()
+                "error: graph '{}' referenced by objective not found",
+                objective.graph
             );
             return ExitCode::FAILURE;
         }
+    };
 
-        if tools.len() == 1 && prompts.is_empty() && agents.is_empty() && pipelines.is_empty() {
-            let tool_name = &tools[0];
-            if verbose {
-                eprintln!("Running default tool: {}", tool_name);
-            }
-            interpreter.run_tool(tool_name, input).await
-        } else if prompts.len() == 1
-            && tools.is_empty()
-            && agents.is_empty()
-            && pipelines.is_empty()
-        {
-            let prompt_name = &prompts[0];
-            if verbose {
-                eprintln!("Running default prompt: {}", prompt_name);
-            }
-            interpreter.run_prompt(prompt_name, input).await
-        } else if agents.len() == 1
-            && tools.is_empty()
-            && prompts.is_empty()
-            && pipelines.is_empty()
-        {
-            let agent_name = &agents[0];
-            if verbose {
-                eprintln!("Running default agent: {}", agent_name);
-            }
-            interpreter.run_agent(agent_name, input).await
-        } else if pipelines.len() == 1
-            && tools.is_empty()
-            && prompts.is_empty()
-            && agents.is_empty()
-        {
-            let pipeline_name = &pipelines[0];
-            if verbose {
-                eprintln!("Running default pipeline: {}", pipeline_name);
-            }
-            interpreter.run_pipeline(pipeline_name, input).await
-        } else {
-            eprintln!("Multiple items available. Please specify one:");
-            if !tools.is_empty() {
-                eprintln!("  Tools: {:?}", tools);
-            }
-            if !prompts.is_empty() {
-                eprintln!("  Prompts: {:?}", prompts);
-            }
-            if !agents.is_empty() {
-                eprintln!("  Agents: {:?}", agents);
-            }
-            if !pipelines.is_empty() {
-                eprintln!("  Pipelines: {:?}", pipelines);
-            }
-            eprintln!("\nUsage: scaffold run {} --tool <TOOL> | --prompt <PROMPT> | --agent <AGENT> | --pipeline <PIPELINE>", file.display());
+    let prompt_mgr = setup_prompt_manager(file);
+    let executor = GraphExecutor::new(ir.clone())
+        .with_prompt_manager(prompt_mgr)
+        .with_overrides(overrides);
+
+    // Load dataset (with optional override)
+    let dataset_spec = match dataset_override {
+        Some(ref path) => scaffold_ir::DatasetSpecIR::File {
+            path: path.display().to_string(),
+        },
+        None => objective.dataset.clone(),
+    };
+    let dataset = match scaffold_runtime::optimizer::load_dataset_from_spec(&dataset_spec) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: failed to load dataset: {}", e);
             return ExitCode::FAILURE;
         }
     };
 
-    match result {
-        Ok(output) => {
-            // Output the result as JSON
-            let json =
-                serde_json::to_string_pretty(&output).unwrap_or_else(|_| format!("{:?}", output));
-            println!("{}", json);
-            ExitCode::SUCCESS
+    eprintln!(
+        "evaluating objective '{}' on graph '{}' ({} cases)",
+        objective_name,
+        objective.graph,
+        dataset.len()
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let case_count = dataset.len();
+    let mut checker_totals: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::new();
+    let mut errors = 0;
+
+    for case in &dataset {
+        match rt.block_on(executor.execute_graph(&objective.graph, case.input.clone())) {
+            Ok(output) => {
+                // Evaluate each checker expression
+                let mut case_checks = Vec::new();
+                for checker in &objective.checkers {
+                    let val = scaffold_runtime::eval_checker_expr(
+                        &executor,
+                        &checker.expr,
+                        &output,
+                        &case.expected,
+                    );
+                    *checker_totals.entry(checker.name.clone()).or_default() += val;
+                    case_checks.push(format!(
+                        "{}={}",
+                        checker.name,
+                        if val >= 1.0 { "PASS" } else { "FAIL" }
+                    ));
+                }
+                let json: serde_json::Value = output.into();
+                eprintln!(
+                    "  case {:?}: {} [{}]",
+                    case.id,
+                    serde_json::to_string(&json).unwrap_or_default(),
+                    case_checks.join(", ")
+                );
+            }
+            Err(e) => {
+                eprintln!("  case {:?}: error: {}", case.id, e);
+                errors += 1;
+            }
         }
+    }
+
+    if case_count > 0 {
+        eprintln!("---");
+        // Print per-checker averages
+        for checker in &objective.checkers {
+            let total = checker_totals.get(&checker.name).copied().unwrap_or(0.0);
+            eprintln!("  {}: {:.4}", checker.name, total / case_count as f64);
+        }
+        // Print per-metric averages
+        let mut metric_avgs: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for metric in &objective.metrics {
+            let checker_total = checker_totals.get(&metric.checker).copied().unwrap_or(0.0);
+            let avg = checker_total / case_count as f64;
+            metric_avgs.insert(metric.name.clone(), avg);
+        }
+        // Evaluate score expression
+        let score_scope = scaffold_runtime::Scope::with_bindings(
+            metric_avgs
+                .iter()
+                .map(|(k, v)| (k.as_str(), scaffold_runtime::Value::Float(*v)))
+                .collect(),
+        );
+        let score = match executor.eval_expr(&objective.score, &score_scope) {
+            Ok(scaffold_runtime::Value::Float(f)) => f,
+            Ok(scaffold_runtime::Value::Int(i)) => i as f64,
+            _ => 0.0,
+        };
+        eprintln!(
+            "score: {:.4} ({} errors / {} cases)",
+            score, errors, case_count
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ── Optimize ──
+
+fn default_best_candidate_path(
+    file: &PathBuf,
+    objective_name: &str,
+    report_dir: Option<&PathBuf>,
+    write_best: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = write_best {
+        return path;
+    }
+
+    if let Some(dir) = report_dir {
+        return dir.join("best_candidate.scaffold");
+    }
+
+    let stem = file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("best_candidate");
+    let safe_objective: String = objective_name
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect();
+    file.with_file_name(format!("{stem}.{safe_objective}.best.scaffold"))
+}
+
+fn cmd_optimize(
+    file: &PathBuf,
+    objective_name: &str,
+    max_candidates: usize,
+    backend: OptimizeBackendArg,
+    report_dir: Option<PathBuf>,
+    write_best: Option<PathBuf>,
+    live: bool,
+    concurrency: usize,
+    meta_model: Option<String>,
+    meta_log: Option<PathBuf>,
+    meta_restart: Option<usize>,
+    meta_full_traces: bool,
+    batch_size: Option<usize>,
+    rotating_val: bool,
+    online: bool,
+) -> ExitCode {
+    let ir = match load_ir(file) {
+        Ok(ir) => ir,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let backend = match backend {
+        OptimizeBackendArg::Grid => OptimizationBackend::Grid,
+        OptimizeBackendArg::Evolutionary => OptimizationBackend::Evolutionary,
+    };
+    let write_best = Some(default_best_candidate_path(
+        file,
+        objective_name,
+        report_dir.as_ref(),
+        write_best,
+    ));
+
+    if live {
+        // TUI mode: spawn optimizer in a thread, run TUI on main thread
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        let options = OptimizationOptions {
+            max_candidates,
+            backend,
+            report_dir,
+            write_best,
+            event_tx: Some(event_tx),
+            concurrency,
+            meta_model: meta_model.clone(),
+            meta_log: meta_log.clone(),
+            meta_context_restart: meta_restart,
+            meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
+        };
+
+        let obj_name = objective_name.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let result = rt.block_on(scaffold_runtime::optimize_hierarchical(
+                &ir, &obj_name, &options,
+            ));
+            let _ = result_tx.send(result.map_err(|e| e.to_string()));
+        });
+
+        match tui::run_tui(event_rx, result_rx) {
+            Ok(report) => {
+                let json = serde_json::to_string_pretty(&report).unwrap_or_default();
+                println!("{}", json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        // Non-live mode: run optimizer directly
+        let options = OptimizationOptions {
+            max_candidates,
+            backend,
+            report_dir,
+            write_best,
+            event_tx: None,
+            concurrency,
+            meta_model,
+            meta_log,
+            meta_context_restart: meta_restart,
+            meta_full_traces,
+            batch_size,
+            rotating_val,
+            online,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(scaffold_runtime::optimize_hierarchical(
+            &ir,
+            objective_name,
+            &options,
+        )) {
+            Ok(report) => {
+                let json = serde_json::to_string_pretty(&report).unwrap_or_default();
+                println!("{}", json);
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+// ── Print ──
+
+fn cmd_print(file: &PathBuf) -> ExitCode {
+    let source = match fs::read_to_string(file) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("Execution error: {}", e);
-            ExitCode::FAILURE
+            eprintln!("error: cannot read {}: {}", file.display(), e);
+            return ExitCode::FAILURE;
         }
+    };
+
+    // Try parsing as IR JSON first
+    if let Ok(ir) = serde_json::from_str::<ScaffoldIR>(&source) {
+        println!("{}", pretty_print(&ir));
+        return ExitCode::SUCCESS;
+    }
+
+    // Parse as scaffold source
+    let program = match parse(&source) {
+        Ok(p) => p,
+        Err(e) => {
+            let filename = file.to_string_lossy().to_string();
+            print_parse_error(&filename, &source, &e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let ir = match lower(&program) {
+        Ok(ir) => ir,
+        Err(e) => {
+            for le in &e {
+                eprintln!("error: lowering: {}", le);
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("{}", pretty_print(&ir));
+    ExitCode::SUCCESS
+}
+
+// ── Helpers ──
+
+fn load_ir(file: &PathBuf) -> Result<ScaffoldIR, String> {
+    let source = fs::read_to_string(file)
+        .map_err(|e| format!("error: cannot read {}: {}", file.display(), e))?;
+
+    // Try as IR JSON first
+    if let Ok(ir) = serde_json::from_str::<ScaffoldIR>(&source) {
+        return Ok(ir);
+    }
+
+    // Parse as scaffold source
+    let program = parse(&source).map_err(|e| format!("parse error: {}", e))?;
+    lower(&program).map_err(|errs| {
+        errs.iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+fn parse_input(input_arg: &str) -> Result<Value, String> {
+    if let Some(file_path) = input_arg.strip_prefix('@') {
+        let content = fs::read_to_string(file_path)
+            .map_err(|e| format!("cannot read {}: {}", file_path, e))?;
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("invalid JSON in {}: {}", file_path, e))?;
+        Ok(Value::from(json))
+    } else {
+        let json: serde_json::Value =
+            serde_json::from_str(input_arg).map_err(|e| format!("invalid JSON input: {}", e))?;
+        Ok(Value::from(json))
+    }
+}
+
+fn setup_prompt_manager(file: &PathBuf) -> scaffold_runtime::PromptManager {
+    // Look for prompts in the file's parent directory
+    if let Some(parent) = file.parent() {
+        let prompts_dir = parent.join("prompts");
+        if prompts_dir.exists() {
+            if let Ok(pm) = scaffold_runtime::PromptManager::with_template_dir(&prompts_dir) {
+                return pm;
+            }
+        }
+        // Also try examples/prompts
+        let examples_prompts = parent.join("examples").join("prompts");
+        if examples_prompts.exists() {
+            if let Ok(pm) = scaffold_runtime::PromptManager::with_template_dir(&examples_prompts) {
+                return pm;
+            }
+        }
+    }
+    scaffold_runtime::PromptManager::new()
+}
+
+fn setup_tracer() {
+    init_tracer(TracerConfig {
+        enabled: true,
+        min_level: TraceLevel::Info,
+        format: TraceFormat::Pretty,
+        output: TraceOutput::Stderr,
+        include_bodies: false,
+    });
+}
+
+fn print_parse_error(filename: &str, source: &str, error: &scaffold_syntax::ParseError) {
+    Report::build(ReportKind::Error, filename, error.span.start)
+        .with_label(
+            Label::new((filename, error.span.start..error.span.end))
+                .with_message(&error.message)
+                .with_color(Color::Red),
+        )
+        .finish()
+        .eprint((filename, Source::from(source)))
+        .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_best_candidate_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_default_best_candidate_path_prefers_report_dir() {
+        let file = PathBuf::from("/tmp/solve.scaffold");
+        let report_dir = PathBuf::from("/tmp/reports");
+
+        let path = default_best_candidate_path(&file, "aider_polyglot", Some(&report_dir), None);
+
+        assert_eq!(path, report_dir.join("best_candidate.scaffold"));
+    }
+
+    #[test]
+    fn test_default_best_candidate_path_derives_from_input_file() {
+        let file = PathBuf::from("/tmp/solve.scaffold");
+
+        let path = default_best_candidate_path(&file, "aider/polyglot", None, None);
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/solve.aider_polyglot.best.scaffold")
+        );
     }
 }

@@ -1,0 +1,31 @@
+Solve this ARC-AGI-2 task.
+
+Each grid is a rectangular matrix of integers between 0 and 9. Infer the rule
+from the training examples, then produce the correct output grids for every test
+input. Return JSON only.
+
+Task id: {{ task_id }}
+
+Training examples:
+{% for pair in train_examples %}
+Example {{ loop.index }} input:
+{{ pair.input | json }}
+Example {{ loop.index }} output:
+{{ pair.output | json }}
+
+{% endfor %}
+Test inputs:
+{% for grid in test_inputs %}
+Test {{ loop.index }}:
+{{ grid | json }}
+
+{% endfor %}
+Return:
+{% raw %}
+{
+  "outputs": [
+    <predicted grid for test 1>,
+    <predicted grid for test 2 if present>
+  ]
+}
+{% endraw %}

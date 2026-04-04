@@ -1,0 +1,26 @@
+Your previous answer to this task was incorrect. Review the feedback and try again.
+
+## Task
+
+{{ task_prompt }}
+
+{% if env_tools and env_tools != "[]" %}
+## Available Tools
+
+{{ env_tools }}
+{% endif %}
+
+## Your Previous Answer
+
+{{ previous_answer }}
+
+## Feedback
+
+{{ observation }}
+
+## Requirements
+
+- Fix your answer based on the feedback above
+- If tools are available and needed, respond with a JSON object matching the tool input schema
+- Do not include markdown code fences around JSON tool calls
+- Think carefully about what went wrong and correct it

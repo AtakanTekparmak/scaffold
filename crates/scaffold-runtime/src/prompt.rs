@@ -48,7 +48,9 @@ impl PromptManager {
 
         env.add_filter("truncate", |s: String, len: usize| {
             if s.len() > len {
-                format!("{}...", &s[..len.saturating_sub(3)])
+                let mut end = len.saturating_sub(3);
+                while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+                format!("{}...", &s[..end])
             } else {
                 s
             }

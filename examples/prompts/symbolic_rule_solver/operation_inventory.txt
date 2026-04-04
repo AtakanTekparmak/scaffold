@@ -1,0 +1,27 @@
+Infer the symbolic transformation rule from the examples and apply it to the query.
+
+Before answering, internally inventory which operations are happening:
+- token reordering
+- token filtering
+- character deletion
+- character reversal
+- swapping outer characters
+- duplicating a character
+- rotating characters
+
+Choose the smallest consistent rule set that explains all examples, then apply it exactly once to the query.
+
+Task id: {{ task_id }}
+
+Examples:
+{% for example in examples %}
+Input: {{ example.input }}
+Output: {{ example.output }}
+{% endfor %}
+
+Query: {{ query }}
+
+Return valid JSON only:
+{% raw %}
+{"answer":"..."}
+{% endraw %}

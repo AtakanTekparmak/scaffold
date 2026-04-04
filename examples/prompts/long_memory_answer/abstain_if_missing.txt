@@ -1,0 +1,27 @@
+Use the retrieved memory facts to answer the question.
+
+Before answering, internally check:
+- whether the evidence is enough for a specific answer
+- whether a later fact overrides an earlier one
+- whether the question asks for current information as of the question date
+
+If the evidence is incomplete or missing, do not guess. Return answer =
+"unknown", abstain = true, and evidence_session_ids = [].
+
+Question type: {{ task.question_type }}
+Question date: {{ task.question_date }}
+Question: {{ task.question }}
+
+Retrieved facts:
+{% for fact in retrieved.facts %}
+- {{ fact.date }} | {{ fact.source_session_id }} | {{ fact.fact }}
+{% endfor %}
+
+Return valid JSON only:
+{% raw %}
+{
+  "answer": "unknown",
+  "evidence_session_ids": [],
+  "abstain": true
+}
+{% endraw %}

@@ -1,0 +1,65 @@
+// OOD Classification — Stress-test for regression gate
+// Merged: 9 diverse OOD datasets (ag_news, amazon_reviews, banking77,
+//   financial_phrasebank, finer139, go_emotions, scicite, scitail, tweet_eval_hate)
+// 1620 total cases across wildly different label spaces.
+
+// ── Types ──
+
+type ClassifyInput = {
+    task_text: string,
+    label_guide: string
+}
+
+// ── Nodes ──
+
+node classify_text: prompt {
+    in: { task_text: string, label_guide: string }
+    out: string
+    template: file("examples/prompts/classify/template")
+    system: file("examples/prompts/classify/system")
+    model: "openai/gpt-oss-120b"
+    temperature: 0.0
+}
+
+node retry_classify: prompt {
+    in: { task_text: string, label_guide: string, previous_prediction: string }
+    out: string
+    template: file("examples/prompts/classify_retry/template")
+    system: file("examples/prompts/classify/system")
+    model: "openai/gpt-oss-120b"
+    temperature: 0.0
+}
+
+// ── Graph ──
+
+graph classify {
+    in: ClassifyInput
+    out: string
+
+    step result = classify_text(
+        task_text: input.task_text,
+        label_guide: input.label_guide
+    )
+    emit result
+}
+
+// ── Objective ──
+
+objective ood_classify {
+    graph: classify
+    dataset: file("examples/datasets/ood_merged.jsonl")
+
+    checker correct { output == expected.label }
+    metric accuracy { checker: correct }
+    score: accuracy
+
+    split { train: 0.28, val: 0.17, test: 0.55 }
+    select { primary: accuracy }
+
+    tune {
+        classify_text.temperature in [0.0, 0.2, 0.5, 0.7, 1.0]
+        retry_classify.temperature in [0.0, 0.2, 0.5]
+    }
+
+    topology { mutations: [set_config, insert_step, remove_step, replace_component] max_nodes: 8 target_score: 0.9 }
+}
