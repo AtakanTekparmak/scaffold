@@ -1,8 +1,12 @@
 # Scaffold
 
-A DSL for writing and automatically optimizing LLM pipelines.
+A typed DSL that compiles to a single binary for writing and automatically optimizing LLM pipelines.
 
-Write a typed graph of LLM calls and tools, define an objective with a dataset and checkers, and let an evolutionary optimizer search over prompt rewrites and structural mutations to maximize your score.
+Define a pipeline as a typed directed graph, point it at a dataset, and the optimizer searches over prompt rewrites and graph topology to maximize your score. On a 247-class classification benchmark, it started from a single LLM call and discovered a [5-step pipeline](examples/text_classification_merged.text_classify.best.scaffold) scoring 77.1% — shortlist, select, normalize, critique, deterministic repair.
+
+## Quick Start
+
+Write a `.scaffold` file:
 
 ```scaffold
 node classify: prompt {
@@ -29,9 +33,39 @@ objective improve {
 }
 ```
 
+Run the optimizer:
+
 ```bash
-scaffold optimize example.scaffold --objective improve
+scaffold optimize example.scaffold \
+    --objective improve \
+    --meta-model anthropic/claude-sonnet-4-5-20250929 \
+    --max-candidates 10 \
+    --concurrency 8 \
+    --live
 ```
+
+The optimizer evaluates the seed graph, sweeps tunable parameters, then runs evolutionary search — a meta-agent proposes typed mutations, the runtime validates each candidate against the type system, and evaluates it on your dataset. The best pipeline is written as a standalone `.scaffold` file.
+
+## What the Optimizer Does
+
+The meta-agent has 18 mutation types across three categories:
+
+- **Content**: rewrite prompts, system prompts, shell commands, tool specs
+- **Structural**: insert/remove steps, add verify gates, retry loops, parallel fan-out
+- **Decomposition**: apply motifs from a library of 6 graph transformations
+
+**Motifs** are reusable patterns triggered by failure analysis:
+
+| Motif | What it does |
+|-------|-------------|
+| ShortlistSelect | Narrow candidates → select → normalize |
+| VoteCritiqueRepair | Propose → critique → deterministic repair gate |
+| NormalizeVerify | Raw output → format normalization |
+| GenerateValidateRefine | Generate → tool validation → refine from feedback |
+| RouterExpert | Route by domain → specialized handler |
+| RetrieveDecide | Extract facts → decide from evidence |
+
+Every candidate is a valid typed graph — verified before evaluation, semantically deduplicated. The meta-agent sees ~4-8KB of structured context per step: failure clusters, step-transition attribution, motif suggestions. Not raw logs.
 
 ## Install
 
@@ -39,12 +73,12 @@ scaffold optimize example.scaffold --objective improve
 cargo install --path crates/scaffold-cli
 ```
 
-Requires `OPENROUTER_API_KEY` in environment.
+Compiles to a single binary. Requires `OPENROUTER_API_KEY` in environment.
 
 ## CLI
 
 ```
-scaffold check FILE                        # parse + type check
+scaffold check FILE                        # parse + type check + verify
 scaffold run FILE --graph G --input JSON   # execute a graph
 scaffold optimize FILE --objective O       # run optimizer
 ```
@@ -62,4 +96,4 @@ scaffold optimize FILE --objective O       # run optimizer
 
 ## Docs
 
-See [`docs/dsl-reference.md`](docs/dsl-reference.md) for full DSL syntax and optimization system reference.
+See [`docs/dsl-reference.md`](docs/dsl-reference.md) for full DSL syntax and optimization reference.
